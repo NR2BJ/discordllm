@@ -2,8 +2,9 @@ services:
   gemini:
     build: ./NRGemini
     restart: unless-stopped
-    env_file: .env
     environment:
+      GEMINI_DISCORD_TOKEN: ${GEMINI_DISCORD_TOKEN}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
       CONFIG_FILE: /data/gemini.json
     volumes:
       - /mnt/storage/docker/discord/data:/data
@@ -12,8 +13,9 @@ services:
   grok:
     build: ./NRGrok
     restart: unless-stopped
-    env_file: .env
     environment:
+      GROK_DISCORD_TOKEN: ${GROK_DISCORD_TOKEN}
+      XAI_API_KEY: ${XAI_API_KEY}
       CONFIG_FILE: /data/grok.json
     volumes:
       - /mnt/storage/docker/discord/data:/data
@@ -21,8 +23,9 @@ services:
   llm:
     build: ./NRLLM
     restart: unless-stopped
-    env_file: .env
     environment:
+      LLM_DISCORD_TOKEN: ${LLM_DISCORD_TOKEN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       CONFIG_FILE: /data/llm.json
     volumes:
       - /mnt/storage/docker/discord/data:/data
