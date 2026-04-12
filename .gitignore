@@ -9,10 +9,5 @@ NRGemini/server.json
 NRGrok/server.json
 NRLLM/server.json
 
-# 레거시
-NRGemini/server_config.json
-NRGemini/sibo_config.json
-NRGemini/bot_stats.json
-NRGrok/server_config.json
-NRGrok/bot_stats.json
-NRLLM/or_server_config.json
+# 사운드 파일 (볼륨에서 관리)
+NRGemini/sb/
