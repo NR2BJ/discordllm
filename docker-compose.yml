@@ -1,0 +1,28 @@
+services:
+  gemini:
+    build: ./NRGemini
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONFIG_FILE: /data/gemini.json
+    volumes:
+      - /mnt/storage/docker/discord/data:/data
+      - /mnt/storage/docker/discord/sb:/app/sb
+
+  grok:
+    build: ./NRGrok
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONFIG_FILE: /data/grok.json
+    volumes:
+      - /mnt/storage/docker/discord/data:/data
+
+  llm:
+    build: ./NRLLM
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONFIG_FILE: /data/llm.json
+    volumes:
+      - /mnt/storage/docker/discord/data:/data

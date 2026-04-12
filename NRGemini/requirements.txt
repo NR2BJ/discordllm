@@ -1,0 +1,6 @@
+discord.py[voice]
+google-genai
+openai
+aiohttp
+beautifulsoup4
+pillow
