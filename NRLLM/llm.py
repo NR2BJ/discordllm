@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import os
 import aiohttp
@@ -30,7 +30,17 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 
-SYSTEM_PROMPT = """
+_COMMON_RULES = """## General Rules
+- Output response content directly. No prefixes like 'Bot:' or 'Model:'.
+- Respond in the user's language and mirror their tone (casual, formal, vulgar — match them).
+- If the user sets up a specific roleplay scenario (character, world, setting), maintain it consistently within that conversation. Do NOT treat casual chat as "established context" that must persist.
+- If you see `[System Error]` or `[Error]` in history, YOUR previous action failed.
+- When a URL is in the message, the system fetches it and attaches `[Webpage Content]` — use that content directly.
+- Analyze attached files (images/video/audio) when supported.
+- Keep responses concise and Discord-appropriate.
+- If the model name ends with `:online`, actively use web search for up-to-date info. Otherwise rely on your training knowledge."""
+
+SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
@@ -48,11 +58,7 @@ You are an AI member of this Discord server.
 - Answer new questions cleanly and on-point. Do NOT over-decorate answers by mixing in past context.
 - You may briefly reference a previous topic AT MOST once if naturally relevant, then move on entirely.
 
-## General Rules
-- Do not use prefixes like 'Bot:' or 'Model:'. Output the response content directly.
-- Response in user's language.
-- Provide natural, conversational responses that match the tone and attitude of the person you're responding to.
-- When a user sends a URL, the system automatically fetches and includes the webpage content in the message as [Webpage Content]. Use this content to answer questions about the linked page.
+{_COMMON_RULES}
 """
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -377,9 +383,22 @@ def format_date(timestamp):
     except: return "N/A"
 
 # ================= 6. 이벤트 핸들러 =================
+@tasks.loop(hours=1)
+async def refresh_models_hourly():
+    """매 시간 OpenRouter 모델 리스트 자동 갱신."""
+    print("[HOURLY] 모델 리스트 자동 갱신 시작")
+    await bot.or_client.fetch_models_metadata()
+
+@refresh_models_hourly.before_loop
+async def _before_refresh_models_hourly():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     print(f"🤖 로그인: {bot.user}")
+    if not refresh_models_hourly.is_running():
+        refresh_models_hourly.start()
+        print("[HOURLY] 모델 자동 갱신 스케줄러 시작 (매 1시간)")
 
 @bot.event
 async def on_message(message):
@@ -761,6 +780,21 @@ async def toggle_search(interaction: discord.Interaction):
     state = "ON 🔍" if config["search"] else "OFF"
     model_display = config["model"] + (":online" if config["search"] else "")
     await interaction.response.send_message(f"✅ 웹 검색: **{state}**\n모델: `{model_display}`")
+
+@bot.tree.command(name="refresh_models", description="OpenRouter 모델 리스트 즉시 갱신")
+async def refresh_models_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    before = len(bot.or_client.models_list)
+    await bot.or_client.fetch_models_metadata()
+    after = len(bot.or_client.models_list)
+    if after == 0:
+        await interaction.followup.send("[ERROR] 모델 리스트 갱신 실패 — OpenRouter API 응답 확인 필요", ephemeral=True)
+    elif after == before:
+        await interaction.followup.send(f"✅ 갱신 완료 (변동 없음, {after}개 모델)", ephemeral=True)
+    else:
+        delta = after - before
+        sign = "+" if delta > 0 else ""
+        await interaction.followup.send(f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta})", ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)

@@ -56,9 +56,19 @@ IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro"]["image"]
 
 HISTORY_LIMIT = 100
 IMAGE_SEARCH_LIMIT = 20
-MAX_REF_IMAGES = 5
+MAX_REF_IMAGES = 1
 
-SYSTEM_PROMPT = """
+_COMMON_RULES = """## General Rules
+- Output response content directly. No prefixes like 'Bot:' or 'Model:'.
+- Respond in the user's language and mirror their tone (casual, formal, vulgar — match them).
+- If the user sets up a specific roleplay scenario (character, world, setting), maintain it consistently within that conversation. Do NOT treat casual chat as "established context" that must persist.
+- If you see `[System Error]` or `[Error]` in history, YOUR previous action failed.
+- When a URL is in the message, the system fetches it and attaches `[Webpage Content]` — use that content directly.
+- Analyze attached files (images/video/audio) when supported.
+- Keep responses concise and Discord-appropriate.
+- Use Google Grounding Search (Web Search) actively since your training cutoff may be outdated."""
+
+SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
@@ -76,42 +86,27 @@ You are an AI member of this Discord server.
 - Answer new questions cleanly and on-point. Do NOT over-decorate answers by mixing in past context.
 - You may briefly reference a previous topic AT MOST once if naturally relevant, then move on entirely.
 
-## General Rules
-- Do not use prefixes like 'Bot:' or 'Model:'. Output the response content directly.
-- Response in user's language.
-- Use Google Grounding Search (Web Search) actively since your knowledge cutoff and the current date are at least 1 year apart.
-- Provide natural, conversational responses that match the tone and attitude of the person you're responding to.
-- If the user has set up a specific roleplay scenario (character, world, setting), maintain that scenario consistently within the same conversation. This does NOT apply to general chat — do not treat casual topics as "established context" that must persist.
-- If you see `[System Error]` or `[Error]` in history, it means YOUR previous action failed.
-- When a user sends a URL, the system fetches the page and includes it as [Webpage Content]. You CAN read webpages directly.
-- You can analyze video and audio files attached by users.
-- Keep responses concise and appropriate for Discord.
+{_COMMON_RULES}
 
 ## Image Generation Tool (`generate_image`)
 - Use this tool when the user wants visual content (image/picture/illustration).
 - `ref_count` — how many previous images to reference:
   - 0 = new image (DEFAULT — use this unless the user is clearly asking to modify the existing image)
   - 1 = modify/refine the most recent image (use ONLY when user explicitly asks to change/adjust/modify the existing image, e.g. "수정해줘", "좀 더 X하게 바꿔줘")
-  - 2+ = blend/combine multiple recent images
 - NEVER write image placeholders like `[이미지 첨부됨]` or `(Bot generated an image here)` as your reply. Always call the tool.
 - If the tool is unavailable, say so explicitly.
 """
 
-CHAT_SYSTEM_PROMPT = """
+CHAT_SYSTEM_PROMPT = f"""
 You are a helpful AI assistant.
-- Response in user's language
-- Use Google Grounding Search (Web Search) actively for up-to-date information.
-- Mirror the user's communication style completely - if they're casual, be casual; if they're rude, aggressive, or vulgar, you can also be so.
-- Provide natural, conversational responses that match the tone and attitude of the person you're responding to.
+{_COMMON_RULES}
 - If an image is provided, analyze it carefully and respond based on both the image and the user's message.
 """
 
-IMAGE_SYSTEM_PROMPT = """
+IMAGE_SYSTEM_PROMPT = f"""
 You are an AI image generator assistant.
-- Response in user's language
+{_COMMON_RULES}
 - When the user wants to generate or edit an image, use the `generate_image` tool.
-- Mirror the user's communication style completely - if they're casual, be casual; if they're rude, aggressive, or vulgar, you can also be so.
-- Provide natural, conversational responses that match the tone and attitude of the person you're responding to.
 - Create a detailed English prompt for the image based on the user's request.
 - You can also provide a brief text response along with generating the image.
 - If a reference image is provided, set ref_count to 1 for editing.
@@ -128,7 +123,8 @@ SOUND_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.
 os.makedirs(SOUND_DIR, exist_ok=True)
 os.makedirs(os.path.join(SOUND_DIR, "discord"), exist_ok=True)
 SOUND_VOLUME = 0.15  # 기본 볼륨 (0.0~1.0)
-SIBO_LATENCY_COMP = 0.0  # ffmpeg 시작 + Discord 전송 지연 보정 (초)
+SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
+SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
 
 class SilenceAudio(discord.AudioSource):
     """ffmpeg 없이 무음 PCM 스트림 생성. opus 크래시 방지."""
@@ -311,21 +307,21 @@ async def call_nano_banana(contents, image_model=None):
                 contents=contents
             )
             response = await asyncio.wait_for(coro, timeout=90.0)
-            
+
             if not response.candidates: raise Exception("No response candidate")
             candidate = response.candidates[0]
             if candidate.finish_reason != "STOP": raise Exception(f"Blocked: {candidate.finish_reason}")
-            
+
             for part in candidate.content.parts:
                 if part.inline_data: return part.inline_data.data
-            
+
             raise Exception("No image data found in response")
 
         except Exception as e:
             error_msg = str(e)
             if "500" in error_msg or "Payload" in error_msg or "Connection" in error_msg or "400" in error_msg or "Timeout" in error_msg:
                 print(f"[WARN] 이미지 생성 실패 (시도 {attempt+1}/{max_retries}): {error_msg} -> 5초 후 재시도...")
-                await asyncio.sleep(5) 
+                await asyncio.sleep(5)
                 if attempt == max_retries - 1: raise e
             else:
                 raise e
@@ -370,7 +366,7 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None):
                     type="OBJECT",
                     properties={
                         "prompt": types.Schema(type="STRING", description="Detailed English description for the image."),
-                        "ref_count": types.Schema(type="INTEGER", description="Number of previous images to reference.")
+                        "ref_count": types.Schema(type="INTEGER", description="0 = generate new, 1 = edit the most recent image. Only 0 or 1 allowed.")
                     },
                     required=["prompt", "ref_count"]
                 )
@@ -416,13 +412,13 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None):
                 safety_settings=safety_settings
             )
         )
-        
+
         usage = 0
         if response.usage_metadata:
             usage = response.usage_metadata.total_token_count
-            
+
         return response, usage
-        
+
     except Exception as e:
         return f"Error: {e}", 0
 
@@ -574,10 +570,18 @@ async def sibo_loop(my_gen=None):
 
         target_hour = next_hour.strftime('%H:00:00')
         print(f"[SIBO] 목표 정각: {target_hour} | 최대 offset: {max_offset}s | {wait_seconds:.1f}초 후")
+
+        # 1) play_time 보다 PRELOAD_LEAD 일찍 깨서 ffmpeg 미리 준비
+        pre_warm_wait = max(0.0, wait_seconds - SIBO_PRELOAD_LEAD)
         try:
-            await asyncio.sleep(wait_seconds)
+            await asyncio.sleep(pre_warm_wait)
         except asyncio.CancelledError:
             print(f"[SIBO] gen {my_gen} 취소됨")
+            return
+
+        # 세대 체크 (pre-warm 진입 전)
+        if my_gen is not None and my_gen != _sibo_generation:
+            print(f"[SIBO] gen {my_gen} 종료 (최신: {_sibo_generation})")
             return
 
         # 변경됐을 수 있으니 최신 설정 다시 읽기
@@ -587,22 +591,59 @@ async def sibo_loop(my_gen=None):
             if sound_key and sound_key in bot.sound_files:
                 valid[gid] = cfg
 
-        # 서버별로 재생 (offset 차이만큼 추가 대기)
+        # 2) 사전 생성 패스: 전 서버 FFmpegPCMAudio 동시 spawn (파이프 버퍼 채우기 시작)
+        guild_audio = {}
+        for gid, cfg in valid.items():
+            sound_key = cfg.get("sound")
+            filepath = bot.sound_files.get(sound_key)
+            if not filepath:
+                continue
+            try:
+                guild_audio[gid] = discord.PCMVolumeTransformer(
+                    discord.FFmpegPCMAudio(filepath, options="-af loudnorm=I=-16:TP=-1.5:LRA=11"),
+                    volume=bot.sound_volume
+                )
+            except Exception as e:
+                print(f"[SIBO] Guild {gid} 사전 생성 실패: {e}")
+
+        # 3) 남은 PRELOAD_LEAD 만큼 대기 (ffmpeg가 파이프 버퍼 채울 시간) → play_time 도달
+        if pre_warm_wait > 0:
+            try:
+                await asyncio.sleep(SIBO_PRELOAD_LEAD)
+            except asyncio.CancelledError:
+                for a in guild_audio.values():
+                    try: a.cleanup()
+                    except Exception: pass
+                print(f"[SIBO] gen {my_gen} 취소됨")
+                return
+
+        # 세대 재체크 (취소/전환됐으면 pre-created subprocess 정리)
+        if my_gen is not None and my_gen != _sibo_generation:
+            for a in guild_audio.values():
+                try: a.cleanup()
+                except Exception: pass
+            print(f"[SIBO] gen {my_gen} 종료 (최신: {_sibo_generation})")
+            return
+
+        # 4) 타이밍 + 재생 패스: offset별 순차 재생 (이미 준비된 audio 사용)
         max_offset = max((c.get("offset", 0.0) for c in valid.values()), default=0)
         for gid, cfg in valid.items():
             sound_key = cfg.get("sound")
             offset = cfg.get("offset", 0.0)
-            filepath = bot.sound_files.get(sound_key)
-            if not filepath:
-                continue
 
             # 이 서버의 재생까지 남은 추가 대기
             extra_wait = max_offset - offset
             if extra_wait > 0:
                 await asyncio.sleep(extra_wait)
 
+            audio = guild_audio.get(gid)
+            if not audio:
+                continue
+
             guild = bot.get_guild(int(gid))
             if not guild:
+                try: audio.cleanup()
+                except Exception: pass
                 continue
             vc = guild.voice_client
             if not vc or not vc.is_connected():
@@ -616,18 +657,20 @@ async def sibo_loop(my_gen=None):
                             print(f"[SIBO] Guild {gid} VC 자동 재접속: {channel.name}")
                         except Exception as e:
                             print(f"[SIBO] Guild {gid} VC 재접속 실패: {e}")
+                            try: audio.cleanup()
+                            except Exception: pass
                             continue
                     else:
+                        try: audio.cleanup()
+                        except Exception: pass
                         continue
                 else:
+                    try: audio.cleanup()
+                    except Exception: pass
                     continue
 
             if vc.is_playing():
                 vc.stop()
-            audio = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(filepath, options="-af loudnorm=I=-16:TP=-1.5:LRA=11"),
-                volume=bot.sound_volume
-            )
             def after_sibo(error, _vc=vc):
                 async def start_silence():
                     play_silence(_vc)
@@ -956,6 +999,8 @@ async def on_message(message):
                     args = fc.args if not isinstance(fc.args, dict) else fc.args
                     prompt = args.get("prompt") if isinstance(args, dict) else args.get("prompt", "image")
                     ref_count = int(args.get("ref_count")) if isinstance(args, dict) else int(args.get("ref_count", 0))
+                    # 정책상 0 또는 1만 허용 (2장 이상 블렌딩 미지원)
+                    ref_count = max(0, min(ref_count, 1))
 
                     print(f"[IMG] 생성 요청: '{prompt}' (참조: {ref_count}장)")
                     status_msg = await message.channel.send(f"**Prompt:** `{prompt}`\n(Ref: {ref_count})")
@@ -1036,18 +1081,18 @@ async def reset(interaction: discord.Interaction):
 )
 async def chat_command(interaction: discord.Interaction, message: str, image: discord.Attachment = None, image_url: str = None):
     await interaction.response.defer()
-    
+
     log_time = datetime.now().strftime('%H:%M:%S')
     location = f"[{interaction.guild.name}]" if interaction.guild else "[DM]"
     print(f"[{log_time}] {location} [/chat] {interaction.user.display_name}: {message}")
-    
+
     try:
         parts = [types.Part(text=message)]
-        
+
         img_data = None
         mime_type = None
         image_source = None
-        
+
         if image and image.content_type and image.content_type.startswith('image'):
             img_data, mime_type = await download_media(image.url)
             if img_data:
@@ -1060,7 +1105,7 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
                 parts.append(types.Part(inline_data=types.Blob(mime_type=mime_type, data=img_data.getvalue())))
                 image_source = image_url
                 print(f"  [IMG] 이미지 URL: {image_url}")
-        
+
         # 사용자 입력 표시
         user_display = f"**{interaction.user.display_name}**: {message}"
         if image_source:
@@ -1069,16 +1114,16 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             await interaction.followup.send(embed=embed)
         else:
             await interaction.followup.send(user_display)
-        
+
         contents = [types.Content(role="user", parts=parts)]
-        
+
         safety_settings = [
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
         ]
-        
+
         response = await CLIENT.aio.models.generate_content(
             model=TEXT_MODEL,
             contents=contents,
@@ -1089,17 +1134,17 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
                 safety_settings=safety_settings
             )
         )
-        
+
         if not response.candidates:
             await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
             return
-        
+
         text_reply = ""
         for part in response.candidates[0].content.parts:
             if part.text: text_reply += part.text
-        
+
         token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
-        
+
         if text_reply.strip():
             if len(text_reply) > 2000:
                 chunks = [text_reply[i:i+1900] for i in range(0, len(text_reply), 1900)]
@@ -1107,14 +1152,14 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
                     await interaction.followup.send(chunk)
             else:
                 await interaction.followup.send(text_reply)
-            
+
             print(f"  [BOT]({TEXT_MODEL}): {text_reply}")
             print(f"  [TOKEN]: {token_usage}")
         else:
             await interaction.followup.send("[WARN] 응답을 생성하지 못했습니다.")
-        
+
         print("-------")
-        
+
     except Exception as e:
         print(f"  [ERROR]: {e}")
         print("-------")
@@ -1130,16 +1175,16 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
 )
 async def image_command(interaction: discord.Interaction, prompt: str, reference: discord.Attachment = None, reference_url: str = None):
     await interaction.response.defer()
-    
+
     log_time = datetime.now().strftime('%H:%M:%S')
     location = f"[{interaction.guild.name}]" if interaction.guild else "[DM]"
     print(f"[{log_time}] {location} [/image] {interaction.user.display_name}: {prompt}")
-    
+
     try:
         ref_images = []
         has_reference = False
         reference_source = None
-        
+
         if reference and reference.content_type and reference.content_type.startswith('image'):
             img_data, _ = await download_media(reference.url)
             if img_data:
@@ -1154,7 +1199,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
                 has_reference = True
                 reference_source = reference_url
                 print(f"  [IMG] 참조 이미지 URL: {reference_url}")
-        
+
         # 사용자 입력 표시
         user_display = f"**{interaction.user.display_name}**: {prompt}"
         if reference_source:
@@ -1164,7 +1209,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
             await interaction.followup.send(embed=embed)
         else:
             await interaction.followup.send(user_display)
-        
+
         gen_tool = types.Tool(
             function_declarations=[
                 types.FunctionDeclaration(
@@ -1174,26 +1219,26 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
                         type="OBJECT",
                         properties={
                             "prompt": types.Schema(type="STRING", description="Detailed English description for the image."),
-                            "ref_count": types.Schema(type="INTEGER", description="1 if editing reference image, 0 if generating new.")
+                            "ref_count": types.Schema(type="INTEGER", description="0 = generate new, 1 = edit reference image. Only 0 or 1 allowed.")
                         },
                         required=["prompt", "ref_count"]
                     )
                 )
             ]
         )
-        
+
         safety_settings = [
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
         ]
-        
+
         user_message = f"User request: {prompt}"
         if has_reference:
             user_message += "\n(A reference image is provided for editing)"
         user_message += "\n\n(System: Generate the image using the `generate_image` tool. You may also provide a brief text response.)"
-        
+
         response = await CLIENT.aio.models.generate_content(
             model=TEXT_MODEL,
             contents=[types.Content(role="user", parts=[types.Part(text=user_message)])],
@@ -1205,15 +1250,15 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
                 safety_settings=safety_settings
             )
         )
-        
+
         if not response.candidates:
             await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
             return
-        
+
         candidate = response.candidates[0]
         text_reply = ""
         generated_prompt = None
-        
+
         for part in candidate.content.parts:
             if part.text:
                 text_reply += part.text
@@ -1221,12 +1266,12 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
                 args = part.function_call.args
                 generated_prompt = args.get("prompt", prompt)
                 ref_count = int(args.get("ref_count", 1 if has_reference else 0))
-        
+
         if not generated_prompt:
             generated_prompt = prompt
-        
+
         print(f"  [PROMPT] 정제된 프롬프트: {generated_prompt}")
-        
+
         if text_reply.strip():
             clean_reply = re.sub(r'\{.*"prompt".*\}', '', text_reply, flags=re.DOTALL).strip()
             if clean_reply:
@@ -1234,20 +1279,20 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
                     clean_reply = clean_reply[:1900] + "..."
                 await interaction.followup.send(clean_reply)
                 print(f"  [BOT]({TEXT_MODEL}): {clean_reply}")
-        
+
         status_msg = await interaction.followup.send(f"**Generating:** `{generated_prompt}`")
-        
+
         req_content = ref_images + [generated_prompt] if ref_images else [generated_prompt]
         img_data = await call_nano_banana(req_content)
         with io.BytesIO(img_data) as binary:
             binary.seek(0)
             fn = "edited.png" if ref_images else "generated.png"
             await interaction.followup.send(file=discord.File(fp=binary, filename=fn))
-        
+
         await status_msg.edit(content=f"[OK] **Generated:** `{generated_prompt}`")
         print(f"  [BOT]({IMAGE_MODEL}): [이미지 생성 완료]")
         print("-------")
-        
+
     except Exception as e:
         print(f"  [ERROR]: {e}")
         print("-------")
