@@ -13,6 +13,7 @@ import warnings
 import re
 import tempfile
 import time as time_module
+import math
 from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta, timezone
@@ -128,6 +129,10 @@ SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
 SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
+VOICE_HEALTH_GRACE = 30.0
+VOICE_HEALTH_BAD_LIMIT = 3
+LOOP_MONITOR_INTERVAL = 2.0
+LOOP_MONITOR_WARN = 2.5
 
 class SilenceAudio(discord.AudioSource):
     """ffmpeg 없이 무음 PCM 스트림 생성. opus 크래시 방지."""
@@ -153,6 +158,36 @@ def format_metric(value):
         return f"{value:.3f}"
     return str(value)
 
+def get_voice_ws_closed(vc):
+    ws = getattr(vc, "ws", None)
+    if ws is None:
+        return None
+    closed = getattr(ws, "closed", None)
+    if callable(closed):
+        try:
+            return closed()
+        except Exception:
+            return "error"
+    return closed
+
+def get_voice_unhealthy_reason(vc):
+    if vc is None:
+        return None
+    reasons = []
+    latency = getattr(vc, "latency", None)
+    average_latency = getattr(vc, "average_latency", None)
+    if isinstance(latency, float) and not math.isfinite(latency):
+        reasons.append(f"latency={latency}")
+    if isinstance(average_latency, float) and not math.isfinite(average_latency):
+        reasons.append(f"avg_latency={average_latency}")
+    ws_closed = get_voice_ws_closed(vc)
+    if ws_closed is True:
+        reasons.append("voice_ws_closed=True")
+    endpoint = getattr(vc, "endpoint", None)
+    if not endpoint:
+        reasons.append("endpoint=missing")
+    return ", ".join(reasons) if reasons else None
+
 def describe_voice_client(vc):
     if vc is None:
         return "vc=None"
@@ -170,12 +205,14 @@ def describe_voice_client(vc):
         paused = f"err:{e.__class__.__name__}"
     endpoint = getattr(vc, "endpoint", None) or "-"
     session_id = getattr(vc, "session_id", None) or "-"
+    ws_closed = get_voice_ws_closed(vc)
     return (
         f"connected={connected} playing={playing} paused={paused} "
         f"channel={format_channel_ref(getattr(vc, 'channel', None))} "
         f"endpoint={endpoint} session_id={session_id} "
         f"latency={format_metric(getattr(vc, 'latency', None))} "
-        f"avg_latency={format_metric(getattr(vc, 'average_latency', None))}"
+        f"avg_latency={format_metric(getattr(vc, 'average_latency', None))} "
+        f"ws_closed={ws_closed}"
     )
 
 def describe_voice_state(state):
@@ -265,6 +302,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, start_silence
                 )
             if start_silence and not vc.is_playing():
                 play_silence(vc, reason=f"{reason}:connected")
+            bot.mark_voice_connected(guild.id)
             return vc
 
         if vc:
@@ -283,6 +321,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, start_silence
         )
         if start_silence and not vc.is_playing():
             play_silence(vc, reason=f"{reason}:fresh_connect")
+        bot.mark_voice_connected(guild.id)
         return vc
 
 # ================= 사운드보드 유틸리티 =================
@@ -590,6 +629,9 @@ class GeminiBot(commands.Bot):
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
+        self.voice_connected_at = {}
+        self.voice_bad_state_counts = {}
+        self.loop_monitor_expected = None
         self.sound_files = scan_sound_files()
         self.sound_volume = SOUND_VOLUME
         self._sound_dir_mtime = self._get_sound_dir_mtime()
@@ -685,6 +727,8 @@ class GeminiBot(commands.Bot):
             old_channel_id = cfg.get("voice_target_channel_id")
             cfg.pop("voice_target_channel_id", None)
             self.save_config()
+            self.voice_bad_state_counts.pop(str(guild_id), None)
+            self.voice_connected_at.pop(str(guild_id), None)
             guild = self.get_guild(guild_id)
             guild_name = guild.name if guild else guild_id
             print(f"[VC] keepalive 대상 해제 ({guild_name}): channel_id={old_channel_id}")
@@ -701,6 +745,30 @@ class GeminiBot(commands.Bot):
     def reset_voice_retry(self, guild_id):
         self.voice_retry_after[str(guild_id)] = 0.0
 
+    def mark_voice_connected(self, guild_id):
+        gid = str(guild_id)
+        self.voice_connected_at[gid] = time_module.monotonic()
+        self.voice_bad_state_counts[gid] = 0
+
+    def mark_voice_disconnected(self, guild_id):
+        gid = str(guild_id)
+        self.voice_connected_at.pop(gid, None)
+        self.voice_bad_state_counts[gid] = 0
+
+    def get_voice_connected_age(self, guild_id):
+        started = self.voice_connected_at.get(str(guild_id))
+        if started is None:
+            return None
+        return time_module.monotonic() - started
+
+    def record_voice_health(self, guild_id, unhealthy_reason):
+        gid = str(guild_id)
+        if unhealthy_reason:
+            self.voice_bad_state_counts[gid] = self.voice_bad_state_counts.get(gid, 0) + 1
+            return self.voice_bad_state_counts[gid]
+        self.voice_bad_state_counts[gid] = 0
+        return 0
+
 bot = GeminiBot()
 
 @tasks.loop(seconds=10)
@@ -710,6 +778,40 @@ async def voice_watchdog():
         vc = guild.voice_client
         if vc and vc.is_connected():
             try:
+                unhealthy_reason = get_voice_unhealthy_reason(vc)
+                connected_age = bot.get_voice_connected_age(guild.id)
+                bad_count = bot.record_voice_health(guild.id, unhealthy_reason)
+                target_channel_id = bot.get_voice_target(guild.id)
+                if (
+                    unhealthy_reason
+                    and target_channel_id
+                    and connected_age is not None
+                    and connected_age >= VOICE_HEALTH_GRACE
+                    and bad_count >= VOICE_HEALTH_BAD_LIMIT
+                    and bot.can_retry_voice(guild.id)
+                ):
+                    log_voice_snapshot(
+                        "watchdog 강제 재연결",
+                        guild,
+                        vc,
+                        extra=(
+                            f"reason={unhealthy_reason} "
+                            f"connected_age={connected_age:.1f}s "
+                            f"bad_count={bad_count} "
+                            f"target_channel_id={target_channel_id}"
+                        ),
+                    )
+                    await cleanup_stale_voice_client(vc, guild)
+                    vc = await ensure_voice_connection(
+                        guild,
+                        target_channel_id,
+                        move=True,
+                        start_silence=True,
+                        reason="watchdog_unhealthy",
+                    )
+                    if vc:
+                        bot.reset_voice_retry(guild.id)
+                    continue
                 if not vc.is_playing():
                     play_silence(vc, reason="watchdog")
             except Exception as e:
@@ -750,6 +852,30 @@ async def sound_watcher():
         new_count = len(bot.sound_files)
         if old_count != new_count:
             print(f"[SB] 사운드 자동 리스캔: {old_count} → {new_count}개")
+
+@tasks.loop(seconds=LOOP_MONITOR_INTERVAL)
+async def loop_watchdog():
+    now = time_module.monotonic()
+    expected = bot.loop_monitor_expected
+    bot.loop_monitor_expected = now + LOOP_MONITOR_INTERVAL
+    if expected is None:
+        return
+
+    lag = now - expected
+    if lag < LOOP_MONITOR_WARN:
+        return
+
+    active_targets = sum(1 for guild in bot.guilds if bot.get_voice_target(guild.id))
+    print(f"[LOOP] event loop lag 감지: {lag:.3f}s | active_voice_targets={active_targets}")
+    for guild in bot.guilds:
+        target_channel_id = bot.get_voice_target(guild.id)
+        if guild.voice_client is not None or target_channel_id:
+            log_voice_snapshot(
+                "event loop lag 시점",
+                guild,
+                guild.voice_client,
+                extra=f"lag={lag:.3f}s target_channel_id={target_channel_id}",
+            )
 
 _sibo_generation = 0  # 시보 루프 세대 카운터
 
@@ -958,6 +1084,9 @@ async def on_ready():
         voice_watchdog.start()
     if not sound_watcher.is_running():
         sound_watcher.start()
+    if not loop_watchdog.is_running():
+        bot.loop_monitor_expected = None
+        loop_watchdog.start()
     if not hasattr(bot, '_sibo_task') or bot._sibo_task is None or bot._sibo_task.done():
         global _sibo_generation
         _sibo_generation += 1
@@ -965,6 +1094,8 @@ async def on_ready():
     print(f"[OK] 사운드 감시 + 시보 스케줄러 시작")
     for guild in bot.guilds:
         target_channel_id = bot.get_voice_target(guild.id)
+        if guild.voice_client and guild.voice_client.is_connected():
+            bot.mark_voice_connected(guild.id)
         if target_channel_id:
             log_voice_snapshot(
                 "on_ready keepalive 상태",
@@ -1018,6 +1149,7 @@ async def on_voice_state_update(member, before, after):
     if after.channel is not None:
         bot.set_voice_target(member.guild.id, after.channel.id)
         bot.reset_voice_retry(member.guild.id)
+        bot.mark_voice_connected(member.guild.id)
         vc = member.guild.voice_client
         if vc and vc.is_connected() and not vc.is_playing():
             await asyncio.sleep(1)
@@ -1031,6 +1163,7 @@ async def on_voice_state_update(member, before, after):
     if not target_channel_id:
         return
 
+    bot.mark_voice_disconnected(member.guild.id)
     print(
         f"[VC] bot 음성 채널 이탈 감지 ({member.guild.name}): "
         f"target_channel_id={target_channel_id}, {VOICE_RECONNECT_DELAY}초 후 재접속 시도"
