@@ -10,16 +10,6 @@ services:
       - /mnt/storage/docker/discord/data:/data
       - /mnt/storage/docker/discord/sb:/app/sb
 
-  grok:
-    build: ./NRGrok
-    restart: unless-stopped
-    environment:
-      GROK_DISCORD_TOKEN: ${GROK_DISCORD_TOKEN}
-      XAI_API_KEY: ${XAI_API_KEY}
-      CONFIG_FILE: /data/grok.json
-    volumes:
-      - /mnt/storage/docker/discord/data:/data
-
   llm:
     build: ./NRLLM
     restart: unless-stopped

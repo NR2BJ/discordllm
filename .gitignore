@@ -6,7 +6,6 @@ worklog.md
 
 # 설정 파일 (볼륨에서 관리)
 NRGemini/server.json
-NRGrok/server.json
 NRLLM/server.json
 
 # 사운드 파일 (볼륨에서 관리)
