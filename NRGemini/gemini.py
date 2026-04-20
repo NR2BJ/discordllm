@@ -134,16 +134,6 @@ VOICE_HEALTH_BAD_LIMIT = 3
 LOOP_MONITOR_INTERVAL = 2.0
 LOOP_MONITOR_WARN = 2.5
 
-class SilenceAudio(discord.AudioSource):
-    """ffmpeg 없이 무음 PCM 스트림 생성. opus 크래시 방지."""
-    def read(self):
-        # 20ms of silence at 48kHz stereo 16-bit = 3840 bytes
-        return b'\x00' * 3840
-    def is_opus(self):
-        return False
-    def cleanup(self):
-        pass
-
 def format_channel_ref(channel):
     if channel is None:
         return "None"
@@ -237,12 +227,6 @@ def log_voice_snapshot(prefix, guild=None, vc=None, extra=None):
     parts.append(describe_voice_client(vc))
     print(" | ".join(parts))
 
-def play_silence(vc, reason="unknown"):
-    """VC에 무음 스트림 재생. 이미 재생 중이면 스킵."""
-    if vc.is_connected() and not vc.is_playing():
-        vc.play(SilenceAudio())
-        log_voice_snapshot(f"무음 재생 시작 [{reason}]", getattr(vc, "guild", None), vc)
-
 async def cleanup_stale_voice_client(vc, guild):
     """끊어진 VoiceClient 캐시를 정리해서 재접속 막힘 방지."""
     log_voice_snapshot("stale VC 정리 시작", guild, vc)
@@ -276,7 +260,7 @@ async def resolve_voice_channel(guild, channel_id):
         return None
     return channel
 
-async def ensure_voice_connection(guild, channel_id, *, move=True, start_silence=False, reason="unknown"):
+async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unknown"):
     channel = await resolve_voice_channel(guild, channel_id)
     if channel is None:
         print(f"[VC] 연결 대상 채널 조회 실패 ({guild.name}, {channel_id}) [{reason}]")
@@ -288,7 +272,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, start_silence
             f"ensure_voice_connection 시작 [{reason}]",
             guild,
             vc,
-            extra=f"target={format_channel_ref(channel)} move={move} start_silence={start_silence}",
+            extra=f"target={format_channel_ref(channel)} move={move}",
         )
         if vc and vc.is_connected():
             if move and vc.channel != channel:
@@ -300,8 +284,6 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, start_silence
                     vc,
                     extra=f"from={format_channel_ref(old_channel)} to={format_channel_ref(channel)}",
                 )
-            if start_silence and not vc.is_playing():
-                play_silence(vc, reason=f"{reason}:connected")
             bot.mark_voice_connected(guild.id)
             return vc
 
@@ -319,8 +301,6 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, start_silence
             vc,
             extra=f"target={format_channel_ref(channel)}",
         )
-        if start_silence and not vc.is_playing():
-            play_silence(vc, reason=f"{reason}:fresh_connect")
         bot.mark_voice_connected(guild.id)
         return vc
 
@@ -382,7 +362,6 @@ async def play_sound_in_vc(guild, member, sound_name, bot_instance):
         guild,
         member.voice.channel.id,
         move=True,
-        start_silence=False,
         reason="soundboard",
     )
     if vc is None:
@@ -404,9 +383,6 @@ async def play_sound_in_vc(guild, member, sound_name, bot_instance):
             vc,
             extra=f"status={status}",
         )
-        async def start_silence():
-            play_silence(vc, reason=f"after_play:{key}")
-        asyncio.run_coroutine_threadsafe(start_silence(), bot_instance.loop)
 
     vc.play(audio, after=after_play)
     return True, f"**{sound_name}** 재생 중 (vol {int(bot_instance.sound_volume * 100)}%)"
@@ -773,7 +749,7 @@ bot = GeminiBot()
 
 @tasks.loop(seconds=10)
 async def voice_watchdog():
-    """VC 연결 유지 감시: 무음 재생 유지 + 끊긴 경우 자동 재접속."""
+    """VC 연결 유지 감시: 끊긴 경우 자동 재접속 + 비정상 상태 강제 재연결."""
     for guild in bot.guilds:
         vc = guild.voice_client
         if vc and vc.is_connected():
@@ -806,14 +782,11 @@ async def voice_watchdog():
                         guild,
                         target_channel_id,
                         move=True,
-                        start_silence=True,
                         reason="watchdog_unhealthy",
                     )
                     if vc:
                         bot.reset_voice_retry(guild.id)
                     continue
-                if not vc.is_playing():
-                    play_silence(vc, reason="watchdog")
             except Exception as e:
                 print(f"[VC] watchdog 재시작 실패 ({guild.name}): {e}")
             continue
@@ -833,7 +806,6 @@ async def voice_watchdog():
                 guild,
                 target_channel_id,
                 move=True,
-                start_silence=True,
                 reason="watchdog",
             )
             if vc:
@@ -1030,11 +1002,7 @@ async def sibo_loop(my_gen=None):
 
             if vc.is_playing():
                 vc.stop()
-            def after_sibo(error, _vc=vc):
-                async def start_silence():
-                    play_silence(_vc)
-                asyncio.run_coroutine_threadsafe(start_silence(), bot.loop)
-            vc.play(audio, after=after_sibo)
+            vc.play(audio)
             play_now = datetime.now(KST)
             print(f"[SIBO] {play_now.strftime('%H:%M:%S.%f')[:-4]} Guild {gid} 시보 재생: {sound_key}")
 
@@ -1150,13 +1118,6 @@ async def on_voice_state_update(member, before, after):
         bot.set_voice_target(member.guild.id, after.channel.id)
         bot.reset_voice_retry(member.guild.id)
         bot.mark_voice_connected(member.guild.id)
-        vc = member.guild.voice_client
-        if vc and vc.is_connected() and not vc.is_playing():
-            await asyncio.sleep(1)
-            try:
-                play_silence(vc, reason="voice_state_update")
-            except Exception as e:
-                print(f"[VC] 무음 재시작 실패: {e}")
         return
 
     target_channel_id = bot.get_voice_target(member.guild.id)
@@ -1174,7 +1135,6 @@ async def on_voice_state_update(member, before, after):
             member.guild,
             target_channel_id,
             move=True,
-            start_silence=True,
             reason="voice_state_update",
         )
         if vc:

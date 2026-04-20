@@ -29,6 +29,8 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
                         '.css', '.md', '.json', '.xml', '.yaml', '.sh', '.rb', '.go', '.rs')
 
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
+VOICE_RECONNECT_DELAY = 3.0
+VOICE_RECONNECT_COOLDOWN = 20.0
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -84,6 +86,123 @@ class DataManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except:
             pass
+
+def format_channel_ref(channel):
+    if channel is None:
+        return "None"
+    name = getattr(channel, "name", str(channel))
+    channel_id = getattr(channel, "id", None)
+    return f"{name}({channel_id})" if channel_id else name
+
+def describe_voice_client(vc):
+    if vc is None:
+        return "vc=None"
+    try:
+        connected = vc.is_connected()
+    except Exception as e:
+        connected = f"err:{e.__class__.__name__}"
+    try:
+        playing = vc.is_playing()
+    except Exception as e:
+        playing = f"err:{e.__class__.__name__}"
+    endpoint = getattr(vc, "endpoint", None) or "-"
+    session_id = getattr(vc, "session_id", None) or "-"
+    return (
+        f"connected={connected} "
+        f"playing={playing} "
+        f"channel={format_channel_ref(getattr(vc, 'channel', None))} "
+        f"endpoint={endpoint} session_id={session_id}"
+    )
+
+def describe_voice_state(state):
+    if state is None:
+        return "state=None"
+    return (
+        f"channel={format_channel_ref(getattr(state, 'channel', None))} "
+        f"self_mute={getattr(state, 'self_mute', None)} "
+        f"self_deaf={getattr(state, 'self_deaf', None)}"
+    )
+
+def log_voice_snapshot(prefix, guild=None, vc=None, extra=None):
+    parts = [f"[VC][LLM] {prefix}"]
+    if guild is not None:
+        parts.append(f"guild={guild.name}({guild.id})")
+    if extra:
+        parts.append(extra)
+    parts.append(describe_voice_client(vc))
+    print(" | ".join(parts))
+
+async def cleanup_stale_voice_client(vc, guild):
+    log_voice_snapshot("stale VC 정리 시작", guild, vc)
+    try:
+        await vc.disconnect(force=True)
+    except TypeError:
+        try:
+            await vc.disconnect()
+        except Exception as e:
+            print(f"[VC][LLM] stale disconnect fallback 실패 ({guild.name}): {e}")
+    except Exception as e:
+        print(f"[VC][LLM] stale disconnect 실패 ({guild.name}): {e}")
+    try:
+        vc.cleanup()
+    except Exception:
+        pass
+    log_voice_snapshot("stale VC 정리 완료", guild, guild.voice_client)
+
+async def resolve_voice_channel(guild, channel_id):
+    if not channel_id:
+        return None
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            print(f"[VC][LLM] 채널 조회 실패 ({guild.name}, {channel_id}): {e}")
+            return None
+    if not hasattr(channel, "connect"):
+        print(f"[VC][LLM] 연결 불가 채널 타입 ({guild.name}, {channel_id})")
+        return None
+    return channel
+
+async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unknown"):
+    channel = await resolve_voice_channel(guild, channel_id)
+    if channel is None:
+        return None
+
+    async with bot.get_voice_lock(guild.id):
+        vc = guild.voice_client
+        log_voice_snapshot(
+            f"ensure_voice_connection [{reason}]",
+            guild,
+            vc,
+            extra=f"target={format_channel_ref(channel)} move={move}",
+        )
+        if vc and vc.is_connected():
+            if move and vc.channel != channel:
+                await vc.move_to(channel)
+                log_voice_snapshot(
+                    f"이동 완료 [{reason}]",
+                    guild,
+                    vc,
+                    extra=f"target={format_channel_ref(channel)}",
+                )
+            return vc
+
+        if vc:
+            await cleanup_stale_voice_client(vc, guild)
+
+        try:
+            vc = await channel.connect(reconnect=True)
+        except TypeError:
+            vc = await channel.connect()
+
+        log_voice_snapshot(
+            f"연결 완료 [{reason}]",
+            guild,
+            vc,
+            extra=f"target={format_channel_ref(channel)}",
+        )
+        return vc
 
 # ================= 3. OpenRouter API 클라이언트 =================
 class OpenRouterClient:
@@ -286,10 +405,13 @@ class OpenRouterBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
         self.or_client = OpenRouterClient(OPENROUTER_API_KEY)
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
+        self.voice_locks = {}
+        self.voice_retry_after = {}
 
     async def setup_hook(self):
         await self.or_client.fetch_models_metadata()
@@ -312,10 +434,67 @@ class OpenRouterBot(commands.Bot):
             self.channel_locks[channel_id] = asyncio.Lock()
         return self.channel_locks[channel_id]
 
+    def get_voice_lock(self, guild_id):
+        gid = str(guild_id)
+        if gid not in self.voice_locks:
+            self.voice_locks[gid] = asyncio.Lock()
+        return self.voice_locks[gid]
+
+    def get_voice_target(self, guild_id):
+        return self.get_config(guild_id).get("voice_target_channel_id")
+
+    def set_voice_target(self, guild_id, channel_id):
+        cfg = self.get_config(guild_id)
+        if cfg.get("voice_target_channel_id") != channel_id:
+            cfg["voice_target_channel_id"] = channel_id
+            self.save_config()
+
+    def clear_voice_target(self, guild_id):
+        cfg = self.get_config(guild_id)
+        if "voice_target_channel_id" in cfg:
+            cfg.pop("voice_target_channel_id", None)
+            self.save_config()
+
+    def can_retry_voice(self, guild_id):
+        now = asyncio.get_running_loop().time()
+        gid = str(guild_id)
+        next_allowed = self.voice_retry_after.get(gid, 0.0)
+        if now < next_allowed:
+            return False
+        self.voice_retry_after[gid] = now + VOICE_RECONNECT_COOLDOWN
+        return True
+
+    def reset_voice_retry(self, guild_id):
+        self.voice_retry_after[str(guild_id)] = 0.0
+
     def save_config(self):
         DataManager.save_json(CONFIG_FILE, self.server_configs)
 
 bot = OpenRouterBot()
+
+@tasks.loop(seconds=10)
+async def voice_watchdog():
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        if vc and vc.is_connected():
+            continue
+
+        target_channel_id = bot.get_voice_target(guild.id)
+        if not target_channel_id or not bot.can_retry_voice(guild.id):
+            continue
+
+        try:
+            log_voice_snapshot(
+                "watchdog 재접속 시도",
+                guild,
+                vc,
+                extra=f"target_channel_id={target_channel_id}",
+            )
+            vc = await ensure_voice_connection(guild, target_channel_id, reason="watchdog")
+            if vc:
+                bot.reset_voice_retry(guild.id)
+        except Exception as e:
+            print(f"[VC][LLM] watchdog 재접속 실패 ({guild.name}): {e}")
 
 # ================= 5. 유틸리티 함수 =================
 async def scrap_webpage(url):
@@ -399,6 +578,46 @@ async def on_ready():
     if not refresh_models_hourly.is_running():
         refresh_models_hourly.start()
         print("[HOURLY] 모델 자동 갱신 스케줄러 시작 (매 1시간)")
+    if not voice_watchdog.is_running():
+        voice_watchdog.start()
+    for guild in bot.guilds:
+        target_channel_id = bot.get_voice_target(guild.id)
+        if target_channel_id:
+            log_voice_snapshot(
+                "on_ready keepalive 상태",
+                guild,
+                guild.voice_client,
+                extra=f"target_channel_id={target_channel_id}",
+            )
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member != bot.user:
+        return
+
+    log_voice_snapshot(
+        "bot voice_state_update",
+        member.guild,
+        member.guild.voice_client,
+        extra=f"before=({describe_voice_state(before)}) after=({describe_voice_state(after)}) target_channel_id={bot.get_voice_target(member.guild.id)}",
+    )
+
+    if after.channel is not None:
+        bot.set_voice_target(member.guild.id, after.channel.id)
+        bot.reset_voice_retry(member.guild.id)
+        return
+
+    target_channel_id = bot.get_voice_target(member.guild.id)
+    if not target_channel_id:
+        return
+
+    await asyncio.sleep(VOICE_RECONNECT_DELAY)
+    try:
+        vc = await ensure_voice_connection(member.guild, target_channel_id, reason="voice_state_update")
+        if vc:
+            bot.reset_voice_retry(member.guild.id)
+    except Exception as e:
+        print(f"[VC][LLM] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
 
 @bot.event
 async def on_message(message):
@@ -795,6 +1014,39 @@ async def refresh_models_cmd(interaction: discord.Interaction):
         delta = after - before
         sign = "+" if delta > 0 else ""
         await interaction.followup.send(f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta})", ephemeral=True)
+
+@bot.tree.command(name="vcjoin", description="현재 들어가 있는 음성 채널에 접속")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def vc_join(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not interaction.guild or not member or not member.voice or not member.voice.channel:
+        await interaction.response.send_message("[ERROR] 음성 채널에 먼저 접속해주세요.")
+        return
+
+    bot.set_voice_target(interaction.guild.id, member.voice.channel.id)
+    vc = await ensure_voice_connection(interaction.guild, member.voice.channel.id, reason="command")
+    if vc is None:
+        await interaction.response.send_message("[ERROR] 음성 채널 연결에 실패했습니다.")
+        return
+
+    await interaction.response.send_message(f"[OK] LLM VC 접속: {member.voice.channel.mention}")
+
+@bot.tree.command(name="vcleave", description="음성 채널에서 나가기")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def vc_leave(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("[ERROR] 서버에서만 사용 가능합니다.")
+        return
+
+    vc = interaction.guild.voice_client
+    bot.clear_voice_target(interaction.guild.id)
+    if vc and vc.is_connected():
+        await vc.disconnect()
+        await interaction.response.send_message("[OK] LLM VC 퇴장")
+    else:
+        await interaction.response.send_message("[OK] 현재 음성 채널에 접속되어 있지 않습니다.")
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
