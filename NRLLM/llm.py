@@ -21,7 +21,6 @@ HISTORY_LIMIT = 20
 IMAGE_HISTORY_LIMIT = 2
 VIDEO_HISTORY_LIMIT = 1
 AUDIO_HISTORY_LIMIT = 1
-MAX_FILE_READ_CHARS = 12000
 MAX_MEDIA_BASE64_MB = 20
 
 # 읽을 수 있는 텍스트 파일 확장자
@@ -31,6 +30,7 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
+DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -66,6 +66,7 @@ You are an AI member of this Discord server.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
 KST = timezone(timedelta(hours=9))
+DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
 
 # ================= 2. 데이터 관리자 =================
 class DataManager:
@@ -86,6 +87,122 @@ class DataManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except:
             pass
+
+class DocumentCache:
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        self.docs_dir = os.path.join(cache_dir, "docs")
+        self.index_file = os.path.join(cache_dir, "index.json")
+        os.makedirs(self.docs_dir, exist_ok=True)
+        self.index = self._load_index()
+
+    def _default_index(self):
+        return {"version": 1, "next_id": 1, "docs": {}, "message_to_docs": {}}
+
+    def _load_index(self):
+        if os.path.exists(self.index_file):
+            try:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("version", 1)
+                    data.setdefault("next_id", 1)
+                    data.setdefault("docs", {})
+                    data.setdefault("message_to_docs", {})
+                    return data
+            except Exception:
+                pass
+        return self._default_index()
+
+    def _save_index(self):
+        with open(self.index_file, 'w', encoding='utf-8') as f:
+            json.dump(self.index, f, indent=2, ensure_ascii=False)
+
+    def _make_doc_id(self):
+        doc_id = f"doc_{self.index['next_id']:06d}"
+        self.index["next_id"] += 1
+        return doc_id
+
+    def _doc_path(self, doc_id):
+        return os.path.join(self.docs_dir, f"{doc_id}.txt")
+
+    def _write_doc(self, doc_id, content):
+        with open(self._doc_path(doc_id), 'w', encoding='utf-8') as f:
+            f.write(content)
+
+    def store_document(self, doc_type, source_label, content, message_id, channel_id):
+        message_key = str(message_id)
+        docs_for_message = self.index["message_to_docs"].setdefault(message_key, [])
+        now = datetime.now(timezone.utc).isoformat()
+
+        for doc_id in docs_for_message:
+            doc = self.index["docs"].get(doc_id)
+            if doc and doc.get("type") == doc_type and doc.get("source_label") == source_label:
+                self._write_doc(doc_id, content)
+                doc.update({
+                    "channel_id": str(channel_id),
+                    "updated_at": now,
+                    "size": len(content),
+                })
+                self._save_index()
+                return doc_id
+
+        doc_id = self._make_doc_id()
+        self._write_doc(doc_id, content)
+        self.index["docs"][doc_id] = {
+            "id": doc_id,
+            "type": doc_type,
+            "source_label": source_label,
+            "message_id": message_key,
+            "channel_id": str(channel_id),
+            "created_at": now,
+            "updated_at": now,
+            "size": len(content),
+        }
+        docs_for_message.append(doc_id)
+        self._save_index()
+        return doc_id
+
+    def get_docs_for_message(self, message_id):
+        message_key = str(message_id)
+        result = []
+        for doc_id in self.index["message_to_docs"].get(message_key, []):
+            doc = self.index["docs"].get(doc_id)
+            if doc:
+                result.append(doc)
+        return result
+
+    def has_source(self, message_id, doc_type, source_label):
+        for doc in self.get_docs_for_message(message_id):
+            if doc.get("type") == doc_type and doc.get("source_label") == source_label:
+                return True
+        return False
+
+    def get_content(self, doc_id):
+        path = self._doc_path(doc_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception:
+            return None
+
+    def render_blocks(self, message_id, full_content=False):
+        blocks = []
+        for doc in self.get_docs_for_message(message_id):
+            doc_id = doc["id"]
+            label = doc.get("source_label", "")
+            if full_content:
+                content = self.get_content(doc_id)
+                if content is None:
+                    continue
+                title = "Cached Webpage Content" if doc.get("type") == "webpage" else "Cached File Content"
+                blocks.append(f"[{title}: {doc_id} | {label}]\n```\n{content}\n```")
+            else:
+                title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
+                blocks.append(f"[{title}: {doc_id} | {label}]")
+        return blocks
 
 def format_channel_ref(channel):
     if channel is None:
@@ -412,6 +529,7 @@ class OpenRouterBot(commands.Bot):
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
+        self.doc_cache = DocumentCache(DOC_CACHE_DIR)
 
     async def setup_hook(self):
         await self.or_client.fetch_models_metadata()
@@ -511,7 +629,7 @@ async def scrap_webpage(url):
                         script.extract()
                     text = soup.get_text(separator='\n')
                     clean_text = '\n'.join([line.strip() for line in text.splitlines() if line.strip()])
-                    return clean_text[:12000] + ("..." if len(clean_text) > 12000 else "")
+                    return clean_text
     except Exception as e:
         print(f"[WARN] URL 읽기 실패: {e}")
     return None
@@ -664,12 +782,14 @@ async def on_message(message):
                 reset_dt = None
                 if config.get("reset_time"):
                     reset_dt = datetime.fromisoformat(config["reset_time"])
+                reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
                 # 히스토리 구축
                 img_count = 0
                 vid_count = 0
                 aud_count = 0
                 history_buffer = []
+                history_position = 0
                 async for msg in message.channel.history(limit=HISTORY_LIMIT + 10):
                     if msg.id == message.id: continue
                     if msg.id > message.id and msg.author != bot.user: continue
@@ -681,6 +801,10 @@ async def on_message(message):
                     is_bot = (msg.author == bot.user)
                     role = "assistant" if is_bot else "user"
                     content_list = []
+                    cached_doc_blocks = []
+                    if not is_bot:
+                        replay_full_docs = (reply_target_id == msg.id) or (history_position < DOC_CACHE_AUTO_REPLAY_WINDOW)
+                        cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=replay_full_docs)
 
                     text_content = ""
                     if is_bot:
@@ -742,13 +866,12 @@ async def on_message(message):
                                         aud_count += 1
                                     else:
                                         text_content += f"\n(User attached an audio file: {att.filename})"
-                                elif att.filename.endswith(SUPPORTED_EXTENSIONS):
+                                elif att.filename.endswith(SUPPORTED_EXTENSIONS) and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
                                     try:
                                         raw_bytes = await att.read()
                                         for enc in ['utf-8', 'cp949', 'latin1']:
                                             try:
                                                 decoded = raw_bytes.decode(enc)
-                                                if len(decoded) > MAX_FILE_READ_CHARS: decoded = decoded[:MAX_FILE_READ_CHARS] + "..."
                                                 text_content += f"\n[File: {att.filename}]\n{decoded}"
                                                 break
                                             except: continue
@@ -758,11 +881,15 @@ async def on_message(message):
                                     elif ct.startswith('video'): text_content += f"\n(User attached a video: {att.filename})"
                                     elif ct.startswith('audio'): text_content += f"\n(User attached an audio file: {att.filename})"
 
+                    if cached_doc_blocks:
+                        text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
+
                     # 봇 메시지인데 텍스트도 없고 이미지도 없으면 히스토리 제외
                     if is_bot and not text_content.strip() and len(content_list) == 0:
                         continue
                     content_list.append({"type": "text", "text": text_content})
                     history_buffer.insert(0, {"role": role, "content": content_list})
+                    history_position += 1
 
                 messages.extend(history_buffer)
 
@@ -776,6 +903,8 @@ async def on_message(message):
                 for url in urls:
                     web_content = await scrap_webpage(url)
                     if web_content:
+                        doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
+                        print(f"[CACHE] webpage 저장: {doc_id} ({url})")
                         user_text += f"\n\n[Webpage Content: {url}]\n```\n{web_content}\n```"
                         print(f"[WEB] 웹사이트 내용 읽음: {url}")
 
@@ -810,7 +939,8 @@ async def on_message(message):
                                 for enc in ['utf-8', 'cp949', 'latin1']:
                                     try:
                                         decoded = raw_bytes.decode(enc)
-                                        if len(decoded) > MAX_FILE_READ_CHARS: decoded = decoded[:MAX_FILE_READ_CHARS] + "..."
+                                        doc_id = bot.doc_cache.store_document("text_file", att.filename, decoded, message.id, message.channel.id)
+                                        print(f"[CACHE] text file 저장: {doc_id} ({att.filename})")
                                         user_text += f"\n[Current File: {att.filename}]\n{decoded}"
                                         break
                                     except: continue

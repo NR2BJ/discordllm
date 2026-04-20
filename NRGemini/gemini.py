@@ -124,6 +124,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
 KST = timezone(timedelta(hours=9))
+DOC_CACHE_DIR = os.environ.get("GEMINI_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_doc_cache"))
+DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 
 SOUND_DIR = os.path.join(BASE_DIR, "sb")
 SOUND_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.weba')
@@ -411,6 +413,122 @@ class DataManager:
             with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2, ensure_ascii=False)
         except: pass
 
+class DocumentCache:
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        self.docs_dir = os.path.join(cache_dir, "docs")
+        self.index_file = os.path.join(cache_dir, "index.json")
+        os.makedirs(self.docs_dir, exist_ok=True)
+        self.index = self._load_index()
+
+    def _default_index(self):
+        return {"version": 1, "next_id": 1, "docs": {}, "message_to_docs": {}}
+
+    def _load_index(self):
+        if os.path.exists(self.index_file):
+            try:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("version", 1)
+                    data.setdefault("next_id", 1)
+                    data.setdefault("docs", {})
+                    data.setdefault("message_to_docs", {})
+                    return data
+            except Exception:
+                pass
+        return self._default_index()
+
+    def _save_index(self):
+        with open(self.index_file, 'w', encoding='utf-8') as f:
+            json.dump(self.index, f, indent=2, ensure_ascii=False)
+
+    def _make_doc_id(self):
+        doc_id = f"doc_{self.index['next_id']:06d}"
+        self.index["next_id"] += 1
+        return doc_id
+
+    def _doc_path(self, doc_id):
+        return os.path.join(self.docs_dir, f"{doc_id}.txt")
+
+    def _write_doc(self, doc_id, content):
+        with open(self._doc_path(doc_id), 'w', encoding='utf-8') as f:
+            f.write(content)
+
+    def store_document(self, doc_type, source_label, content, message_id, channel_id):
+        message_key = str(message_id)
+        docs_for_message = self.index["message_to_docs"].setdefault(message_key, [])
+        now = datetime.now(timezone.utc).isoformat()
+
+        for doc_id in docs_for_message:
+            doc = self.index["docs"].get(doc_id)
+            if doc and doc.get("type") == doc_type and doc.get("source_label") == source_label:
+                self._write_doc(doc_id, content)
+                doc.update({
+                    "channel_id": str(channel_id),
+                    "updated_at": now,
+                    "size": len(content),
+                })
+                self._save_index()
+                return doc_id
+
+        doc_id = self._make_doc_id()
+        self._write_doc(doc_id, content)
+        self.index["docs"][doc_id] = {
+            "id": doc_id,
+            "type": doc_type,
+            "source_label": source_label,
+            "message_id": message_key,
+            "channel_id": str(channel_id),
+            "created_at": now,
+            "updated_at": now,
+            "size": len(content),
+        }
+        docs_for_message.append(doc_id)
+        self._save_index()
+        return doc_id
+
+    def get_docs_for_message(self, message_id):
+        message_key = str(message_id)
+        result = []
+        for doc_id in self.index["message_to_docs"].get(message_key, []):
+            doc = self.index["docs"].get(doc_id)
+            if doc:
+                result.append(doc)
+        return result
+
+    def has_source(self, message_id, doc_type, source_label):
+        for doc in self.get_docs_for_message(message_id):
+            if doc.get("type") == doc_type and doc.get("source_label") == source_label:
+                return True
+        return False
+
+    def get_content(self, doc_id):
+        path = self._doc_path(doc_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception:
+            return None
+
+    def render_blocks(self, message_id, full_content=False):
+        blocks = []
+        for doc in self.get_docs_for_message(message_id):
+            doc_id = doc["id"]
+            label = doc.get("source_label", "")
+            if full_content:
+                content = self.get_content(doc_id)
+                if content is None:
+                    continue
+                title = "Cached Webpage Content" if doc.get("type") == "webpage" else "Cached File Content"
+                blocks.append(f"[{title}: {doc_id} | {label}]\n```\n{content}\n```")
+            else:
+                title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
+                blocks.append(f"[{title}: {doc_id} | {label}]")
+        return blocks
+
 # ================= 3. 유틸리티 & API =================
 async def download_media(url):
     try:
@@ -467,7 +585,7 @@ async def scrap_webpage(url):
                         script.extract()
                     text = soup.get_text(separator='\n')
                     clean_text = '\n'.join([line.strip() for line in text.splitlines() if line.strip()])
-                    return clean_text[:12000] + ("..." if len(clean_text) > 12000 else "")
+                    return clean_text
     except Exception as e:
         print(f"[WARN] URL 읽기 실패: {e}")
     return None
@@ -616,6 +734,7 @@ class GeminiBot(commands.Bot):
         self.voice_connected_at = {}
         self.voice_bad_state_counts = {}
         self.loop_monitor_expected = None
+        self.doc_cache = DocumentCache(DOC_CACHE_DIR)
         self.sound_files = scan_sound_files()
         self.sound_volume = SOUND_VOLUME
         self._sound_dir_mtime = self._get_sound_dir_mtime()
@@ -1203,14 +1322,21 @@ async def on_message(message):
                 server_image_model = config.get("image_model", IMAGE_MODEL)
                 history_limit = get_history_limit_for_text_model(server_text_model)
                 reset_ts = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
+                reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
                 history_list = []
                 print(f"[HIST] {server_text_model}: history_limit={history_limit}")
+                history_position = 0
 
                 async for msg in message.channel.history(limit=history_limit + 10):
                     if msg.id == message.id: continue
                     if msg.id > message.id and msg.author != bot.user: continue
                     if reset_ts and msg.created_at < reset_ts: break
+
+                    cached_doc_blocks = []
+                    if msg.author != bot.user:
+                        replay_full_docs = (reply_target_id == msg.id) or (history_position < DOC_CACHE_AUTO_REPLAY_WINDOW)
+                        cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=replay_full_docs)
 
                     if msg.author == bot.user:
                         content = msg.content
@@ -1235,15 +1361,19 @@ async def on_message(message):
                                     content += f"\n(User attached a {media_type} file: {att.filename})"
                                 else:
                                     is_text = (att.content_type and "text" in att.content_type) or att.filename.lower().endswith(text_extensions)
-                                    if is_text:
+                                    if is_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
                                         try:
                                             file_bytes = await att.read()
                                             file_text = file_bytes.decode('utf-8')
                                             content += f"\n\n[Attached File Content: {att.filename}]\n```\n{file_text}\n```"
                                         except: pass
 
+                    if cached_doc_blocks:
+                        content += "\n\n" + "\n\n".join(cached_doc_blocks)
+
                     role = "model" if msg.author == bot.user else "user"
                     history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
+                    history_position += 1
 
                 _cur_member = message.guild.get_member(message.author.id) or message.author
                 current_parts = [types.Part(text=f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}")]
@@ -1252,6 +1382,8 @@ async def on_message(message):
                 for url in urls:
                     web_content = await scrap_webpage(url)
                     if web_content:
+                        doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
+                        print(f"[CACHE] webpage 저장: {doc_id} ({url})")
                         current_parts.append(types.Part(text=f"\n\n[Webpage Content: {url}]\n```\n{web_content}\n```"))
                         print(f"[WEB] 웹사이트 내용 읽음: {url}")
 
@@ -1278,6 +1410,8 @@ async def on_message(message):
                                 try:
                                     file_bytes = await att.read()
                                     file_content = file_bytes.decode('utf-8')
+                                    doc_id = bot.doc_cache.store_document("text_file", att.filename, file_content, message.id, message.channel.id)
+                                    print(f"[CACHE] text file 저장: {doc_id} ({att.filename})")
                                     current_parts.append(types.Part(text=f"\n\n[Attached File Content: {att.filename}]\n```\n{file_content}\n```"))
                                 except: pass
 
