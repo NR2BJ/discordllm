@@ -29,8 +29,8 @@ AVAILABLE_IMAGE_MODELS = {
 TEXT_MODEL = AVAILABLE_MODELS["4.20"]
 IMAGE_MODEL = AVAILABLE_IMAGE_MODELS["imagine"]
 
-HISTORY_LIMIT = 100
-IMAGE_SEARCH_LIMIT = 20
+HISTORY_LIMIT = 20
+IMAGE_SEARCH_LIMIT = 2
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))

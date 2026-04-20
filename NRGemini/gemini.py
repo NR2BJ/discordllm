@@ -56,9 +56,14 @@ TEXT_MODEL = AVAILABLE_MODELS["3.1-pro"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro"]["image"]
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
-HISTORY_LIMIT = 100
-IMAGE_SEARCH_LIMIT = 20
+DEFAULT_HISTORY_LIMIT = 100
+IMAGE_SEARCH_LIMIT = 2
 MAX_REF_IMAGES = 1
+MODEL_HISTORY_LIMITS = {
+    AVAILABLE_MODELS["3.1-pro"]["text"]: 20,
+    AVAILABLE_MODELS["3-flash"]["text"]: 50,
+    AVAILABLE_MODELS["3.1-flash-lite"]["text"]: 100,
+}
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -159,6 +164,9 @@ def get_voice_ws_closed(vc):
         except Exception:
             return "error"
     return closed
+
+def get_history_limit_for_text_model(text_model):
+    return MODEL_HISTORY_LIMITS.get(text_model, DEFAULT_HISTORY_LIMIT)
 
 def get_voice_unhealthy_reason(vc):
     if vc is None:
@@ -1191,11 +1199,15 @@ async def on_message(message):
         async with message.channel.typing():
             try:
                 text_extensions = ('.txt', '.py', '.json', '.md', '.c', '.cpp', '.js', '.html', '.css', '.log', '.xml', '.yaml', '.sh', '.csv')
+                server_text_model = config.get("text_model", TEXT_MODEL)
+                server_image_model = config.get("image_model", IMAGE_MODEL)
+                history_limit = get_history_limit_for_text_model(server_text_model)
                 reset_ts = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
 
                 history_list = []
+                print(f"[HIST] {server_text_model}: history_limit={history_limit}")
 
-                async for msg in message.channel.history(limit=HISTORY_LIMIT + 10):
+                async for msg in message.channel.history(limit=history_limit + 10):
                     if msg.id == message.id: continue
                     if msg.id > message.id and msg.author != bot.user: continue
                     if reset_ts and msg.created_at < reset_ts: break
@@ -1270,10 +1282,6 @@ async def on_message(message):
                                 except: pass
 
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
-
-                # Per-server model selection (falls back to global default)
-                server_text_model = config.get("text_model", TEXT_MODEL)
-                server_image_model = config.get("image_model", IMAGE_MODEL)
 
                 response, token_usage = await call_gemini(full_contents, message.content, text_model=server_text_model)
 
@@ -2200,11 +2208,14 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
             cfg = bot.get_config(interaction.guild_id)
             server_tm = cfg.get("text_model", TEXT_MODEL)
             server_im = cfg.get("image_model", IMAGE_MODEL)
+            server_hist = get_history_limit_for_text_model(server_tm)
+            global_hist = get_history_limit_for_text_model(TEXT_MODEL)
             await temp_reply(interaction,
-                f"이 서버 모델: `{server_tm}` (텍스트) / `{server_im}` (이미지)\n글로벌 기본값: `{TEXT_MODEL}` / `{IMAGE_MODEL}`")
+                f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개) / `{server_im}` (이미지)\n글로벌 기본값: `{TEXT_MODEL}` (히스토리 {global_hist}개) / `{IMAGE_MODEL}`")
         else:
+            global_hist = get_history_limit_for_text_model(TEXT_MODEL)
             await temp_reply(interaction,
-                f"글로벌 기본 모델: `{TEXT_MODEL}` (텍스트) / `{IMAGE_MODEL}` (이미지)")
+                f"글로벌 기본 모델: `{TEXT_MODEL}` (텍스트, 히스토리 {global_hist}개) / `{IMAGE_MODEL}` (이미지)")
         return
     if name not in AVAILABLE_MODELS:
         available = ', '.join(AVAILABLE_MODELS.keys())
@@ -2217,8 +2228,9 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         cfg["text_model"] = TEXT_MODEL
         cfg["image_model"] = IMAGE_MODEL
         bot.save_config()
+    history_limit = get_history_limit_for_text_model(TEXT_MODEL)
     await temp_reply(interaction,
-        f"모델 변경됨: **{name}**\n텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`")
+        f"모델 변경됨: **{name}**\n텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n히스토리 참조: {history_limit}개")
 
 @switch_model.autocomplete('name')
 async def model_autocomplete(interaction: discord.Interaction, current: str):
