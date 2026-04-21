@@ -147,6 +147,8 @@ VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
 VOICE_SELF_DEAF = True
 VOICE_SELF_MUTE = False
+VOICE_SILENCE_KEEPALIVE = True
+VOICE_SILENCE_RESUME_DELAY = 0.5
 VOICE_DEBUG_LOGS = False
 LOOP_MONITOR_INTERVAL = 2.0
 LOOP_MONITOR_WARN = 2.5
@@ -305,6 +307,83 @@ async def apply_voice_preferences(guild, channel):
     except Exception as e:
         log_voice_debug(f"[VC] voice state 선호값 적용 실패 ({guild.name}): {e}")
 
+def make_silence_audio_source():
+    return discord.FFmpegPCMAudio(
+        "anullsrc=channel_layout=stereo:sample_rate=48000",
+        before_options="-f lavfi",
+        options="-vn",
+    )
+
+async def ensure_silence_keepalive(guild, vc=None, *, reason="unknown"):
+    if not VOICE_SILENCE_KEEPALIVE:
+        return False
+
+    target_channel_id = bot.get_voice_target(guild.id)
+    if not target_channel_id:
+        return False
+
+    if vc is None:
+        vc = guild.voice_client
+
+    if vc is None or not vc.is_connected():
+        return False
+
+    try:
+        if vc.is_playing() or vc.is_paused():
+            return False
+    except Exception:
+        return False
+
+    try:
+        vc.play(make_silence_audio_source())
+        log_voice_debug(f"[VC] 무음 keepalive 시작 ({guild.name}) [{reason}]")
+        return True
+    except Exception as e:
+        log_voice_debug(f"[VC] 무음 keepalive 시작 실패 ({guild.name}) [{reason}]: {e}")
+        return False
+
+async def resume_silence_keepalive(guild_id, delay=VOICE_SILENCE_RESUME_DELAY, *, reason="unknown"):
+    if not VOICE_SILENCE_KEEPALIVE:
+        return
+
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    guild = bot.get_guild(guild_id)
+    if guild is None or bot.is_closed():
+        return
+
+    target_channel_id = bot.get_voice_target(guild.id)
+    if not target_channel_id:
+        return
+
+    vc = guild.voice_client
+    if vc is None or not vc.is_connected():
+        vc = await ensure_voice_connection(
+            guild,
+            target_channel_id,
+            move=True,
+            reason=f"{reason}_resume",
+        )
+        if vc is None:
+            return
+
+    await ensure_silence_keepalive(guild, vc, reason=reason)
+
+def schedule_silence_keepalive_resume(guild_id, delay=VOICE_SILENCE_RESUME_DELAY, *, reason="unknown"):
+    if not VOICE_SILENCE_KEEPALIVE or bot.is_closed():
+        return
+
+    try:
+        asyncio.run_coroutine_threadsafe(
+            resume_silence_keepalive(guild_id, delay=delay, reason=reason),
+            bot.loop,
+        )
+    except Exception as e:
+        guild = bot.get_guild(guild_id)
+        guild_name = guild.name if guild else guild_id
+        log_voice_debug(f"[VC] 무음 keepalive 재개 예약 실패 ({guild_name}) [{reason}]: {e}")
+
 async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unknown"):
     channel = await resolve_voice_channel(guild, channel_id)
     if channel is None:
@@ -331,6 +410,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
                 )
             await apply_voice_preferences(guild, channel)
             bot.mark_voice_connected(guild.id)
+            await ensure_silence_keepalive(guild, vc, reason=reason)
             return vc
 
         if vc:
@@ -353,6 +433,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
             extra=f"target={format_channel_ref(channel)}",
         )
         bot.mark_voice_connected(guild.id)
+        await ensure_silence_keepalive(guild, vc, reason=reason)
         return vc
 
 # ================= 사운드보드 유틸리티 =================
@@ -433,6 +514,10 @@ async def play_sound_in_vc(guild, member, sound_name, bot_instance):
             guild,
             vc,
             extra=f"status={status}",
+        )
+        schedule_silence_keepalive_resume(
+            guild.id,
+            reason=f"soundboard:{key}",
         )
 
     vc.play(audio, after=after_play)
@@ -955,6 +1040,8 @@ async def voice_watchdog():
                     if vc:
                         bot.reset_voice_retry(guild.id)
                     continue
+                if target_channel_id:
+                    await ensure_silence_keepalive(guild, vc, reason="watchdog_idle")
             except Exception as e:
                 log_voice_debug(f"[VC] watchdog 재시작 실패 ({guild.name}): {e}")
             continue
@@ -1152,7 +1239,16 @@ async def sibo_loop(my_gen=None):
                     channel = guild.get_channel(vc_channel_id)
                     if channel:
                         try:
-                            vc = await channel.connect()
+                            vc = await ensure_voice_connection(
+                                guild,
+                                vc_channel_id,
+                                move=True,
+                                reason="sibo_reconnect",
+                            )
+                            if not vc:
+                                try: audio.cleanup()
+                                except Exception: pass
+                                continue
                             print(f"[SIBO] Guild {gid} VC 자동 재접속: {channel.name}")
                         except Exception as e:
                             print(f"[SIBO] Guild {gid} VC 재접속 실패: {e}")
@@ -1170,7 +1266,15 @@ async def sibo_loop(my_gen=None):
 
             if vc.is_playing():
                 vc.stop()
-            vc.play(audio)
+            def after_sibo_play(error, guild_id=int(gid), sound_name=sound_key):
+                if error:
+                    print(f"[SIBO] Guild {guild_id} 재생 종료 오류: {error}")
+                schedule_silence_keepalive_resume(
+                    guild_id,
+                    reason=f"sibo:{sound_name}",
+                )
+
+            vc.play(audio, after=after_sibo_play)
             play_now = datetime.now(KST)
             print(f"[SIBO] {play_now.strftime('%H:%M:%S.%f')[:-4]} Guild {gid} 시보 재생: {sound_key}")
 
@@ -1232,6 +1336,7 @@ async def on_ready():
         target_channel_id = bot.get_voice_target(guild.id)
         if guild.voice_client and guild.voice_client.is_connected():
             bot.mark_voice_connected(guild.id)
+            await ensure_silence_keepalive(guild, guild.voice_client, reason="on_ready")
         if target_channel_id:
             log_voice_snapshot(
                 "on_ready keepalive 상태",
@@ -1286,6 +1391,11 @@ async def on_voice_state_update(member, before, after):
         bot.set_voice_target(member.guild.id, after.channel.id)
         bot.reset_voice_retry(member.guild.id)
         bot.mark_voice_connected(member.guild.id)
+        await ensure_silence_keepalive(
+            member.guild,
+            member.guild.voice_client,
+            reason="voice_state_update_connected",
+        )
         return
 
     target_channel_id = bot.get_voice_target(member.guild.id)
