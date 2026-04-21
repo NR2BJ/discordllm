@@ -138,6 +138,7 @@ VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
+VOICE_DEBUG_LOGS = False
 LOOP_MONITOR_INTERVAL = 2.0
 LOOP_MONITOR_WARN = 2.5
 
@@ -229,6 +230,8 @@ def describe_voice_state(state):
     )
 
 def log_voice_snapshot(prefix, guild=None, vc=None, extra=None):
+    if not VOICE_DEBUG_LOGS:
+        return
     parts = [f"[VC] {prefix}"]
     if guild is not None:
         parts.append(f"guild={guild.name}({guild.id})")
@@ -237,24 +240,9 @@ def log_voice_snapshot(prefix, guild=None, vc=None, extra=None):
     parts.append(describe_voice_client(vc))
     print(" | ".join(parts))
 
-def describe_history_message(msg, guild=None):
-    if msg is None:
-        return "none"
-    author = "bot" if guild is not None and msg.author == guild.me else f"user:{getattr(msg.author, 'display_name', msg.author)}"
-    created_at = getattr(msg, "created_at", None)
-    if created_at is not None:
-        created_text = created_at.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S JST")
-    else:
-        created_text = "unknown"
-    content = (msg.content or "").replace("\n", "\\n").strip()
-    if len(content) > 60:
-        content = content[:57] + "..."
-    if not content:
-        content = "<no-text>"
-    return (
-        f"id={msg.id} author={author} created_at={created_text} "
-        f"attachments={len(getattr(msg, 'attachments', []))} content={content!r}"
-    )
+def log_voice_debug(message):
+    if VOICE_DEBUG_LOGS:
+        print(message)
 
 async def cleanup_stale_voice_client(vc, guild):
     """끊어진 VoiceClient 캐시를 정리해서 재접속 막힘 방지."""
@@ -265,9 +253,9 @@ async def cleanup_stale_voice_client(vc, guild):
         try:
             await vc.disconnect()
         except Exception as e:
-            print(f"[VC] stale disconnect fallback 실패 ({guild.name}): {e}")
+            log_voice_debug(f"[VC] stale disconnect fallback 실패 ({guild.name}): {e}")
     except Exception as e:
-        print(f"[VC] stale disconnect 실패 ({guild.name}): {e}")
+        log_voice_debug(f"[VC] stale disconnect 실패 ({guild.name}): {e}")
     try:
         vc.cleanup()
     except Exception:
@@ -282,17 +270,17 @@ async def resolve_voice_channel(guild, channel_id):
         try:
             channel = await bot.fetch_channel(channel_id)
         except Exception as e:
-            print(f"[VC] 채널 조회 실패 ({guild.name}, {channel_id}): {e}")
+            log_voice_debug(f"[VC] 채널 조회 실패 ({guild.name}, {channel_id}): {e}")
             return None
     if not hasattr(channel, "connect"):
-        print(f"[VC] 연결 불가 채널 타입 ({guild.name}, {channel_id})")
+        log_voice_debug(f"[VC] 연결 불가 채널 타입 ({guild.name}, {channel_id})")
         return None
     return channel
 
 async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unknown"):
     channel = await resolve_voice_channel(guild, channel_id)
     if channel is None:
-        print(f"[VC] 연결 대상 채널 조회 실패 ({guild.name}, {channel_id}) [{reason}]")
+        log_voice_debug(f"[VC] 연결 대상 채널 조회 실패 ({guild.name}, {channel_id}) [{reason}]")
         return None
 
     async with bot.get_voice_lock(guild.id):
@@ -841,7 +829,7 @@ class GeminiBot(commands.Bot):
             self.save_config()
             guild = self.get_guild(guild_id)
             guild_name = guild.name if guild else guild_id
-            print(f"[VC] keepalive 대상 저장 ({guild_name}): channel_id={channel_id}")
+            log_voice_debug(f"[VC] keepalive 대상 저장 ({guild_name}): channel_id={channel_id}")
 
     def clear_voice_target(self, guild_id):
         cfg = self.get_config(guild_id)
@@ -853,7 +841,7 @@ class GeminiBot(commands.Bot):
             self.voice_connected_at.pop(str(guild_id), None)
             guild = self.get_guild(guild_id)
             guild_name = guild.name if guild else guild_id
-            print(f"[VC] keepalive 대상 해제 ({guild_name}): channel_id={old_channel_id}")
+            log_voice_debug(f"[VC] keepalive 대상 해제 ({guild_name}): channel_id={old_channel_id}")
 
     def can_retry_voice(self, guild_id):
         now = time_module.monotonic()
@@ -934,7 +922,7 @@ async def voice_watchdog():
                         bot.reset_voice_retry(guild.id)
                     continue
             except Exception as e:
-                print(f"[VC] watchdog 재시작 실패 ({guild.name}): {e}")
+                log_voice_debug(f"[VC] watchdog 재시작 실패 ({guild.name}): {e}")
             continue
 
         target_channel_id = bot.get_voice_target(guild.id)
@@ -957,7 +945,7 @@ async def voice_watchdog():
             if vc:
                 bot.reset_voice_retry(guild.id)
         except Exception as e:
-            print(f"[VC] watchdog 재접속 실패 ({guild.name}): {e}")
+            log_voice_debug(f"[VC] watchdog 재접속 실패 ({guild.name}): {e}")
 
 @tasks.loop(seconds=5)
 async def sound_watcher():
@@ -1222,7 +1210,7 @@ async def on_ready():
 @bot.event
 async def on_disconnect():
     active = sum(1 for guild in bot.guilds if guild.voice_client is not None)
-    print(f"[GATEWAY] on_disconnect | active_voice_clients={active}")
+    log_voice_debug(f"[GATEWAY] on_disconnect | active_voice_clients={active}")
     for guild in bot.guilds:
         target_channel_id = bot.get_voice_target(guild.id)
         if guild.voice_client is not None or target_channel_id:
@@ -1236,7 +1224,7 @@ async def on_disconnect():
 @bot.event
 async def on_resumed():
     active = sum(1 for guild in bot.guilds if guild.voice_client is not None)
-    print(f"[GATEWAY] on_resumed | active_voice_clients={active}")
+    log_voice_debug(f"[GATEWAY] on_resumed | active_voice_clients={active}")
     for guild in bot.guilds:
         target_channel_id = bot.get_voice_target(guild.id)
         if guild.voice_client is not None or target_channel_id:
@@ -1271,7 +1259,7 @@ async def on_voice_state_update(member, before, after):
         return
 
     bot.mark_voice_disconnected(member.guild.id)
-    print(
+    log_voice_debug(
         f"[VC] bot 음성 채널 이탈 감지 ({member.guild.name}): "
         f"target_channel_id={target_channel_id}, {VOICE_RECONNECT_DELAY}초 후 재접속 시도"
     )
@@ -1286,7 +1274,7 @@ async def on_voice_state_update(member, before, after):
         if vc:
             bot.reset_voice_retry(member.guild.id)
     except Exception as e:
-        print(f"[VC] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
+        log_voice_debug(f"[VC] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
 
 @bot.event
 async def on_message(message):
@@ -1344,63 +1332,17 @@ async def on_message(message):
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
                 history_list = []
-                history_scan_limit = history_limit + 10
-                history_stats = {
-                    "scanned_total": 0,
-                    "scanned_user": 0,
-                    "scanned_model": 0,
-                    "included_total": 0,
-                    "included_user": 0,
-                    "included_model": 0,
-                    "skipped_current": 0,
-                    "skipped_future_user": 0,
-                    "skipped_bot_empty": 0,
-                    "cached_full_messages": 0,
-                    "cached_marker_messages": 0,
-                }
-                history_stop_reason = "exhausted"
-                newest_scanned_msg = None
-                oldest_scanned_msg = None
-                newest_included_msg = None
-                oldest_included_msg = None
-                reset_cutoff_msg = None
-                print(
-                    f"[HIST] {server_text_model}: history_limit={history_limit} "
-                    f"scan_limit={history_scan_limit} reset_time={config.get('reset_time')} "
-                    f"channel={message.channel.id} current_message={message.id}"
-                )
                 history_position = 0
 
-                async for msg in message.channel.history(limit=history_scan_limit):
-                    history_stats["scanned_total"] += 1
-                    if msg.author == bot.user:
-                        history_stats["scanned_model"] += 1
-                    else:
-                        history_stats["scanned_user"] += 1
-                    if newest_scanned_msg is None:
-                        newest_scanned_msg = msg
-                    oldest_scanned_msg = msg
-
-                    if msg.id == message.id:
-                        history_stats["skipped_current"] += 1
-                        continue
-                    if msg.id > message.id and msg.author != bot.user:
-                        history_stats["skipped_future_user"] += 1
-                        continue
-                    if reset_ts and msg.created_at < reset_ts:
-                        history_stop_reason = "reset_time"
-                        reset_cutoff_msg = msg
-                        break
+                async for msg in message.channel.history(limit=history_limit + 10):
+                    if msg.id == message.id: continue
+                    if msg.id > message.id and msg.author != bot.user: continue
+                    if reset_ts and msg.created_at < reset_ts: break
 
                     cached_doc_blocks = []
                     if msg.author != bot.user:
                         replay_full_docs = (reply_target_id == msg.id) or (history_position < DOC_CACHE_AUTO_REPLAY_WINDOW)
                         cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=replay_full_docs)
-                        if cached_doc_blocks:
-                            if replay_full_docs:
-                                history_stats["cached_full_messages"] += 1
-                            else:
-                                history_stats["cached_marker_messages"] += 1
 
                     if msg.author == bot.user:
                         content = msg.content
@@ -1414,7 +1356,6 @@ async def on_message(message):
                                     content += f"\n(Bot generated a video here: {att.filename})"
                                 # 이미지는 마커 없이 스킵 (최근 이미지는 base64로 별도 포함)
                         if not content.strip():
-                            history_stats["skipped_bot_empty"] += 1
                             continue  # 텍스트 없는 이미지 전용 메시지는 히스토리 제외
                     else:
                         _member = message.guild.get_member(msg.author.id) or msg.author
@@ -1438,23 +1379,10 @@ async def on_message(message):
 
                     role = "model" if msg.author == bot.user else "user"
                     history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
-                    history_stats["included_total"] += 1
-                    if role == "model":
-                        history_stats["included_model"] += 1
-                    else:
-                        history_stats["included_user"] += 1
-                    if newest_included_msg is None:
-                        newest_included_msg = msg
-                    oldest_included_msg = msg
                     history_position += 1
 
                 _cur_member = message.guild.get_member(message.author.id) or message.author
                 current_parts = [types.Part(text=f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}")]
-                current_url_count = 0
-                current_text_file_count = 0
-                current_image_count = 0
-                current_video_count = 0
-                current_audio_count = 0
 
                 urls = re.findall(r'(https?://\S+)', message.content)
                 for url in urls:
@@ -1464,7 +1392,6 @@ async def on_message(message):
                         print(f"[CACHE] webpage 저장: {doc_id} ({url})")
                         current_parts.append(types.Part(text=f"\n\n[Webpage Content: {url}]\n```\n{web_content}\n```"))
                         print(f"[WEB] 웹사이트 내용 읽음: {url}")
-                        current_url_count += 1
 
                 if message.attachments:
                     for att in message.attachments:
@@ -1472,7 +1399,6 @@ async def on_message(message):
                             d, m = await download_media(att.url)
                             if d:
                                 current_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=d.getvalue())))
-                                current_image_count += 1
                         elif att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
                             d, m = await download_media(att.url)
                             if d:
@@ -1485,10 +1411,6 @@ async def on_message(message):
                                     if file_ref:
                                         current_parts.append(types.Part(file_data=types.FileData(file_uri=file_ref.uri, mime_type=m)))
                                 print(f"[{media_type.upper()}] {media_type} 첨부: {att.filename} ({len(file_bytes)} bytes)")
-                                if media_type == "video":
-                                    current_video_count += 1
-                                else:
-                                    current_audio_count += 1
                         else:
                             is_text = (att.content_type and "text" in att.content_type) or att.filename.lower().endswith(text_extensions)
                             if is_text:
@@ -1498,29 +1420,9 @@ async def on_message(message):
                                     doc_id = bot.doc_cache.store_document("text_file", att.filename, file_content, message.id, message.channel.id)
                                     print(f"[CACHE] text file 저장: {doc_id} ({att.filename})")
                                     current_parts.append(types.Part(text=f"\n\n[Attached File Content: {att.filename}]\n```\n{file_content}\n```"))
-                                    current_text_file_count += 1
                                 except: pass
 
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
-                print(
-                    f"[HIST] assembled total={history_stats['included_total']} "
-                    f"user={history_stats['included_user']} model={history_stats['included_model']} "
-                    f"scanned_total={history_stats['scanned_total']} scanned_user={history_stats['scanned_user']} "
-                    f"scanned_model={history_stats['scanned_model']} skipped_current={history_stats['skipped_current']} "
-                    f"skipped_future_user={history_stats['skipped_future_user']} "
-                    f"skipped_bot_empty={history_stats['skipped_bot_empty']} "
-                    f"cached_full_messages={history_stats['cached_full_messages']} "
-                    f"cached_marker_messages={history_stats['cached_marker_messages']} "
-                    f"stop_reason={history_stop_reason} "
-                    f"newest_scanned=({describe_history_message(newest_scanned_msg, message.guild)}) "
-                    f"oldest_scanned=({describe_history_message(oldest_scanned_msg, message.guild)}) "
-                    f"newest_included=({describe_history_message(newest_included_msg, message.guild)}) "
-                    f"oldest_included=({describe_history_message(oldest_included_msg, message.guild)}) "
-                    f"reset_cutoff=({describe_history_message(reset_cutoff_msg, message.guild)}) "
-                    f"current_urls={current_url_count} current_text_files={current_text_file_count} "
-                    f"current_images={current_image_count} current_videos={current_video_count} "
-                    f"current_audios={current_audio_count} current_parts={len(current_parts)}"
-                )
 
                 response, token_usage = await call_gemini(full_contents, message.content, text_model=server_text_model)
 

@@ -67,6 +67,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
+VOICE_DEBUG_LOGS = False
+HISTORY_DEBUG_LOGS = False
 
 # ================= 2. 데이터 관리자 =================
 class DataManager:
@@ -241,6 +243,8 @@ def describe_voice_state(state):
     )
 
 def log_voice_snapshot(prefix, guild=None, vc=None, extra=None):
+    if not VOICE_DEBUG_LOGS:
+        return
     parts = [f"[VC][LLM] {prefix}"]
     if guild is not None:
         parts.append(f"guild={guild.name}({guild.id})")
@@ -248,6 +252,14 @@ def log_voice_snapshot(prefix, guild=None, vc=None, extra=None):
         parts.append(extra)
     parts.append(describe_voice_client(vc))
     print(" | ".join(parts))
+
+def log_voice_debug(message):
+    if VOICE_DEBUG_LOGS:
+        print(message)
+
+def log_history_debug(message):
+    if HISTORY_DEBUG_LOGS:
+        print(message)
 
 async def cleanup_stale_voice_client(vc, guild):
     log_voice_snapshot("stale VC 정리 시작", guild, vc)
@@ -257,9 +269,9 @@ async def cleanup_stale_voice_client(vc, guild):
         try:
             await vc.disconnect()
         except Exception as e:
-            print(f"[VC][LLM] stale disconnect fallback 실패 ({guild.name}): {e}")
+            log_voice_debug(f"[VC][LLM] stale disconnect fallback 실패 ({guild.name}): {e}")
     except Exception as e:
-        print(f"[VC][LLM] stale disconnect 실패 ({guild.name}): {e}")
+        log_voice_debug(f"[VC][LLM] stale disconnect 실패 ({guild.name}): {e}")
     try:
         vc.cleanup()
     except Exception:
@@ -274,10 +286,10 @@ async def resolve_voice_channel(guild, channel_id):
         try:
             channel = await bot.fetch_channel(channel_id)
         except Exception as e:
-            print(f"[VC][LLM] 채널 조회 실패 ({guild.name}, {channel_id}): {e}")
+            log_voice_debug(f"[VC][LLM] 채널 조회 실패 ({guild.name}, {channel_id}): {e}")
             return None
     if not hasattr(channel, "connect"):
-        print(f"[VC][LLM] 연결 불가 채널 타입 ({guild.name}, {channel_id})")
+        log_voice_debug(f"[VC][LLM] 연결 불가 채널 타입 ({guild.name}, {channel_id})")
         return None
     return channel
 
@@ -612,7 +624,7 @@ async def voice_watchdog():
             if vc:
                 bot.reset_voice_retry(guild.id)
         except Exception as e:
-            print(f"[VC][LLM] watchdog 재접속 실패 ({guild.name}): {e}")
+            log_voice_debug(f"[VC][LLM] watchdog 재접속 실패 ({guild.name}): {e}")
 
 # ================= 5. 유틸리티 함수 =================
 async def scrap_webpage(url):
@@ -735,7 +747,7 @@ async def on_voice_state_update(member, before, after):
         if vc:
             bot.reset_voice_retry(member.guild.id)
     except Exception as e:
-        print(f"[VC][LLM] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
+        log_voice_debug(f"[VC][LLM] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
 
 @bot.event
 async def on_message(message):
@@ -824,13 +836,13 @@ async def on_message(message):
                                     if b64:
                                         content_list.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
                                         img_count += 1
-                                        print(f"[HIST] 봇 이미지 히스토리 포함: {att.filename} ({len(b64)} chars)")
+                                        log_history_debug(f"[HIST] 봇 이미지 히스토리 포함: {att.filename} ({len(b64)} chars)")
                                     else:
-                                        print(f"[HIST] 봇 이미지 인코딩 실패: {att.url[:80]}")
+                                        log_history_debug(f"[HIST] 봇 이미지 인코딩 실패: {att.url[:80]}")
                                         # 마커 없이 스킵
                                 elif ct.startswith('image'):
                                     reason = "no_cap" if not can_see_image else f"limit({img_count}>={IMAGE_HISTORY_LIMIT})" if img_count >= IMAGE_HISTORY_LIMIT else f"too_large({file_size})"
-                                    print(f"[HIST] 봇 이미지 스킵: {reason}")
+                                    log_history_debug(f"[HIST] 봇 이미지 스킵: {reason}")
                                     # 마커 없이 스킵
                                 elif ct.startswith('video'):
                                     text_content += "\n(Bot generated a video here)"
