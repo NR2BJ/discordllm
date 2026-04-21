@@ -13,12 +13,16 @@ from datetime import datetime, timedelta, timezone
 from typing import List
 from bs4 import BeautifulSoup
 
-try:
-    import uvloop
-except Exception:
-    uvloop = None
+ENABLE_UVLOOP = os.environ.get("LLM_ENABLE_UVLOOP", "0") == "1"
+if ENABLE_UVLOOP:
+    try:
+        import uvloop
+    except Exception:
+        uvloop = None
+    else:
+        uvloop.install()
 else:
-    uvloop.install()
+    uvloop = None
 
 # ================= 1. 설정 및 상수 =================
 DISCORD_TOKEN = os.environ["LLM_DISCORD_TOKEN"]
@@ -40,8 +44,10 @@ VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
+VOICE_HEALTH_RECOVERY = os.environ.get("LLM_VOICE_HEALTH_RECOVERY", "0") == "1"
 VOICE_SELF_DEAF = True
 VOICE_SELF_MUTE = False
+VOICE_FORCE_STATE = os.environ.get("LLM_VOICE_FORCE_STATE", "0") == "1"
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 
 _COMMON_RULES = """## General Rules
@@ -347,6 +353,8 @@ async def resolve_voice_channel(guild, channel_id):
     return channel
 
 async def apply_voice_preferences(guild, channel):
+    if not VOICE_FORCE_STATE:
+        return
     me = guild.me or guild.get_member(bot.user.id)
     current_state = getattr(me, "voice", None) if me else None
     if (
@@ -395,11 +403,13 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
             await cleanup_stale_voice_client(vc, guild)
 
         try:
-            vc = await channel.connect(
-                reconnect=True,
-                self_deaf=VOICE_SELF_DEAF,
-                self_mute=VOICE_SELF_MUTE,
-            )
+            connect_kwargs = {"reconnect": True}
+            if VOICE_FORCE_STATE:
+                connect_kwargs.update(
+                    self_deaf=VOICE_SELF_DEAF,
+                    self_mute=VOICE_SELF_MUTE,
+                )
+            vc = await channel.connect(**connect_kwargs)
         except TypeError:
             vc = await channel.connect()
 
@@ -714,23 +724,26 @@ async def voice_watchdog():
         vc = guild.voice_client
         if vc and vc.is_connected():
             try:
-                unhealthy_reason = get_voice_unhealthy_reason(vc)
-                connected_age = bot.get_voice_connected_age(guild.id)
-                bad_count = bot.record_voice_health(guild.id, unhealthy_reason)
                 target_channel_id = bot.get_voice_target(guild.id)
-                if (
-                    unhealthy_reason
-                    and target_channel_id
-                    and connected_age is not None
-                    and connected_age >= VOICE_HEALTH_GRACE
-                    and bad_count >= VOICE_HEALTH_BAD_LIMIT
-                    and bot.can_retry_voice(guild.id)
-                ):
-                    await cleanup_stale_voice_client(vc, guild)
-                    vc = await ensure_voice_connection(guild, target_channel_id, reason="watchdog_unhealthy")
-                    if vc:
-                        bot.reset_voice_retry(guild.id)
-                    continue
+                if VOICE_HEALTH_RECOVERY:
+                    unhealthy_reason = get_voice_unhealthy_reason(vc)
+                    connected_age = bot.get_voice_connected_age(guild.id)
+                    bad_count = bot.record_voice_health(guild.id, unhealthy_reason)
+                    if (
+                        unhealthy_reason
+                        and target_channel_id
+                        and connected_age is not None
+                        and connected_age >= VOICE_HEALTH_GRACE
+                        and bad_count >= VOICE_HEALTH_BAD_LIMIT
+                        and bot.can_retry_voice(guild.id)
+                    ):
+                        await cleanup_stale_voice_client(vc, guild)
+                        vc = await ensure_voice_connection(guild, target_channel_id, reason="watchdog_unhealthy")
+                        if vc:
+                            bot.reset_voice_retry(guild.id)
+                        continue
+                else:
+                    bot.record_voice_health(guild.id, None)
             except Exception as e:
                 log_voice_debug(f"[VC][LLM] watchdog 상태점검 실패 ({guild.name}): {e}")
             continue
