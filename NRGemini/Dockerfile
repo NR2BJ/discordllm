@@ -1,4 +1,4 @@
-FROM python:3.14.3-slim-bookworm
+FROM python:3.14.4-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libopus0 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
