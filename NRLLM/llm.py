@@ -8,9 +8,17 @@ import asyncio
 import base64
 import io
 import re
+import math
 from datetime import datetime, timedelta, timezone
 from typing import List
 from bs4 import BeautifulSoup
+
+try:
+    import uvloop
+except Exception:
+    uvloop = None
+else:
+    uvloop.install()
 
 # ================= 1. 설정 및 상수 =================
 DISCORD_TOKEN = os.environ["LLM_DISCORD_TOKEN"]
@@ -30,6 +38,10 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
+VOICE_HEALTH_GRACE = 30.0
+VOICE_HEALTH_BAD_LIMIT = 3
+VOICE_SELF_DEAF = True
+VOICE_SELF_MUTE = False
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 
 _COMMON_RULES = """## General Rules
@@ -213,6 +225,43 @@ def format_channel_ref(channel):
     channel_id = getattr(channel, "id", None)
     return f"{name}({channel_id})" if channel_id else name
 
+def format_metric(value):
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+def get_voice_ws_closed(vc):
+    ws = getattr(vc, "ws", None)
+    if ws is None:
+        return None
+    closed = getattr(ws, "closed", None)
+    if callable(closed):
+        try:
+            return closed()
+        except Exception:
+            return "error"
+    return closed
+
+def get_voice_unhealthy_reason(vc):
+    if vc is None:
+        return None
+    reasons = []
+    latency = getattr(vc, "latency", None)
+    average_latency = getattr(vc, "average_latency", None)
+    if isinstance(latency, float) and not math.isfinite(latency):
+        reasons.append(f"latency={latency}")
+    if isinstance(average_latency, float) and not math.isfinite(average_latency):
+        reasons.append(f"avg_latency={average_latency}")
+    ws_closed = get_voice_ws_closed(vc)
+    if ws_closed is True:
+        reasons.append("voice_ws_closed=True")
+    endpoint = getattr(vc, "endpoint", None)
+    if not endpoint:
+        reasons.append("endpoint=missing")
+    return ", ".join(reasons) if reasons else None
+
 def describe_voice_client(vc):
     if vc is None:
         return "vc=None"
@@ -226,11 +275,15 @@ def describe_voice_client(vc):
         playing = f"err:{e.__class__.__name__}"
     endpoint = getattr(vc, "endpoint", None) or "-"
     session_id = getattr(vc, "session_id", None) or "-"
+    ws_closed = get_voice_ws_closed(vc)
     return (
         f"connected={connected} "
         f"playing={playing} "
         f"channel={format_channel_ref(getattr(vc, 'channel', None))} "
-        f"endpoint={endpoint} session_id={session_id}"
+        f"endpoint={endpoint} session_id={session_id} "
+        f"latency={format_metric(getattr(vc, 'latency', None))} "
+        f"avg_latency={format_metric(getattr(vc, 'average_latency', None))} "
+        f"ws_closed={ws_closed}"
     )
 
 def describe_voice_state(state):
@@ -293,6 +346,25 @@ async def resolve_voice_channel(guild, channel_id):
         return None
     return channel
 
+async def apply_voice_preferences(guild, channel):
+    me = guild.me or guild.get_member(bot.user.id)
+    current_state = getattr(me, "voice", None) if me else None
+    if (
+        current_state
+        and current_state.channel == channel
+        and current_state.self_deaf == VOICE_SELF_DEAF
+        and current_state.self_mute == VOICE_SELF_MUTE
+    ):
+        return
+    try:
+        await guild.change_voice_state(
+            channel=channel,
+            self_deaf=VOICE_SELF_DEAF,
+            self_mute=VOICE_SELF_MUTE,
+        )
+    except Exception as e:
+        log_voice_debug(f"[VC][LLM] voice state 선호값 적용 실패 ({guild.name}): {e}")
+
 async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unknown"):
     channel = await resolve_voice_channel(guild, channel_id)
     if channel is None:
@@ -315,22 +387,30 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
                     vc,
                     extra=f"target={format_channel_ref(channel)}",
                 )
+            await apply_voice_preferences(guild, channel)
+            bot.mark_voice_connected(guild.id)
             return vc
 
         if vc:
             await cleanup_stale_voice_client(vc, guild)
 
         try:
-            vc = await channel.connect(reconnect=True)
+            vc = await channel.connect(
+                reconnect=True,
+                self_deaf=VOICE_SELF_DEAF,
+                self_mute=VOICE_SELF_MUTE,
+            )
         except TypeError:
             vc = await channel.connect()
 
+        await apply_voice_preferences(guild, channel)
         log_voice_snapshot(
             f"연결 완료 [{reason}]",
             guild,
             vc,
             extra=f"target={format_channel_ref(channel)}",
         )
+        bot.mark_voice_connected(guild.id)
         return vc
 
 # ================= 3. OpenRouter API 클라이언트 =================
@@ -541,6 +621,8 @@ class OpenRouterBot(commands.Bot):
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
+        self.voice_connected_at = {}
+        self.voice_bad_state_counts = {}
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
 
     async def setup_hook(self):
@@ -597,6 +679,30 @@ class OpenRouterBot(commands.Bot):
     def reset_voice_retry(self, guild_id):
         self.voice_retry_after[str(guild_id)] = 0.0
 
+    def mark_voice_connected(self, guild_id):
+        gid = str(guild_id)
+        self.voice_connected_at[gid] = asyncio.get_running_loop().time()
+        self.voice_bad_state_counts[gid] = 0
+
+    def mark_voice_disconnected(self, guild_id):
+        gid = str(guild_id)
+        self.voice_connected_at.pop(gid, None)
+        self.voice_bad_state_counts[gid] = 0
+
+    def get_voice_connected_age(self, guild_id):
+        started = self.voice_connected_at.get(str(guild_id))
+        if started is None:
+            return None
+        return asyncio.get_running_loop().time() - started
+
+    def record_voice_health(self, guild_id, unhealthy_reason):
+        gid = str(guild_id)
+        if unhealthy_reason:
+            self.voice_bad_state_counts[gid] = self.voice_bad_state_counts.get(gid, 0) + 1
+            return self.voice_bad_state_counts[gid]
+        self.voice_bad_state_counts[gid] = 0
+        return 0
+
     def save_config(self):
         DataManager.save_json(CONFIG_FILE, self.server_configs)
 
@@ -607,6 +713,26 @@ async def voice_watchdog():
     for guild in bot.guilds:
         vc = guild.voice_client
         if vc and vc.is_connected():
+            try:
+                unhealthy_reason = get_voice_unhealthy_reason(vc)
+                connected_age = bot.get_voice_connected_age(guild.id)
+                bad_count = bot.record_voice_health(guild.id, unhealthy_reason)
+                target_channel_id = bot.get_voice_target(guild.id)
+                if (
+                    unhealthy_reason
+                    and target_channel_id
+                    and connected_age is not None
+                    and connected_age >= VOICE_HEALTH_GRACE
+                    and bad_count >= VOICE_HEALTH_BAD_LIMIT
+                    and bot.can_retry_voice(guild.id)
+                ):
+                    await cleanup_stale_voice_client(vc, guild)
+                    vc = await ensure_voice_connection(guild, target_channel_id, reason="watchdog_unhealthy")
+                    if vc:
+                        bot.reset_voice_retry(guild.id)
+                    continue
+            except Exception as e:
+                log_voice_debug(f"[VC][LLM] watchdog 상태점검 실패 ({guild.name}): {e}")
             continue
 
         target_channel_id = bot.get_voice_target(guild.id)
@@ -712,6 +838,8 @@ async def on_ready():
         voice_watchdog.start()
     for guild in bot.guilds:
         target_channel_id = bot.get_voice_target(guild.id)
+        if guild.voice_client and guild.voice_client.is_connected():
+            bot.mark_voice_connected(guild.id)
         if target_channel_id:
             log_voice_snapshot(
                 "on_ready keepalive 상태",
@@ -735,12 +863,14 @@ async def on_voice_state_update(member, before, after):
     if after.channel is not None:
         bot.set_voice_target(member.guild.id, after.channel.id)
         bot.reset_voice_retry(member.guild.id)
+        bot.mark_voice_connected(member.guild.id)
         return
 
     target_channel_id = bot.get_voice_target(member.guild.id)
     if not target_channel_id:
         return
 
+    bot.mark_voice_disconnected(member.guild.id)
     await asyncio.sleep(VOICE_RECONNECT_DELAY)
     try:
         vc = await ensure_voice_connection(member.guild, target_channel_id, reason="voice_state_update")

@@ -22,6 +22,13 @@ import unicodedata
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.genai._api_client")
 
+try:
+    import uvloop
+except Exception:
+    uvloop = None
+else:
+    uvloop.install()
+
 if not discord.opus.is_loaded():
     try:
         discord.opus.load_opus('libopus.so.0')
@@ -138,6 +145,8 @@ VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
+VOICE_SELF_DEAF = True
+VOICE_SELF_MUTE = False
 VOICE_DEBUG_LOGS = False
 LOOP_MONITOR_INTERVAL = 2.0
 LOOP_MONITOR_WARN = 2.5
@@ -277,6 +286,25 @@ async def resolve_voice_channel(guild, channel_id):
         return None
     return channel
 
+async def apply_voice_preferences(guild, channel):
+    me = guild.me or guild.get_member(bot.user.id)
+    current_state = getattr(me, "voice", None) if me else None
+    if (
+        current_state
+        and current_state.channel == channel
+        and current_state.self_deaf == VOICE_SELF_DEAF
+        and current_state.self_mute == VOICE_SELF_MUTE
+    ):
+        return
+    try:
+        await guild.change_voice_state(
+            channel=channel,
+            self_deaf=VOICE_SELF_DEAF,
+            self_mute=VOICE_SELF_MUTE,
+        )
+    except Exception as e:
+        log_voice_debug(f"[VC] voice state 선호값 적용 실패 ({guild.name}): {e}")
+
 async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unknown"):
     channel = await resolve_voice_channel(guild, channel_id)
     if channel is None:
@@ -301,6 +329,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
                     vc,
                     extra=f"from={format_channel_ref(old_channel)} to={format_channel_ref(channel)}",
                 )
+            await apply_voice_preferences(guild, channel)
             bot.mark_voice_connected(guild.id)
             return vc
 
@@ -308,10 +337,15 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
             await cleanup_stale_voice_client(vc, guild)
 
         try:
-            vc = await channel.connect(reconnect=True)
+            vc = await channel.connect(
+                reconnect=True,
+                self_deaf=VOICE_SELF_DEAF,
+                self_mute=VOICE_SELF_MUTE,
+            )
         except TypeError:
             vc = await channel.connect()
 
+        await apply_voice_preferences(guild, channel)
         log_voice_snapshot(
             f"연결 완료 [{reason}]",
             guild,
