@@ -1,11 +1,30 @@
 services:
+  lavalink:
+    image: ghcr.io/lavalink-devs/lavalink:4.2.2
+    restart: unless-stopped
+    environment:
+      LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD}
+      _JAVA_OPTIONS: -Xms256M -Xmx512M
+    volumes:
+      - ./Lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      - /mnt/storage/docker/discord/sb:/opt/lavalink/sb:ro
+
   gemini:
     build: ./NRGemini
     restart: unless-stopped
+    depends_on:
+      - lavalink
     environment:
       GEMINI_DISCORD_TOKEN: ${GEMINI_DISCORD_TOKEN}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       CONFIG_FILE: /data/gemini.json
+      GEMINI_USE_LAVALINK: "1"
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD}
+      LAVALINK_SECURE: "0"
+      LAVALINK_LABEL: main
+      LAVALINK_LOCAL_ROOT: /opt/lavalink/sb
     volumes:
       - /mnt/storage/docker/discord/data:/data
       - /mnt/storage/docker/discord/sb:/app/sb
@@ -21,10 +40,10 @@ services:
       - /mnt/storage/docker/discord/data:/data
 
   stayvc:
-    build: ./NRStayVC
+    build: ./NRStayVCNet
     restart: unless-stopped
     environment:
       STAYVC_DISCORD_TOKEN: ${STAYVC_DISCORD_TOKEN}
-      CONFIG_FILE: /data/stayvc.json
+      CONFIG_FILE: /data/stayvc-net.json
     volumes:
       - /mnt/storage/docker/discord/data:/data

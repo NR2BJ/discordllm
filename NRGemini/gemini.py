@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+import mafic
 from google import genai
 from google.genai import types
 from bs4 import BeautifulSoup
@@ -159,6 +160,14 @@ VOICE_SILENCE_RESUME_DELAY = 0.5
 VOICE_DEBUG_LOGS = False
 LOOP_MONITOR_INTERVAL = 2.0
 LOOP_MONITOR_WARN = 2.5
+LAVALINK_ENABLED = os.environ.get("GEMINI_USE_LAVALINK", "0") == "1"
+LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lavalink")
+LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "2333"))
+LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "youshallnotpass")
+LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "0") == "1"
+LAVALINK_LABEL = os.environ.get("LAVALINK_LABEL", "main")
+LAVALINK_LOCAL_ROOT = Path(os.environ.get("LAVALINK_LOCAL_ROOT", "/opt/lavalink/sb"))
+LAVALINK_TIMEOUT = float(os.environ.get("LAVALINK_TIMEOUT", "10"))
 
 def format_channel_ref(channel):
     if channel is None:
@@ -173,6 +182,60 @@ def format_metric(value):
     if isinstance(value, float):
         return f"{value:.3f}"
     return str(value)
+
+def is_lavalink_player(vc):
+    return LAVALINK_ENABLED and isinstance(vc, mafic.Player)
+
+def voice_is_connected(vc):
+    if vc is None:
+        return False
+    try:
+        return vc.is_connected()
+    except Exception:
+        return bool(getattr(vc, "connected", False))
+
+def voice_is_playing(vc):
+    if vc is None:
+        return False
+    if is_lavalink_player(vc):
+        return getattr(vc, "current", None) is not None and not getattr(vc, "paused", False)
+    try:
+        return vc.is_playing()
+    except Exception:
+        return False
+
+def voice_is_paused(vc):
+    if vc is None:
+        return False
+    if is_lavalink_player(vc):
+        return bool(getattr(vc, "paused", False))
+    try:
+        return vc.is_paused()
+    except Exception:
+        return False
+
+async def voice_stop(vc):
+    if vc is None:
+        return
+    if is_lavalink_player(vc):
+        await vc.stop()
+        return
+    vc.stop()
+
+async def voice_disconnect(vc, *, force=True):
+    if vc is None:
+        return
+    if is_lavalink_player(vc):
+        await vc.disconnect(force=force)
+        return
+    try:
+        await vc.disconnect(force=force)
+    except TypeError:
+        await vc.disconnect()
+
+def build_lavalink_local_identifier(filepath):
+    relative = Path(filepath).resolve().relative_to(Path(SOUND_DIR).resolve())
+    return (LAVALINK_LOCAL_ROOT / relative).as_uri()
 
 def get_voice_ws_closed(vc):
     ws = getattr(vc, "ws", None)
@@ -192,6 +255,8 @@ def get_history_limit_for_text_model(text_model):
 def get_voice_unhealthy_reason(vc):
     if vc is None:
         return None
+    if is_lavalink_player(vc):
+        return None
     reasons = []
     latency = getattr(vc, "latency", None)
     average_latency = getattr(vc, "average_latency", None)
@@ -210,6 +275,16 @@ def get_voice_unhealthy_reason(vc):
 def describe_voice_client(vc):
     if vc is None:
         return "vc=None"
+    if is_lavalink_player(vc):
+        return (
+            f"connected={voice_is_connected(vc)} "
+            f"playing={voice_is_playing(vc)} "
+            f"paused={voice_is_paused(vc)} "
+            f"channel={format_channel_ref(getattr(vc, 'channel', None))} "
+            f"node={getattr(getattr(vc, 'node', None), 'label', '-') } "
+            f"ping={format_metric(getattr(vc, 'ping', None))} "
+            f"current={getattr(getattr(vc, 'current', None), 'identifier', '-')}"
+        )
     try:
         connected = vc.is_connected()
     except Exception as e:
@@ -266,12 +341,7 @@ async def cleanup_stale_voice_client(vc, guild):
     """끊어진 VoiceClient 캐시를 정리해서 재접속 막힘 방지."""
     log_voice_snapshot("stale VC 정리 시작", guild, vc)
     try:
-        await vc.disconnect(force=True)
-    except TypeError:
-        try:
-            await vc.disconnect()
-        except Exception as e:
-            log_voice_debug(f"[VC] stale disconnect fallback 실패 ({guild.name}): {e}")
+        await voice_disconnect(vc, force=True)
     except Exception as e:
         log_voice_debug(f"[VC] stale disconnect 실패 ({guild.name}): {e}")
     try:
@@ -296,6 +366,8 @@ async def resolve_voice_channel(guild, channel_id):
     return channel
 
 async def apply_voice_preferences(guild, channel):
+    if LAVALINK_ENABLED:
+        return
     if not VOICE_FORCE_STATE:
         return
     me = guild.me or guild.get_member(bot.user.id)
@@ -324,6 +396,8 @@ def make_silence_audio_source():
     )
 
 async def ensure_silence_keepalive(guild, vc=None, *, reason="unknown"):
+    if LAVALINK_ENABLED:
+        return False
     if not VOICE_SILENCE_KEEPALIVE:
         return False
 
@@ -334,11 +408,11 @@ async def ensure_silence_keepalive(guild, vc=None, *, reason="unknown"):
     if vc is None:
         vc = guild.voice_client
 
-    if vc is None or not vc.is_connected():
+    if vc is None or not voice_is_connected(vc):
         return False
 
     try:
-        if vc.is_playing() or vc.is_paused():
+        if voice_is_playing(vc) or voice_is_paused(vc):
             return False
     except Exception:
         return False
@@ -407,10 +481,20 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
             vc,
             extra=f"target={format_channel_ref(channel)} move={move}",
         )
-        if vc and vc.is_connected():
+        if vc and voice_is_connected(vc):
             if move and vc.channel != channel:
                 old_channel = vc.channel
-                await vc.move_to(channel)
+                if is_lavalink_player(vc):
+                    await vc.disconnect(force=True)
+                    vc = await channel.connect(
+                        cls=mafic.Player,
+                        timeout=LAVALINK_TIMEOUT,
+                        reconnect=True,
+                        self_deaf=VOICE_SELF_DEAF,
+                        self_mute=VOICE_SELF_MUTE,
+                    )
+                else:
+                    await vc.move_to(channel)
                 log_voice_snapshot(
                     f"이동 완료 [{reason}]",
                     guild,
@@ -425,16 +509,26 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
         if vc:
             await cleanup_stale_voice_client(vc, guild)
 
-        try:
-            connect_kwargs = {"reconnect": True}
-            if VOICE_FORCE_STATE:
-                connect_kwargs.update(
-                    self_deaf=VOICE_SELF_DEAF,
-                    self_mute=VOICE_SELF_MUTE,
-                )
-            vc = await channel.connect(**connect_kwargs)
-        except TypeError:
-            vc = await channel.connect()
+        if LAVALINK_ENABLED:
+            await bot.ensure_lavalink_node()
+            vc = await channel.connect(
+                cls=mafic.Player,
+                timeout=LAVALINK_TIMEOUT,
+                reconnect=True,
+                self_deaf=VOICE_SELF_DEAF,
+                self_mute=VOICE_SELF_MUTE,
+            )
+        else:
+            try:
+                connect_kwargs = {"reconnect": True}
+                if VOICE_FORCE_STATE:
+                    connect_kwargs.update(
+                        self_deaf=VOICE_SELF_DEAF,
+                        self_mute=VOICE_SELF_MUTE,
+                    )
+                vc = await channel.connect(**connect_kwargs)
+            except TypeError:
+                vc = await channel.connect()
 
         await apply_voice_preferences(guild, channel)
         log_voice_snapshot(
@@ -484,6 +578,14 @@ async def temp_followup(interaction, content, delay=5):
     except Exception:
         pass
 
+async def play_lavalink_local_sound(player, filepath, volume, *, replace=True):
+    identifier = build_lavalink_local_identifier(filepath)
+    await player.play(
+        identifier,
+        volume=max(0, min(1000, int(volume * 100))),
+        replace=replace,
+    )
+
 async def play_sound_in_vc(guild, member, sound_name, bot_instance):
     if not member.voice or not member.voice.channel:
         return False, "음성 채널에 먼저 접속해주세요."
@@ -510,8 +612,12 @@ async def play_sound_in_vc(guild, member, sound_name, bot_instance):
     if vc is None:
         return False, "음성 채널 연결에 실패했습니다."
 
-    if vc.is_playing():
-        vc.stop()
+    if voice_is_playing(vc):
+        await voice_stop(vc)
+
+    if is_lavalink_player(vc):
+        await play_lavalink_local_sound(vc, filepath, bot_instance.sound_volume, replace=True)
+        return True, f"**{sound_name}** 재생 중 (Lavalink, vol {int(bot_instance.sound_volume * 100)}%)"
 
     audio = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(filepath, options="-af loudnorm=I=-16:TP=-1.5:LRA=11"),
@@ -879,6 +985,9 @@ class GeminiBot(commands.Bot):
         global SIBO_LATENCY_COMP
         SIBO_LATENCY_COMP = self.server_configs.get("_global", {}).get("sibo_comp", SIBO_LATENCY_COMP)
         self.active_views = []  # View 참조 유지용
+        self.mafic_pool = mafic.NodePool(self) if LAVALINK_ENABLED else None
+        self.mafic_node = None
+        self.mafic_connect_lock = asyncio.Lock()
 
     def _get_sound_dir_mtime(self):
         """SOUND_DIR 전체의 최신 mtime 반환."""
@@ -929,8 +1038,42 @@ class GeminiBot(commands.Bot):
                 result[gid] = sibo
         return result
 
+    def get_global_config(self):
+        global_cfg = self.server_configs.setdefault("_global", {})
+        return global_cfg if isinstance(global_cfg, dict) else {}
+
+    def get_lavalink_session_id(self):
+        return self.get_global_config().get("lavalink_session_id")
+
+    def set_lavalink_session_id(self, session_id):
+        cfg = self.get_global_config()
+        if cfg.get("lavalink_session_id") == session_id:
+            return
+        cfg["lavalink_session_id"] = session_id
+        self.save_config()
+
     def save_config(self):
         DataManager.save_json(CONFIG_FILE, self.server_configs)
+
+    async def ensure_lavalink_node(self):
+        if not LAVALINK_ENABLED:
+            return None
+        async with self.mafic_connect_lock:
+            if self.mafic_node is not None:
+                return self.mafic_node
+            self.mafic_node = await self.mafic_pool.create_node(
+                host=LAVALINK_HOST,
+                port=LAVALINK_PORT,
+                label=LAVALINK_LABEL,
+                password=LAVALINK_PASSWORD,
+                secure=LAVALINK_SECURE,
+                timeout=LAVALINK_TIMEOUT,
+                resuming_session_id=self.get_lavalink_session_id(),
+                player_cls=mafic.Player,
+            )
+            if getattr(self.mafic_node, "session_id", None):
+                self.set_lavalink_session_id(self.mafic_node.session_id)
+            return self.mafic_node
 
     def get_channel_lock(self, channel_id):
         if channel_id not in self.channel_locks:
@@ -1190,6 +1333,71 @@ async def sibo_loop(my_gen=None):
         target_hour = next_hour.strftime('%H:00:00')
         print(f"[SIBO] 목표 정각: {target_hour} | 최대 offset: {max_offset}s | {wait_seconds:.1f}초 후")
 
+        if LAVALINK_ENABLED:
+            try:
+                await asyncio.sleep(wait_seconds)
+            except asyncio.CancelledError:
+                print(f"[SIBO] gen {my_gen} 취소됨")
+                return
+
+            if my_gen is not None and my_gen != _sibo_generation:
+                print(f"[SIBO] gen {my_gen} 종료 (최신: {_sibo_generation})")
+                return
+
+            valid = {}
+            for gid, cfg in bot.get_all_sibo().items():
+                sound_key = cfg.get("sound")
+                if sound_key and sound_key in bot.sound_files:
+                    valid[gid] = cfg
+
+            last_wait = 0.0
+            for gid, cfg in sorted(valid.items(), key=lambda item: item[1].get("offset", 0.0), reverse=True):
+                sound_key = cfg.get("sound")
+                offset = cfg.get("offset", 0.0)
+                filepath = bot.sound_files.get(sound_key)
+                if not filepath:
+                    continue
+
+                wait_delta = max(0.0, last_wait - offset)
+                if wait_delta > 0:
+                    await asyncio.sleep(wait_delta)
+                last_wait = offset
+
+                guild = bot.get_guild(int(gid))
+                if not guild:
+                    continue
+
+                vc = guild.voice_client
+                if not vc or not voice_is_connected(vc):
+                    vc_channel_id = cfg.get("vc_channel")
+                    if not vc_channel_id:
+                        continue
+                    try:
+                        vc = await ensure_voice_connection(
+                            guild,
+                            vc_channel_id,
+                            move=True,
+                            reason="sibo_lavalink_reconnect",
+                        )
+                    except Exception as e:
+                        print(f"[SIBO] Guild {gid} Lavalink VC 재접속 실패: {e}")
+                        continue
+
+                if not vc:
+                    continue
+
+                try:
+                    if voice_is_playing(vc):
+                        await voice_stop(vc)
+                    await play_lavalink_local_sound(vc, filepath, bot.sound_volume, replace=True)
+                    play_now = datetime.now(KST)
+                    print(f"[SIBO] {play_now.strftime('%H:%M:%S.%f')[:-4]} Guild {gid} 시보 재생(Lavalink): {sound_key}")
+                except Exception as e:
+                    print(f"[SIBO] Guild {gid} Lavalink 재생 실패: {e}")
+
+            await asyncio.sleep(1)
+            continue
+
         # 1) play_time 보다 PRELOAD_LEAD 일찍 깨서 ffmpeg 미리 준비
         pre_warm_wait = max(0.0, wait_seconds - SIBO_PRELOAD_LEAD)
         try:
@@ -1265,7 +1473,7 @@ async def sibo_loop(my_gen=None):
                 except Exception: pass
                 continue
             vc = guild.voice_client
-            if not vc or not vc.is_connected():
+            if not vc or not voice_is_connected(vc):
                 # VC 끊겼으면 저장된 채널로 자동 재접속
                 vc_channel_id = cfg.get("vc_channel")
                 if vc_channel_id:
@@ -1297,8 +1505,8 @@ async def sibo_loop(my_gen=None):
                     except Exception: pass
                     continue
 
-            if vc.is_playing():
-                vc.stop()
+            if voice_is_playing(vc):
+                await voice_stop(vc)
             def after_sibo_play(error, guild_id=int(gid), sound_name=sound_key):
                 if error:
                     print(f"[SIBO] Guild {guild_id} 재생 종료 오류: {error}")
@@ -1353,6 +1561,13 @@ async def on_ready():
         print(f"[OK] {len(synced)}개의 슬래시 커맨드 동기화 완료")
     except Exception as e:
         print(f"[ERROR] 슬래시 커맨드 동기화 실패: {e}")
+    if LAVALINK_ENABLED:
+        try:
+            node = await bot.ensure_lavalink_node()
+            session_id = getattr(node, "session_id", None)
+            print(f"[OK] Lavalink 연결 완료: {LAVALINK_HOST}:{LAVALINK_PORT} label={LAVALINK_LABEL} session_id={session_id}")
+        except Exception as e:
+            print(f"[ERROR] Lavalink 연결 실패: {e}")
     if not voice_watchdog.is_running():
         voice_watchdog.start()
     if not sound_watcher.is_running():
@@ -1406,6 +1621,34 @@ async def on_resumed():
                 guild.voice_client,
                 extra=f"target_channel_id={target_channel_id}",
             )
+
+@bot.event
+async def on_node_ready(node):
+    if getattr(node, "session_id", None):
+        bot.set_lavalink_session_id(node.session_id)
+    print(
+        f"[LAVALINK] node ready: label={getattr(node, 'label', '-')}"
+        f" session_id={getattr(node, 'session_id', None)}"
+    )
+
+@bot.event
+async def on_node_unavailable(node):
+    print(f"[LAVALINK] node unavailable: label={getattr(node, 'label', '-')}")
+
+@bot.event
+async def on_websocket_closed(event):
+    player = getattr(event, "player", None)
+    guild_id = getattr(getattr(player, "guild", None), "id", None)
+    print(
+        f"[LAVALINK] websocket closed: guild={guild_id} code={getattr(event, 'code', None)} "
+        f"reason={getattr(event, 'reason', None)} by_discord={getattr(event, 'by_discord', None)}"
+    )
+
+@bot.event
+async def on_track_exception(event):
+    player = getattr(event, "player", None)
+    guild_id = getattr(getattr(player, "guild", None), "id", None)
+    print(f"[LAVALINK] track exception: guild={guild_id} error={getattr(event, 'exception', None)}")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
