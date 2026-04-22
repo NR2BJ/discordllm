@@ -1,6 +1,8 @@
 services:
   baeksu:
-    build: ./NRBaekSu
+    build:
+      context: ./NRBaekSu
+      dockerfile: Dockerfile.baeksu
     restart: unless-stopped
     environment:
       BAEKSU_DISCORD_TOKEN: ${BAEKSU_DISCORD_TOKEN}
