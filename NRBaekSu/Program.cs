@@ -107,15 +107,16 @@ client.SlashCommandExecuted += async command =>
         }
         case "vcleave":
         {
+            await command.DeferAsync(ephemeral: true);
             state.ClearTargetChannelId(guildId);
             var guild = client.GetGuild(guildId);
             var current = guild?.CurrentUser?.VoiceChannel;
             if (current is not null)
             {
-                await current.DisconnectAsync();
+                await Task.Run(async () => await current.DisconnectAsync());
             }
 
-            await command.RespondAsync("상주를 해제하고 음성 채널에서 나갔습니다.", ephemeral: true);
+            await command.FollowupAsync("상주 채널을 해제했습니다.", ephemeral: true);
             return;
         }
         case "vcrejoin":
@@ -181,7 +182,10 @@ client.UserVoiceStateUpdated += async (user, before, after) =>
     _ = Task.Run(async () =>
     {
         await Task.Delay(ReconnectDelayMs);
-        await EnsureConnectedAsync(guildId, targetChannelId.Value, "voice-state");
+        if (state.GetTargetChannelId(guildId) is ulong latestTargetChannelId && latestTargetChannelId == targetChannelId.Value)
+        {
+            await EnsureConnectedAsync(guildId, targetChannelId.Value, "voice-state");
+        }
     });
 };
 
@@ -226,6 +230,12 @@ async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string rea
     await gate.WaitAsync();
     try
     {
+        if (state.GetTargetChannelId(guildId) is not ulong latestTargetChannelId || latestTargetChannelId != channelId)
+        {
+            Console.WriteLine($"[BAEKSU] guild={guildId} skip connect stale-target channel={channelId} reason={reason}");
+            return false;
+        }
+
         var guild = client.GetGuild(guildId);
         if (guild is null)
         {
