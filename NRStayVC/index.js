@@ -23,6 +23,7 @@ const READY_TIMEOUT_MS = 30_000;
 const TRANSIENT_DISCONNECT_GRACE_MS = 5_000;
 const STARTUP_RESTORE_DELAY_MS = 5_000;
 const RECONCILE_INTERVAL_MS = 60_000;
+const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_STEPS_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
 
 if (!DISCORD_TOKEN) {
@@ -131,11 +132,21 @@ function scheduleReconnect(guildId, reason) {
   }
 
   const previous = reconnectState.get(key);
+  if (previous?.stopped) {
+    return;
+  }
   if (previous && previous.timer) {
     return;
   }
 
   const attempt = (previous?.attempt || 0) + 1;
+  if (attempt > MAX_RETRY_ATTEMPTS) {
+    reconnectState.set(key, { attempt: previous?.attempt || MAX_RETRY_ATTEMPTS, timer: null, stopped: true });
+    log(
+      `guild=${key} reconnect halted after ${previous?.attempt || MAX_RETRY_ATTEMPTS} attempts; manual rejoin required`
+    );
+    return;
+  }
   const delayMs = getRetryDelay(attempt);
 
   log(`guild=${key} reconnect scheduled in ${delayMs}ms (attempt=${attempt}, reason=${reason})`);
@@ -314,6 +325,7 @@ function getStatusSummary(guildId) {
     status: connection?.state?.status || 'none',
     retryAttempt: retry?.attempt || 0,
     retryScheduled: Boolean(retry?.timer),
+    retryStopped: Boolean(retry?.stopped),
   };
 }
 
@@ -449,7 +461,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `currentChannelId: ${status.currentChannelId || 'none'}\n` +
         `voiceStatus: ${status.status}\n` +
         `retryAttempt: ${status.retryAttempt}\n` +
-        `retryScheduled: ${status.retryScheduled}`,
+        `retryScheduled: ${status.retryScheduled}\n` +
+        `retryStopped: ${status.retryStopped}`,
       flags: MessageFlags.Ephemeral,
     });
   }
