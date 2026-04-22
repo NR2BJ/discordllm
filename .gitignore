@@ -19,5 +19,5 @@ NRLLM/llm_doc_cache/
 NRStayVC/node_modules/
 
 # .NET 빌드 산출물
-NRStayVCNet/bin/
-NRStayVCNet/obj/
+NRBaekSu/bin/
+NRBaekSu/obj/

@@ -7,10 +7,10 @@ const int StartupRestoreDelayMs = 5000;
 const int ReconcileIntervalMs = 30000;
 const int ReconnectDelayMs = 5000;
 
-var token = Environment.GetEnvironmentVariable("STAYVC_DISCORD_TOKEN")
-    ?? throw new InvalidOperationException("STAYVC_DISCORD_TOKEN is required");
+var token = Environment.GetEnvironmentVariable("BAEKSU_DISCORD_TOKEN")
+    ?? throw new InvalidOperationException("BAEKSU_DISCORD_TOKEN is required");
 var configFile = Environment.GetEnvironmentVariable("CONFIG_FILE")
-    ?? Path.Combine(AppContext.BaseDirectory, "stayvc.json");
+    ?? Path.Combine(AppContext.BaseDirectory, "baeksu.json");
 
 var client = new DiscordSocketClient(new DiscordSocketConfig
 {
@@ -25,13 +25,13 @@ Task? reconcileTask = null;
 
 client.Log += message =>
 {
-    Console.WriteLine($"[STAYVC.NET] {message}");
+    Console.WriteLine($"[BAEKSU] {message}");
     return Task.CompletedTask;
 };
 
 client.Ready += async () =>
 {
-    Console.WriteLine($"[STAYVC.NET] ready as {client.CurrentUser}");
+    Console.WriteLine($"[BAEKSU] ready as {client.CurrentUser}");
     await RegisterCommandsAsync();
 
     _ = Task.Run(async () =>
@@ -157,7 +157,7 @@ client.UserVoiceStateUpdated += async (user, before, after) =>
 
     var guildId = guildUser.Guild.Id;
     Console.WriteLine(
-        $"[STAYVC.NET] guild={guildId} voice {before.VoiceChannel?.Id?.ToString() ?? "none"} -> {after.VoiceChannel?.Id?.ToString() ?? "none"}"
+        $"[BAEKSU] guild={guildId} voice {before.VoiceChannel?.Id?.ToString() ?? "none"} -> {after.VoiceChannel?.Id?.ToString() ?? "none"}"
     );
 
     if (after.VoiceChannel is not null)
@@ -198,11 +198,11 @@ async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
                 new SlashCommandBuilder().WithName("vcrejoin").WithDescription("저장된 상주 채널로 강제 재접속합니다.").Build(),
             };
             await guild.BulkOverwriteApplicationCommandAsync(commands.ToArray());
-            Console.WriteLine($"[STAYVC.NET] registered commands for guild={guild.Id} ({guild.Name})");
+            Console.WriteLine($"[BAEKSU] registered commands for guild={guild.Id} ({guild.Name})");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[STAYVC.NET] command registration failed guild={guild.Id}: {ex.Message}");
+            Console.WriteLine($"[BAEKSU] command registration failed guild={guild.Id}: {ex.Message}");
         }
     }
 }
@@ -216,14 +216,14 @@ async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string rea
         var guild = client.GetGuild(guildId);
         if (guild is null)
         {
-            Console.WriteLine($"[STAYVC.NET] guild={guildId} unavailable reason={reason}");
+            Console.WriteLine($"[BAEKSU] guild={guildId} unavailable reason={reason}");
             return false;
         }
 
         var channel = guild.GetVoiceChannel(channelId);
         if (channel is null)
         {
-            Console.WriteLine($"[STAYVC.NET] guild={guildId} target channel unavailable channel={channelId} reason={reason}");
+            Console.WriteLine($"[BAEKSU] guild={guildId} target channel unavailable channel={channelId} reason={reason}");
             return false;
         }
 
@@ -234,14 +234,14 @@ async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string rea
 
         try
         {
-            Console.WriteLine($"[STAYVC.NET] guild={guildId} joining channel={channelId} ({channel.Name}) reason={reason}");
+            Console.WriteLine($"[BAEKSU] guild={guildId} joining channel={channelId} ({channel.Name}) reason={reason}");
             await channel.ConnectAsync(selfDeaf: true, selfMute: false, external: false, disconnect: true);
             state.SetTargetChannelId(guildId, channelId);
             return true;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[STAYVC.NET] guild={guildId} connect failed channel={channelId} reason={reason}: {ex.Message}");
+            Console.WriteLine($"[BAEKSU] guild={guildId} connect failed channel={channelId} reason={reason}: {ex.Message}");
             return false;
         }
     }

@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
-COPY StayVC.csproj ./
+COPY NRBaekSu.csproj ./
 RUN dotnet restore
 COPY Program.cs ./
 RUN dotnet publish -c Release -o /app/out --no-restore
@@ -12,4 +12,4 @@ WORKDIR /app
 COPY --from=build /app/out ./
 ENV DOTNET_EnableDiagnostics=0
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-CMD ["dotnet", "StayVC.dll"]
+CMD ["dotnet", "NRBaekSu.dll"]
