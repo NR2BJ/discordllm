@@ -17,7 +17,7 @@ ConfigureDaveLogging();
 
 var client = new DiscordSocketClient(new DiscordSocketConfig
 {
-    GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildVoiceStates,
+    GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildVoiceStates | GatewayIntents.GuildMembers,
     LogGatewayIntentWarnings = false,
     AlwaysDownloadUsers = true,
     EnableVoiceDaveEncryption = true,

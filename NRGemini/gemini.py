@@ -148,6 +148,7 @@ SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
 SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
 LAVALINK_POST_CONNECT_GRACE = 0.35  # Lavalink 최초 연결 직후 첫 재생 앞머리 손실 완충
 VOICE_RECONNECT_DELAY = 3.0
+VOICE_STATE_REJOIN_DELAY = 8.0
 VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_LIBRARY_RECOVERY_GRACE = 75.0
 VOICE_HEALTH_GRACE = 30.0
@@ -233,6 +234,41 @@ async def voice_disconnect(vc, *, force=True):
         await vc.disconnect(force=force)
     except TypeError:
         await vc.disconnect()
+
+async def attempt_voice_state_rejoin(guild_id, channel_id):
+    await asyncio.sleep(VOICE_STATE_REJOIN_DELAY)
+
+    guild = bot.get_guild(guild_id)
+    if guild is None or bot.is_closed():
+        return
+
+    if bot.get_voice_target(guild_id) != channel_id:
+        return
+
+    vc = guild.voice_client
+    if vc and voice_is_connected(vc):
+        return
+
+    if not bot.can_retry_voice(guild_id):
+        return
+
+    try:
+        log_voice_snapshot(
+            "voice_state 빠른 재접속 시도",
+            guild,
+            vc,
+            extra=f"target_channel_id={channel_id}",
+        )
+        vc = await ensure_voice_connection(
+            guild,
+            channel_id,
+            move=True,
+            reason="voice_state",
+        )
+        if vc:
+            bot.reset_voice_retry(guild_id)
+    except Exception as e:
+        log_voice_debug(f"[VC] voice_state 빠른 재접속 실패 ({guild.name}): {e}")
 
 def build_lavalink_local_identifier(filepath):
     relative = Path(filepath).resolve().relative_to(Path(SOUND_DIR).resolve())
@@ -1691,6 +1727,7 @@ async def on_voice_state_update(member, before, after):
         f"target_channel_id={target_channel_id}, "
         f"discord.py 내부 복구 우선, {VOICE_LIBRARY_RECOVERY_GRACE:.0f}초 후 watchdog 개입"
     )
+    asyncio.create_task(attempt_voice_state_rejoin(member.guild.id, target_channel_id))
 
 @bot.event
 async def on_message(message):
