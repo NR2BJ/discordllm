@@ -187,7 +187,9 @@ await Task.Delay(Timeout.Infinite);
 
 async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
 {
-    var guilds = onlyGuild is null ? client.Guilds : new[] { onlyGuild };
+    IReadOnlyCollection<SocketGuild> guilds = onlyGuild is null
+        ? client.Guilds
+        : new List<SocketGuild> { onlyGuild };
     foreach (var guild in guilds)
     {
         try

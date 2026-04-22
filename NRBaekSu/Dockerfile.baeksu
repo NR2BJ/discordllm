@@ -7,7 +7,7 @@ WORKDIR /app
 COPY . ./
 
 RUN dotnet restore ./NRBaekSu.csproj
-RUN dotnet build ./NRBaekSu.csproj -c Release --no-restore
+RUN dotnet build ./NRBaekSu.csproj -c Release
 
 ENV DOTNET_EnableDiagnostics=0
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
