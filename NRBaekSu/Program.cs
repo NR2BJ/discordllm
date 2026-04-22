@@ -94,9 +94,10 @@ client.SlashCommandExecuted += async command =>
                 return;
             }
 
+            await command.DeferAsync(ephemeral: true);
             state.SetTargetChannelId(guildId, channel.Id);
             var ok = await EnsureConnectedAsync(guildId, channel.Id, "slash:vcjoin");
-            await command.RespondAsync(
+            await command.FollowupAsync(
                 ok ? $"상주 시작: {channel.Mention}" : "연결 시도는 했지만 음성 채널 연결을 확인하지 못했습니다.",
                 ephemeral: true
             );
@@ -124,8 +125,9 @@ client.SlashCommandExecuted += async command =>
                 return;
             }
 
+            await command.DeferAsync(ephemeral: true);
             var ok = await EnsureConnectedAsync(guildId, targetChannelId.Value, "slash:vcrejoin");
-            await command.RespondAsync(
+            await command.FollowupAsync(
                 ok ? "저장된 채널로 다시 붙었습니다." : "재접속을 시도했지만 연결을 확인하지 못했습니다.",
                 ephemeral: true
             );

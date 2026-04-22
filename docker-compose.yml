@@ -1,4 +1,13 @@
 services:
+  baeksu:
+    build: ./NRBaekSu
+    restart: unless-stopped
+    environment:
+      BAEKSU_DISCORD_TOKEN: ${BAEKSU_DISCORD_TOKEN}
+      CONFIG_FILE: /data/baeksu.json
+    volumes:
+      - /mnt/storage/docker/discord/data:/data
+
   lavalink:
     image: ghcr.io/lavalink-devs/lavalink
     restart: unless-stopped

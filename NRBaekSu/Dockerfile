@@ -1,9 +1,8 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
-COPY NRBaekSu.csproj ./
-RUN dotnet restore
-COPY Program.cs ./
-RUN dotnet publish -c Release -o /app/out --no-restore
+COPY . ./
+RUN dotnet restore ./NRBaekSu.csproj
+RUN dotnet publish ./NRBaekSu.csproj -c Release -o /app/out
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
