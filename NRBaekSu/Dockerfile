@@ -5,5 +5,5 @@ WORKDIR /app
 COPY . ./
 RUN dotnet restore ./NRBaekSu.csproj
 ENV DOTNET_EnableDiagnostics=0
-ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
 CMD ["dotnet", "run", "--project", "NRBaekSu.csproj", "-c", "Release", "--no-restore"]
