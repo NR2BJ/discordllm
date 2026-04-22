@@ -147,6 +147,7 @@ SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
 SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
+VOICE_LIBRARY_RECOVERY_GRACE = 75.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
 VOICE_HEALTH_RECOVERY = os.environ.get("GEMINI_VOICE_HEALTH_RECOVERY", "0") == "1"
@@ -868,6 +869,7 @@ class GeminiBot(commands.Bot):
         self.voice_locks = {}
         self.voice_retry_after = {}
         self.voice_connected_at = {}
+        self.voice_disconnected_at = {}
         self.voice_bad_state_counts = {}
         self.loop_monitor_expected = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
@@ -968,6 +970,7 @@ class GeminiBot(commands.Bot):
             self.save_config()
             self.voice_bad_state_counts.pop(str(guild_id), None)
             self.voice_connected_at.pop(str(guild_id), None)
+            self.voice_disconnected_at.pop(str(guild_id), None)
             guild = self.get_guild(guild_id)
             guild_name = guild.name if guild else guild_id
             log_voice_debug(f"[VC] keepalive 대상 해제 ({guild_name}): channel_id={old_channel_id}")
@@ -987,12 +990,20 @@ class GeminiBot(commands.Bot):
     def mark_voice_connected(self, guild_id):
         gid = str(guild_id)
         self.voice_connected_at[gid] = time_module.monotonic()
+        self.voice_disconnected_at.pop(gid, None)
         self.voice_bad_state_counts[gid] = 0
 
     def mark_voice_disconnected(self, guild_id):
         gid = str(guild_id)
         self.voice_connected_at.pop(gid, None)
+        self.voice_disconnected_at[gid] = time_module.monotonic()
         self.voice_bad_state_counts[gid] = 0
+
+    def get_voice_disconnected_age(self, guild_id):
+        started = self.voice_disconnected_at.get(str(guild_id))
+        if started is None:
+            return None
+        return time_module.monotonic() - started
 
     def get_voice_connected_age(self, guild_id):
         started = self.voice_connected_at.get(str(guild_id))
@@ -1060,7 +1071,13 @@ async def voice_watchdog():
             continue
 
         target_channel_id = bot.get_voice_target(guild.id)
-        if not target_channel_id or not bot.can_retry_voice(guild.id):
+        disconnected_age = bot.get_voice_disconnected_age(guild.id)
+        if (
+            not target_channel_id
+            or disconnected_age is None
+            or disconnected_age < VOICE_LIBRARY_RECOVERY_GRACE
+            or not bot.can_retry_voice(guild.id)
+        ):
             continue
 
         try:
@@ -1068,7 +1085,10 @@ async def voice_watchdog():
                 "watchdog 재접속 시도",
                 guild,
                 vc,
-                extra=f"target_channel_id={target_channel_id}",
+                extra=(
+                    f"target_channel_id={target_channel_id} "
+                    f"disconnected_age={disconnected_age:.1f}s"
+                ),
             )
             vc = await ensure_voice_connection(
                 guild,
@@ -1418,20 +1438,9 @@ async def on_voice_state_update(member, before, after):
     bot.mark_voice_disconnected(member.guild.id)
     log_voice_debug(
         f"[VC] bot 음성 채널 이탈 감지 ({member.guild.name}): "
-        f"target_channel_id={target_channel_id}, {VOICE_RECONNECT_DELAY}초 후 재접속 시도"
+        f"target_channel_id={target_channel_id}, "
+        f"discord.py 내부 복구 우선, {VOICE_LIBRARY_RECOVERY_GRACE:.0f}초 후 watchdog 개입"
     )
-    await asyncio.sleep(VOICE_RECONNECT_DELAY)
-    try:
-        vc = await ensure_voice_connection(
-            member.guild,
-            target_channel_id,
-            move=True,
-            reason="voice_state_update",
-        )
-        if vc:
-            bot.reset_voice_retry(member.guild.id)
-    except Exception as e:
-        log_voice_debug(f"[VC] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
 
 @bot.event
 async def on_message(message):

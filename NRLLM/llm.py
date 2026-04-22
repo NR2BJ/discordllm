@@ -42,6 +42,7 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
+VOICE_LIBRARY_RECOVERY_GRACE = 75.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
 VOICE_HEALTH_RECOVERY = os.environ.get("LLM_VOICE_HEALTH_RECOVERY", "0") == "1"
@@ -632,6 +633,7 @@ class OpenRouterBot(commands.Bot):
         self.voice_locks = {}
         self.voice_retry_after = {}
         self.voice_connected_at = {}
+        self.voice_disconnected_at = {}
         self.voice_bad_state_counts = {}
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
 
@@ -676,6 +678,10 @@ class OpenRouterBot(commands.Bot):
         if "voice_target_channel_id" in cfg:
             cfg.pop("voice_target_channel_id", None)
             self.save_config()
+            gid = str(guild_id)
+            self.voice_connected_at.pop(gid, None)
+            self.voice_disconnected_at.pop(gid, None)
+            self.voice_bad_state_counts.pop(gid, None)
 
     def can_retry_voice(self, guild_id):
         now = asyncio.get_running_loop().time()
@@ -692,12 +698,20 @@ class OpenRouterBot(commands.Bot):
     def mark_voice_connected(self, guild_id):
         gid = str(guild_id)
         self.voice_connected_at[gid] = asyncio.get_running_loop().time()
+        self.voice_disconnected_at.pop(gid, None)
         self.voice_bad_state_counts[gid] = 0
 
     def mark_voice_disconnected(self, guild_id):
         gid = str(guild_id)
         self.voice_connected_at.pop(gid, None)
+        self.voice_disconnected_at[gid] = asyncio.get_running_loop().time()
         self.voice_bad_state_counts[gid] = 0
+
+    def get_voice_disconnected_age(self, guild_id):
+        started = self.voice_disconnected_at.get(str(guild_id))
+        if started is None:
+            return None
+        return asyncio.get_running_loop().time() - started
 
     def get_voice_connected_age(self, guild_id):
         started = self.voice_connected_at.get(str(guild_id))
@@ -749,7 +763,13 @@ async def voice_watchdog():
             continue
 
         target_channel_id = bot.get_voice_target(guild.id)
-        if not target_channel_id or not bot.can_retry_voice(guild.id):
+        disconnected_age = bot.get_voice_disconnected_age(guild.id)
+        if (
+            not target_channel_id
+            or disconnected_age is None
+            or disconnected_age < VOICE_LIBRARY_RECOVERY_GRACE
+            or not bot.can_retry_voice(guild.id)
+        ):
             continue
 
         try:
@@ -757,7 +777,10 @@ async def voice_watchdog():
                 "watchdog 재접속 시도",
                 guild,
                 vc,
-                extra=f"target_channel_id={target_channel_id}",
+                extra=(
+                    f"target_channel_id={target_channel_id} "
+                    f"disconnected_age={disconnected_age:.1f}s"
+                ),
             )
             vc = await ensure_voice_connection(guild, target_channel_id, reason="watchdog")
             if vc:
@@ -884,13 +907,11 @@ async def on_voice_state_update(member, before, after):
         return
 
     bot.mark_voice_disconnected(member.guild.id)
-    await asyncio.sleep(VOICE_RECONNECT_DELAY)
-    try:
-        vc = await ensure_voice_connection(member.guild, target_channel_id, reason="voice_state_update")
-        if vc:
-            bot.reset_voice_retry(member.guild.id)
-    except Exception as e:
-        log_voice_debug(f"[VC][LLM] 이벤트 기반 재접속 실패 ({member.guild.name}): {e}")
+    log_voice_debug(
+        f"[VC][LLM] bot 음성 채널 이탈 감지 ({member.guild.name}): "
+        f"target_channel_id={target_channel_id}, "
+        f"discord.py 내부 복구 우선, {VOICE_LIBRARY_RECOVERY_GRACE:.0f}초 후 watchdog 개입"
+    )
 
 @bot.event
 async def on_message(message):
