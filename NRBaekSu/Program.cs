@@ -6,6 +6,7 @@ using Discord.WebSocket;
 const int StartupRestoreDelayMs = 5000;
 const int ReconcileIntervalMs = 30000;
 const int ReconnectDelayMs = 5000;
+const int FailedConnectCooldownMs = 20000;
 
 var token = Environment.GetEnvironmentVariable("BAEKSU_DISCORD_TOKEN")
     ?? throw new InvalidOperationException("BAEKSU_DISCORD_TOKEN is required");
@@ -24,6 +25,7 @@ var client = new DiscordSocketClient(new DiscordSocketConfig
 
 var state = new StayVcState(configFile);
 var reconnectLocks = new ConcurrentDictionary<ulong, SemaphoreSlim>();
+var failedConnectCooldowns = new ConcurrentDictionary<ulong, DateTimeOffset>();
 Task? reconcileTask = null;
 
 client.Log += message =>
@@ -99,12 +101,13 @@ client.SlashCommandExecuted += async command =>
 
             await command.DeferAsync(ephemeral: true);
             state.SetTargetChannelId(guildId, channel.Id);
-            var ok = await Task.Run(async () =>
-                await EnsureConnectedAsync(guildId, channel.Id, "slash:vcjoin")
-            );
-            await command.FollowupAsync(
-                ok ? $"상주 시작: {channel.Mention}" : "연결 시도는 했지만 음성 채널 연결을 확인하지 못했습니다.",
-                ephemeral: true
+            QueueSlashConnectAsync(
+                command,
+                guildId,
+                channel.Id,
+                "slash:vcjoin",
+                $"상주 시작: {channel.Mention}",
+                "연결 시도는 했지만 음성 채널 연결을 확인하지 못했습니다."
             );
             return;
         }
@@ -132,12 +135,13 @@ client.SlashCommandExecuted += async command =>
             }
 
             await command.DeferAsync(ephemeral: true);
-            var ok = await Task.Run(async () =>
-                await EnsureConnectedAsync(guildId, targetChannelId.Value, "slash:vcrejoin")
-            );
-            await command.FollowupAsync(
-                ok ? "저장된 채널로 다시 붙었습니다." : "재접속을 시도했지만 연결을 확인하지 못했습니다.",
-                ephemeral: true
+            QueueSlashConnectAsync(
+                command,
+                guildId,
+                targetChannelId.Value,
+                "slash:vcrejoin",
+                "저장된 채널로 다시 붙었습니다.",
+                "재접속을 시도했지만 연결을 확인하지 못했습니다."
             );
             return;
         }
@@ -217,6 +221,29 @@ static string FormatVoiceChannelId(SocketVoiceState state)
     return state.VoiceChannel is null ? "none" : state.VoiceChannel.Id.ToString();
 }
 
+void QueueSlashConnectAsync(
+    SocketSlashCommand command,
+    ulong guildId,
+    ulong channelId,
+    string reason,
+    string successMessage,
+    string failureMessage
+)
+{
+    _ = Task.Run(async () =>
+    {
+        var ok = await EnsureConnectedAsync(guildId, channelId, reason, bypassCooldown: true);
+        try
+        {
+            await command.FollowupAsync(ok ? successMessage : failureMessage, ephemeral: true);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BAEKSU] followup failed guild={guildId} reason={reason}: {ex.Message}");
+        }
+    });
+}
+
 async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
 {
     IReadOnlyCollection<SocketGuild> guilds = onlyGuild is null
@@ -243,7 +270,7 @@ async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
     }
 }
 
-async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string reason)
+async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string reason, bool bypassCooldown = false)
 {
     var gate = reconnectLocks.GetOrAdd(guildId, _ => new SemaphoreSlim(1, 1));
     await gate.WaitAsync();
@@ -269,8 +296,19 @@ async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string rea
             return false;
         }
 
+        if (!bypassCooldown
+            && failedConnectCooldowns.TryGetValue(guildId, out var cooldownUntil)
+            && cooldownUntil > DateTimeOffset.UtcNow)
+        {
+            Console.WriteLine(
+                $"[BAEKSU] guild={guildId} skip connect cooldown-until={cooldownUntil:O} channel={channelId} reason={reason}"
+            );
+            return false;
+        }
+
         if (guild.CurrentUser?.VoiceChannel?.Id == channelId)
         {
+            failedConnectCooldowns.TryRemove(guildId, out _);
             return true;
         }
 
@@ -279,10 +317,12 @@ async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string rea
             Console.WriteLine($"[BAEKSU] guild={guildId} joining channel={channelId} ({channel.Name}) reason={reason}");
             await channel.ConnectAsync(selfDeaf: true, selfMute: false, external: false, disconnect: true);
             state.SetTargetChannelId(guildId, channelId);
+            failedConnectCooldowns.TryRemove(guildId, out _);
             return true;
         }
         catch (Exception ex)
         {
+            failedConnectCooldowns[guildId] = DateTimeOffset.UtcNow.AddMilliseconds(FailedConnectCooldownMs);
             Console.WriteLine($"[BAEKSU] guild={guildId} connect failed channel={channelId} reason={reason}: {ex.Message}");
             return false;
         }
