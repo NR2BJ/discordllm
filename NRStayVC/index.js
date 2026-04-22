@@ -5,6 +5,7 @@ const {
   Client,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -374,26 +375,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.commandName === 'vcjoin') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
     const channel = member?.voice?.channel || null;
     if (!channel) {
-      await interaction.reply({ content: '음성 채널에 먼저 들어가 주세요.', ephemeral: true });
+      await interaction.editReply({ content: '음성 채널에 먼저 들어가 주세요.' });
       return;
     }
 
     setTargetChannelId(interaction.guild.id, channel.id);
     const connection = await connectToChannel(channel, 'slash:vcjoin');
     if (!connection) {
-      await interaction.reply({
+      await interaction.editReply({
         content: '연결은 시도했지만 READY 상태 확인에 실패했습니다. 백그라운드 재시도를 계속합니다.',
-        ephemeral: true,
       });
       return;
     }
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `상주 시작: ${channel.toString()}`,
-      ephemeral: true,
     });
     return;
   }
@@ -409,14 +409,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
         // Ignore destroy races.
       }
     }
-    await interaction.reply({ content: '상주를 해제하고 음성 채널에서 나갔습니다.', ephemeral: true });
+    await interaction.reply({
+      content: '상주를 해제하고 음성 채널에서 나갔습니다.',
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
   if (interaction.commandName === 'vcrejoin') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const targetChannelId = getTargetChannelId(interaction.guild.id);
     if (!targetChannelId) {
-      await interaction.reply({ content: '저장된 상주 채널이 없습니다.', ephemeral: true });
+      await interaction.editReply({ content: '저장된 상주 채널이 없습니다.' });
       return;
     }
 
@@ -431,9 +435,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     const restored = await restoreVoiceForGuild(interaction.guild.id, 'slash:vcrejoin');
-    await interaction.reply({
+    await interaction.editReply({
       content: restored ? '저장된 채널로 다시 붙었습니다.' : '재접속을 시작했습니다. 실패하면 백그라운드 재시도를 계속합니다.',
-      ephemeral: true,
     });
     return;
   }
@@ -447,7 +450,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `voiceStatus: ${status.status}\n` +
         `retryAttempt: ${status.retryAttempt}\n` +
         `retryScheduled: ${status.retryScheduled}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 });
