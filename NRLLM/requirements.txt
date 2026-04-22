@@ -1,4 +1,4 @@
-discord.py==2.7.1
-aiohttp==3.13.5
-beautifulsoup4==4.14.3
-uvloop==0.22.1
+discord.py
+aiohttp
+beautifulsoup4
+uvloop

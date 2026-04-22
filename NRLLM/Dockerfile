@@ -1,4 +1,4 @@
-FROM python:3.14.4-slim
+FROM python:slim
 WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
