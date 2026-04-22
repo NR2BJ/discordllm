@@ -19,7 +19,7 @@ var client = new DiscordSocketClient(new DiscordSocketConfig
 {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildVoiceStates,
     LogGatewayIntentWarnings = false,
-    AlwaysDownloadUsers = false,
+    AlwaysDownloadUsers = true,
     EnableVoiceDaveEncryption = true,
 });
 
