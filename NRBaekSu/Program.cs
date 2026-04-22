@@ -159,7 +159,7 @@ client.UserVoiceStateUpdated += async (user, before, after) =>
 
     var guildId = guildUser.Guild.Id;
     Console.WriteLine(
-        $"[BAEKSU] guild={guildId} voice {before.VoiceChannel?.Id?.ToString() ?? "none"} -> {after.VoiceChannel?.Id?.ToString() ?? "none"}"
+        $"[BAEKSU] guild={guildId} voice {FormatVoiceChannelId(before)} -> {FormatVoiceChannelId(after)}"
     );
 
     if (after.VoiceChannel is not null)
@@ -184,6 +184,11 @@ client.UserVoiceStateUpdated += async (user, before, after) =>
 await client.LoginAsync(TokenType.Bot, token);
 await client.StartAsync();
 await Task.Delay(Timeout.Infinite);
+
+static string FormatVoiceChannelId(SocketVoiceState state)
+{
+    return state.VoiceChannel is null ? "none" : state.VoiceChannel.Id.ToString();
+}
 
 async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
 {
