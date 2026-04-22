@@ -12,11 +12,14 @@ var token = Environment.GetEnvironmentVariable("BAEKSU_DISCORD_TOKEN")
 var configFile = Environment.GetEnvironmentVariable("CONFIG_FILE")
     ?? Path.Combine(AppContext.BaseDirectory, "baeksu.json");
 
+ConfigureDaveLogging();
+
 var client = new DiscordSocketClient(new DiscordSocketConfig
 {
     GatewayIntents = GatewayIntents.Guilds | GatewayIntents.GuildVoiceStates,
     LogGatewayIntentWarnings = false,
     AlwaysDownloadUsers = false,
+    EnableVoiceDaveEncryption = true,
 });
 
 var state = new StayVcState(configFile);
@@ -192,6 +195,22 @@ client.UserVoiceStateUpdated += async (user, before, after) =>
 await client.LoginAsync(TokenType.Bot, token);
 await client.StartAsync();
 await Task.Delay(Timeout.Infinite);
+
+static void ConfigureDaveLogging()
+{
+    try
+    {
+        Discord.LibDave.Dave.SetLogSink(static (severity, filePath, lineNumber, message) =>
+        {
+            var fileName = Path.GetFileName(filePath);
+            Console.WriteLine($"[BAEKSU][LIBDAVE:{severity}] {fileName}#{lineNumber} {message}");
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[BAEKSU] failed to configure libdave log sink: {ex.Message}");
+    }
+}
 
 static string FormatVoiceChannelId(SocketVoiceState state)
 {
