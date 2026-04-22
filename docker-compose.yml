@@ -19,3 +19,12 @@ services:
       CONFIG_FILE: /data/llm.json
     volumes:
       - /mnt/storage/docker/discord/data:/data
+
+  stayvc:
+    build: ./NRStayVC
+    restart: unless-stopped
+    environment:
+      STAYVC_DISCORD_TOKEN: ${STAYVC_DISCORD_TOKEN}
+      CONFIG_FILE: /data/stayvc.json
+    volumes:
+      - /mnt/storage/docker/discord/data:/data
