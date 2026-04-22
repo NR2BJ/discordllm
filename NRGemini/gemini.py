@@ -235,7 +235,8 @@ async def voice_disconnect(vc, *, force=True):
 
 def build_lavalink_local_identifier(filepath):
     relative = Path(filepath).resolve().relative_to(Path(SOUND_DIR).resolve())
-    return (LAVALINK_LOCAL_ROOT / relative).as_uri()
+    # Lavalink local source expects a filesystem path, not a file:// URI.
+    return (LAVALINK_LOCAL_ROOT / relative).as_posix()
 
 def get_voice_ws_closed(vc):
     ws = getattr(vc, "ws", None)
