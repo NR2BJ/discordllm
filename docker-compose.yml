@@ -3,7 +3,7 @@ services:
     image: ghcr.io/lavalink-devs/lavalink:4.2.2
     restart: unless-stopped
     environment:
-      LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD}
+      LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
       _JAVA_OPTIONS: -Xms256M -Xmx512M
     volumes:
       - ./Lavalink/application.yml:/opt/Lavalink/application.yml:ro
@@ -21,7 +21,7 @@ services:
       GEMINI_USE_LAVALINK: "1"
       LAVALINK_HOST: lavalink
       LAVALINK_PORT: 2333
-      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD}
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
       LAVALINK_SECURE: "0"
       LAVALINK_LABEL: main
       LAVALINK_LOCAL_ROOT: /opt/lavalink/sb
