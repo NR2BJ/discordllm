@@ -146,6 +146,7 @@ os.makedirs(os.path.join(SOUND_DIR, "discord"), exist_ok=True)
 SOUND_VOLUME = 0.15  # 기본 볼륨 (0.0~1.0)
 SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
 SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
+LAVALINK_POST_CONNECT_GRACE = 0.35  # Lavalink 최초 연결 직후 첫 재생 앞머리 손실 완충
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_LIBRARY_RECOVERY_GRACE = 75.0
@@ -580,6 +581,11 @@ async def temp_followup(interaction, content, delay=5):
         pass
 
 async def play_lavalink_local_sound(player, filepath, volume, *, replace=True):
+    guild = getattr(player, "guild", None)
+    if guild is not None:
+        connected_age = bot.get_voice_connected_age(guild.id)
+        if connected_age is not None and connected_age < LAVALINK_POST_CONNECT_GRACE:
+            await asyncio.sleep(LAVALINK_POST_CONNECT_GRACE - connected_age)
     identifier = build_lavalink_local_identifier(filepath)
     await player.play(
         identifier,
