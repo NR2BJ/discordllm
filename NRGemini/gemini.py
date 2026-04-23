@@ -103,6 +103,8 @@ GEMINI_MEMORY_MODEL = os.environ.get("GEMINI_MEMORY_MODEL", ROUTING_MODEL)
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
 DEFAULT_HISTORY_LIMIT = 20
+MIN_HISTORY_LIMIT = 1
+MAX_HISTORY_LIMIT = 100
 IMAGE_SEARCH_LIMIT = 2
 MAX_REF_IMAGES = 1
 MAX_DOC_CHARS = 12000
@@ -332,6 +334,16 @@ def get_voice_ws_closed(vc):
 
 def get_history_limit_for_text_model(text_model):
     return MODEL_HISTORY_LIMITS.get(text_model, DEFAULT_HISTORY_LIMIT)
+
+def clamp_history_limit(value):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = DEFAULT_HISTORY_LIMIT
+    return max(MIN_HISTORY_LIMIT, min(MAX_HISTORY_LIMIT, limit))
+
+def get_history_limit(config):
+    return clamp_history_limit((config or {}).get("history_limit", DEFAULT_HISTORY_LIMIT))
 
 def get_voice_unhealthy_reason(vc):
     if vc is None:
@@ -815,17 +827,6 @@ MEMORY_EXTRACTION_SCHEMA = {
 }
 
 
-CHANNEL_SUMMARY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "topics": {"type": "array", "items": {"type": "string"}},
-        "open_questions": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["summary", "topics", "open_questions"],
-}
-
-
 IMAGE_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -865,13 +866,6 @@ class MemoryStore:
         servers = self.data.setdefault("servers", {})
         if gid not in servers:
             servers[gid] = {
-                "channel_summary": {
-                    "summary": "",
-                    "topics": [],
-                    "open_questions": [],
-                    "updated_at": None,
-                    "last_message_id": None,
-                },
                 "speaker_state": {},
             }
         return servers[gid]
@@ -879,17 +873,6 @@ class MemoryStore:
     def clear_speaker_state(self, guild_id):
         server = self.get_server(guild_id)
         server["speaker_state"] = {}
-        self.save()
-
-    def clear_context(self, guild_id):
-        server = self.get_server(guild_id)
-        server["channel_summary"] = {
-            "summary": "",
-            "topics": [],
-            "open_questions": [],
-            "updated_at": None,
-            "last_message_id": None,
-        }
         self.save()
 
     def touch_user(self, guild_id, user_id, display_name):
@@ -910,19 +893,6 @@ class MemoryStore:
         recent_names = [display_name] + [name for name in state.get("recent_display_names", []) if name != display_name]
         state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
         self.save()
-
-    def render_channel_summary(self, guild_id):
-        summary = self.get_server(guild_id).get("channel_summary", {})
-        lines = []
-        if summary.get("summary"):
-            lines.append(f"Summary: {summary['summary']}")
-        if summary.get("topics"):
-            lines.append("Topics: " + "; ".join(summary["topics"][:8]))
-        if summary.get("open_questions"):
-            lines.append("Open questions: " + "; ".join(summary["open_questions"][:8]))
-        if not lines:
-            return ""
-        return "[Channel Memory]\n" + "\n".join(lines)
 
     def render_speaker_state(self, guild_id):
         speaker_state = self.get_server(guild_id).get("speaker_state", {})
@@ -999,18 +969,6 @@ class MemoryStore:
                     items.insert(0, normalized)
                 state["items"] = items[:MEMORY_MAX_ITEMS_PER_USER]
 
-        self.save()
-
-    def update_channel_summary(self, guild_id, payload, *, message_id):
-        server = self.get_server(guild_id)
-        now = datetime.now(timezone.utc).isoformat()
-        server["channel_summary"] = {
-            "summary": (payload.get("summary") or "").strip(),
-            "topics": [t.strip() for t in payload.get("topics", []) if isinstance(t, str) and t.strip()][:8],
-            "open_questions": [q.strip() for q in payload.get("open_questions", []) if isinstance(q, str) and q.strip()][:8],
-            "updated_at": now,
-            "last_message_id": str(message_id),
-        }
         self.save()
 
 
@@ -1739,29 +1697,9 @@ async def update_speaker_memory(guild, history_texts, current_user_text, message
         bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
 
 
-async def update_channel_summary(guild, history_texts, current_user_text, message):
-    excerpt = build_recent_conversation_excerpt(history_texts, current_user_text)
-    if not excerpt:
-        return
-
-    current_summary = bot.memory_store.render_channel_summary(guild.id)
-    summary_prompt = (
-        "You maintain a concise server-level channel memory.\n"
-        "Summarize the ongoing topic, key agreements/disagreements, and unresolved questions.\n"
-        "Do not repeat user-specific facts that belong in speaker memory unless they matter to the shared discussion.\n"
-        "Keep the summary dense and practical.\n\n"
-        f"Current channel memory:\n{current_summary or '(empty)'}\n\n"
-        f"Recent conversation excerpt:\n{excerpt}"
-    )
-    payload = await generate_json_with_gemini(summary_prompt, CHANNEL_SUMMARY_SCHEMA)
-    if payload:
-        bot.memory_store.update_channel_summary(guild.id, payload, message_id=message.id)
-
-
 async def update_gemini_memory(guild, history_texts, current_user_text, message):
     try:
         await update_speaker_memory(guild, history_texts, current_user_text, message)
-        await update_channel_summary(guild, history_texts, current_user_text, message)
     except Exception as e:
         print(f"[MEMORY] Gemini 메모리 업데이트 실패: {e}")
 
@@ -2036,7 +1974,8 @@ class GeminiBot(commands.Bot):
     def get_config(self, guild_id):
         gid = str(guild_id)
         if gid not in self.server_configs:
-            self.server_configs[gid] = {"channel_id": None, "reset_time": None}
+            self.server_configs[gid] = {"channel_id": None, "reset_time": None, "history_limit": DEFAULT_HISTORY_LIMIT}
+        self.server_configs[gid].setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
         return self.server_configs[gid]
 
     def get_sibo(self, guild_id):
@@ -2551,8 +2490,40 @@ async def sibo_loop(my_gen=None):
 
         await asyncio.sleep(1)
 
+async def rebuild_panel_channel(guild, channel, *, save_target=False):
+    """사운드보드 전용 채널을 비우고 시보/사운드보드 패널을 재게시."""
+    if save_target:
+        config = bot.get_config(guild.id)
+        config["sb_channel_id"] = channel.id
+        bot.save_config()
+
+    deleted_count = 0
+    try:
+        while True:
+            deleted = await channel.purge(limit=100, bulk=False)
+            deleted_count += len(deleted)
+            if len(deleted) < 100:
+                break
+            await asyncio.sleep(0.25)
+        print(f"[PANEL] {guild.name}: #{channel.name} {deleted_count}개 메시지 삭제")
+    except Exception as e:
+        print(f"[PANEL] {guild.name}: 채널 초기화 실패: {e}")
+        raise
+
+    sibo_view = SiboView(guild.id)
+    bot.active_views.append(sibo_view)
+    await channel.send(embed=sibo_view._make_embed(), view=sibo_view)
+
+    keys = sorted(bot.sound_files.keys())
+    sb_view = SoundboardView(keys)
+    bot.active_views.append(sb_view)
+    await channel.send(embed=sb_view._make_embed(), view=sb_view)
+    print(f"[PANEL] {guild.name}: 패널 임베드 재생성 완료")
+    return deleted_count
+
+
 async def setup_panel_channels():
-    """봇 시작 시 사운드보드 채널 메시지 초기화 후 /sb, /sibo 임베드 자동 재생성."""
+    """봇 시작 시 사운드보드 채널 메시지 초기화 후 패널 자동 재생성."""
     for guild in bot.guilds:
         config = bot.get_config(guild.id)
         panel_channel_id = config.get("sb_channel_id")
@@ -2563,23 +2534,7 @@ async def setup_panel_channels():
             print(f"[PANEL] {guild.name}: 패널 채널 없음 (ID: {panel_channel_id})")
             continue
         try:
-            deleted = await channel.purge(limit=500, bulk=False)
-            print(f"[PANEL] {guild.name}: #{channel.name} {len(deleted)}개 메시지 삭제")
-        except Exception as e:
-            print(f"[PANEL] {guild.name}: 채널 초기화 실패: {e}")
-            continue
-        try:
-            # /sibo 임베드
-            sibo_view = SiboView(guild.id)
-            bot.active_views.append(sibo_view)
-            await channel.send(embed=sibo_view._make_embed(), view=sibo_view)
-            # /sb 임베드
-            keys = sorted(bot.sound_files.keys())
-            if keys:
-                sb_view = SoundboardView(keys)
-                bot.active_views.append(sb_view)
-                await channel.send(embed=sb_view._make_embed(), view=sb_view)
-            print(f"[PANEL] {guild.name}: 패널 임베드 재생성 완료")
+            await rebuild_panel_channel(guild, channel)
         except Exception as e:
             print(f"[PANEL] {guild.name}: 임베드 생성 실패: {e}")
 
@@ -2766,7 +2721,7 @@ async def on_message(message):
             try:
                 server_text_model = config.get("text_model", TEXT_MODEL)
                 server_image_model = config.get("image_model", IMAGE_MODEL)
-                history_limit = get_history_limit_for_text_model(server_text_model)
+                history_limit = get_history_limit(config)
                 reset_ts = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
@@ -2820,6 +2775,8 @@ async def on_message(message):
                     history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
                     history_texts.insert(0, content)
                     history_position += 1
+                    if len(history_list) >= history_limit:
+                        break
 
                 _cur_member = message.guild.get_member(message.author.id) or message.author
                 bot.memory_store.touch_user(message.guild.id, message.author.id, _cur_member.display_name)
@@ -2933,7 +2890,6 @@ async def on_message(message):
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
                 memory_context = "\n\n".join(
                     block for block in [
-                        bot.memory_store.render_channel_summary(message.guild.id),
                         bot.memory_store.render_speaker_state(message.guild.id),
                     ] if block
                 )
@@ -3013,20 +2969,41 @@ async def set_ch(interaction: discord.Interaction):
         f"[OK] {interaction.user.display_name}님이 봇 활성화 채널을 {interaction.channel.mention} 으로 설정했습니다."
     )
 
+
+@bot.tree.command(name="history", description="Gemini 대화 원문 히스토리 참조 개수 설정")
+@app_commands.describe(count=f"참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)")
+async def set_history(interaction: discord.Interaction, count: int | None = None):
+    if not interaction.guild:
+        await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
+        return
+    config = bot.get_config(interaction.guild_id)
+    if count is None:
+        await interaction.response.send_message(
+            f"현재 Gemini 원문 히스토리 참조: **{get_history_limit(config)}개** "
+            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)"
+        )
+        return
+    limit = clamp_history_limit(count)
+    config["history_limit"] = limit
+    bot.save_config()
+    suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
+    await interaction.response.send_message(
+        f"[OK] {interaction.user.display_name}님이 Gemini 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
+    )
+
 reset_group = app_commands.Group(name="reset", description="Gemini 메모리/맥락 초기화")
 
 
-@reset_group.command(name="context", description="채널 요약 메모리와 원문 기준 시점을 초기화")
+@reset_group.command(name="context", description="원문 대화 기준 시점을 초기화")
 async def reset_context(interaction: discord.Interaction):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
         return
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
-    bot.memory_store.clear_context(interaction.guild_id)
     bot.save_config()
     await interaction.response.send_message(
-        f"[OK] {interaction.user.display_name}님이 Gemini 채널 요약 메모리와 원문 기준 시점을 초기화했습니다."
+        f"[OK] {interaction.user.display_name}님이 Gemini 원문 대화 기준 시점을 초기화했습니다."
     )
 
 
@@ -3402,9 +3379,9 @@ class SoundboardView(discord.ui.View):
         log_btn.callback = self._log_callback
         self.add_item(log_btn)
 
-        channel_btn = discord.ui.Button(label="🔧 이 채널을 업로드용으로", style=discord.ButtonStyle.secondary, row=3)
-        channel_btn.callback = self._channel_callback
-        self.add_item(channel_btn)
+        volume_btn = discord.ui.Button(label=f"🔉 볼륨: {int(bot.sound_volume * 100)}%", style=discord.ButtonStyle.secondary, row=3)
+        volume_btn.callback = self._volume_callback
+        self.add_item(volume_btn)
 
     def _make_embed(self):
         if self.show_log:
@@ -3499,35 +3476,58 @@ class SoundboardView(discord.ui.View):
         else:
             await temp_reply(interaction, "현재 음성 채널에 접속되어 있지 않습니다.")
 
-    async def _channel_callback(self, interaction: discord.Interaction):
-        config = bot.get_config(interaction.guild.id)
-        config["sb_channel_id"] = interaction.channel.id
-        bot.save_config()
-        await temp_reply(interaction,
-            f"사운드 업로드 채널: {interaction.channel.mention}\n음원 파일을 올리면 자동으로 추가됩니다.\n봇 재시작 시 이 채널에 /sibo, /sb 임베드가 자동으로 재게시됩니다.")
+    async def _volume_callback(self, interaction: discord.Interaction):
+        modal = VolumeModal(self)
+        await interaction.response.send_modal(modal)
 
     async def on_timeout(self):
         self.clear_items()
 
 
-@bot.tree.command(name="sb", description="사운드보드 (이름 입력시 바로 재생, 빈 입력시 목록)")
+class VolumeModal(discord.ui.Modal, title="사운드보드 볼륨 설정"):
+    def __init__(self, soundboard_view: SoundboardView):
+        super().__init__()
+        self.soundboard_view = soundboard_view
+        self.value = discord.ui.TextInput(
+            label="볼륨 (1~100%)",
+            placeholder=str(int(bot.sound_volume * 100)),
+            max_length=3,
+        )
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            percent = max(1, min(100, int(self.value.value)))
+        except ValueError:
+            await temp_reply(interaction, "숫자를 입력해주세요.")
+            return
+        bot.sound_volume = percent / 100.0
+        self.soundboard_view._refresh_keys()
+        self.soundboard_view._update_components()
+        await interaction.response.edit_message(embed=self.soundboard_view._make_embed(), view=self.soundboard_view)
+
+
+@bot.tree.command(name="sb", description="사운드보드 (이름 입력시 재생, 빈 입력시 현재 채널 패널 재생성)")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.describe(name="재생할 사운드 이름 (비우면 목록 표시)")
+@app_commands.describe(name="재생할 사운드 이름 (비우면 현재 채널을 패널 채널로 설정)")
 async def soundboard(interaction: discord.Interaction, name: str = None):
     if not interaction.guild:
         await temp_reply(interaction, "서버에서만 사용 가능합니다.")
         return
 
-    # 인자 없으면 목록 UI 표시
+    # 인자 없으면 현재 채널을 사운드보드 전용 채널로 설정하고 패널 재생성
     if not name:
-        keys = sorted(bot.sound_files.keys())
-        if not keys:
-            await temp_reply(interaction, "등록된 사운드가 없습니다.")
-            return
-        view = SoundboardView(keys, user_id=interaction.user.id)
-        bot.active_views.append(view)
-        await interaction.response.send_message(embed=view._make_embed(), view=view)
+        await interaction.response.defer()
+        try:
+            deleted_count = await rebuild_panel_channel(interaction.guild, interaction.channel, save_target=True)
+            await temp_followup(
+                interaction,
+                f"사운드보드 채널을 {interaction.channel.mention}로 설정하고 패널을 재생성했습니다. "
+                f"(삭제 {deleted_count}개)",
+            )
+        except Exception as e:
+            await temp_followup(interaction, f"[ERROR] 패널 재생성 실패: {e}")
         return
 
     # 인자 있으면 바로 재생
@@ -3564,15 +3564,6 @@ async def sb_autocomplete(interaction: discord.Interaction, current: str):
         display = key if len(key) <= 100 else "..." + key[-97:]
         choices.append(app_commands.Choice(name=display, value=key))
     return choices[:25]
-
-@bot.tree.command(name="vol", description="사운드보드 볼륨 조절")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.describe(percent="볼륨 (1~100%)")
-async def set_volume(interaction: discord.Interaction, percent: int):
-    percent = max(1, min(100, percent))
-    bot.sound_volume = percent / 100.0
-    await temp_reply(interaction, f"사운드보드 볼륨: **{percent}%**")
 
 # ================= 시보 커맨드 (임베드 UI) =================
 
@@ -3791,17 +3782,6 @@ class CompModal(discord.ui.Modal, title="딜레이 보정값 설정"):
         except ValueError:
             await temp_reply(interaction, "숫자를 입력해주세요.")
 
-@bot.tree.command(name="sibo", description="시보 (정각 알림) 설정")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-async def sibo_command(interaction: discord.Interaction):
-    if not interaction.guild:
-        await temp_reply(interaction, "서버에서만 사용 가능합니다.")
-        return
-    view = SiboView(interaction.guild.id)
-    bot.active_views.append(view)
-    await interaction.response.send_message(embed=view._make_embed(), view=view)
-
 # ================= 모델 전환 =================
 
 @bot.tree.command(name="model", description="AI 모델 전환")
@@ -3815,16 +3795,14 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
             cfg = bot.get_config(interaction.guild_id)
             server_tm = cfg.get("text_model", TEXT_MODEL)
             server_im = cfg.get("image_model", IMAGE_MODEL)
-            server_hist = get_history_limit_for_text_model(server_tm)
-            global_hist = get_history_limit_for_text_model(TEXT_MODEL)
+            server_hist = get_history_limit(cfg)
             await interaction.response.send_message(
                 f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개) / `{server_im}` (이미지)\n"
-                f"글로벌 기본값: `{TEXT_MODEL}` (히스토리 {global_hist}개) / `{IMAGE_MODEL}`"
+                f"글로벌 기본값: `{TEXT_MODEL}` / `{IMAGE_MODEL}`"
             )
         else:
-            global_hist = get_history_limit_for_text_model(TEXT_MODEL)
             await interaction.response.send_message(
-                f"글로벌 기본 모델: `{TEXT_MODEL}` (텍스트, 히스토리 {global_hist}개) / `{IMAGE_MODEL}` (이미지)"
+                f"글로벌 기본 모델: `{TEXT_MODEL}` / `{IMAGE_MODEL}` (이미지)"
             )
         return
     if name not in AVAILABLE_MODELS:
@@ -3838,7 +3816,7 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         cfg["text_model"] = TEXT_MODEL
         cfg["image_model"] = IMAGE_MODEL
         bot.save_config()
-    history_limit = get_history_limit_for_text_model(TEXT_MODEL)
+    history_limit = get_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_HISTORY_LIMIT
     await interaction.response.send_message(
         f"모델 변경됨: **{name}** by {interaction.user.display_name}\n"
         f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n히스토리 참조: {history_limit}개"

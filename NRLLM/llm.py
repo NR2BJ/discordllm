@@ -47,6 +47,8 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 # 🔢 [수치 조절 구역]
 HISTORY_LIMIT = 20
+MIN_HISTORY_LIMIT = 1
+MAX_HISTORY_LIMIT = 100
 IMAGE_HISTORY_LIMIT = 2
 VIDEO_HISTORY_LIMIT = 1
 AUDIO_HISTORY_LIMIT = 1
@@ -147,21 +149,6 @@ MEMORY_EXTRACTION_SCHEMA = {
             },
         },
         "required": ["speaker_updates"],
-        "additionalProperties": False,
-    },
-}
-
-CHANNEL_SUMMARY_SCHEMA = {
-    "name": "channel_summary_update",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string"},
-            "topics": {"type": "array", "items": {"type": "string"}},
-            "open_questions": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["summary", "topics", "open_questions"],
         "additionalProperties": False,
     },
 }
@@ -426,13 +413,6 @@ class MemoryStore:
         servers = self.data.setdefault("servers", {})
         if gid not in servers:
             servers[gid] = {
-                "channel_summary": {
-                    "summary": "",
-                    "topics": [],
-                    "open_questions": [],
-                    "updated_at": None,
-                    "last_message_id": None,
-                },
                 "speaker_state": {},
             }
         return servers[gid]
@@ -440,17 +420,6 @@ class MemoryStore:
     def clear_speaker_state(self, guild_id):
         server = self.get_server(guild_id)
         server["speaker_state"] = {}
-        self.save()
-
-    def clear_context(self, guild_id):
-        server = self.get_server(guild_id)
-        server["channel_summary"] = {
-            "summary": "",
-            "topics": [],
-            "open_questions": [],
-            "updated_at": None,
-            "last_message_id": None,
-        }
         self.save()
 
     def touch_user(self, guild_id, user_id, display_name):
@@ -471,19 +440,6 @@ class MemoryStore:
         recent_names = [display_name] + [name for name in state.get("recent_display_names", []) if name != display_name]
         state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
         self.save()
-
-    def render_channel_summary(self, guild_id):
-        summary = self.get_server(guild_id).get("channel_summary", {})
-        lines = []
-        if summary.get("summary"):
-            lines.append(f"Summary: {summary['summary']}")
-        if summary.get("topics"):
-            lines.append("Topics: " + "; ".join(summary["topics"][:8]))
-        if summary.get("open_questions"):
-            lines.append("Open questions: " + "; ".join(summary["open_questions"][:8]))
-        if not lines:
-            return ""
-        return "[Channel Memory]\n" + "\n".join(lines)
 
     def render_speaker_state(self, guild_id):
         speaker_state = self.get_server(guild_id).get("speaker_state", {})
@@ -560,18 +516,6 @@ class MemoryStore:
                     items.insert(0, normalized)
                 state["items"] = items[:MEMORY_MAX_ITEMS_PER_USER]
 
-        self.save()
-
-    def update_channel_summary(self, guild_id, payload, *, message_id):
-        server = self.get_server(guild_id)
-        now = datetime.now(timezone.utc).isoformat()
-        server["channel_summary"] = {
-            "summary": (payload.get("summary") or "").strip(),
-            "topics": [t.strip() for t in payload.get("topics", []) if isinstance(t, str) and t.strip()][:8],
-            "open_questions": [q.strip() for q in payload.get("open_questions", []) if isinstance(q, str) and q.strip()][:8],
-            "updated_at": now,
-            "last_message_id": str(message_id),
-        }
         self.save()
 
 def log_history_debug(message):
@@ -694,6 +638,18 @@ def sanitize_for_memory_excerpt(text):
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:MEMORY_EXCERPT_MAX_CHARS]
+
+
+def clamp_history_limit(value):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = HISTORY_LIMIT
+    return max(MIN_HISTORY_LIMIT, min(MAX_HISTORY_LIMIT, limit))
+
+
+def get_history_limit(config):
+    return clamp_history_limit((config or {}).get("history_limit", HISTORY_LIMIT))
 
 
 def get_bot_display_name():
@@ -1011,9 +967,11 @@ class OpenRouterBot(commands.Bot):
                 "reset_time": None,
                 "search": False,
                 "provider_policy": DEFAULT_PROVIDER_POLICY,
+                "history_limit": HISTORY_LIMIT,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
         self.server_configs[gid].setdefault("provider_policy", DEFAULT_PROVIDER_POLICY)
+        self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -1409,41 +1367,6 @@ async def update_speaker_memory(guild, config, history_messages, current_user_te
         print(f"⚠️ 화자 메모리 업데이트 실패: {e}")
 
 
-async def update_channel_summary(guild, config, history_messages, current_user_text, message):
-    excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
-    if not excerpt:
-        return
-
-    current_summary = bot.memory_store.render_channel_summary(guild.id)
-    summary_prompt = (
-        "You maintain a concise server-level channel memory.\n"
-        "Summarize the ongoing topic, key agreements/disagreements, and unresolved questions.\n"
-        "Do not repeat user-specific facts that belong in speaker memory unless they matter to the shared discussion.\n"
-        "Keep the summary dense and practical.\n\n"
-        f"Current channel memory:\n{current_summary or '(empty)'}\n\n"
-        f"Recent conversation excerpt:\n{excerpt}"
-    )
-    try:
-        response_text, _, _, _ = await bot.or_client.chat_completion(
-            DEFAULT_MEMORY_MODEL,
-            [
-                {"role": "system", "content": "Return valid JSON only."},
-                {"role": "user", "content": summary_prompt},
-            ],
-            response_format={"type": "json_schema", "json_schema": CHANNEL_SUMMARY_SCHEMA},
-            provider=build_provider_preferences(config.get("provider_policy"), strict=True),
-            require_parameter_support=True,
-            cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
-                {"content": summary_prompt},
-            ]),
-        )
-        payload = coerce_json_object(response_text)
-        if payload:
-            bot.memory_store.update_channel_summary(guild.id, payload, message_id=message.id)
-    except Exception as e:
-        print(f"⚠️ 채널 요약 메모리 업데이트 실패: {e}")
-
-
 async def handle_natural_image_request(message, config, history_messages, current_user_text, *, reference_inputs=None):
     base_model_info = await bot.or_client.resolve_model_info(config["model"])
     base_caps = bot.or_client.analyze_model_capabilities(config["model"], model_info=base_model_info)
@@ -1593,7 +1516,6 @@ async def on_message(message):
 
                 messages = [{"role": "system", "content": sys_prompt}]
                 memory_blocks = [
-                    bot.memory_store.render_channel_summary(message.guild.id),
                     bot.memory_store.render_speaker_state(message.guild.id),
                 ]
                 rendered_memory = "\n\n".join(block for block in memory_blocks if block)
@@ -1608,8 +1530,9 @@ async def on_message(message):
                 aud_count = 0
                 history_buffer = []
                 history_position = 0
+                history_limit = get_history_limit(config)
 
-                async for msg in message.channel.history(limit=HISTORY_LIMIT + 10):
+                async for msg in message.channel.history(limit=history_limit + 10):
                     if msg.id == message.id:
                         continue
                     if msg.id > message.id and msg.author != bot.user:
@@ -1691,6 +1614,8 @@ async def on_message(message):
                     content_list.append({"type": "text", "text": text_content})
                     history_buffer.insert(0, {"role": role, "content": content_list})
                     history_position += 1
+                    if len(history_buffer) >= history_limit:
+                        break
 
                 messages.extend(history_buffer)
 
@@ -1795,7 +1720,6 @@ async def on_message(message):
                     )
                     if handled:
                         await update_speaker_memory(message.guild, config, history_buffer, user_text, message)
-                        await update_channel_summary(message.guild, config, history_buffer, user_text, message)
                         return
 
                 if route.get("action") == "inspect_recent_images" and not current_image_inputs and route.get("use_recent_images"):
@@ -1847,7 +1771,7 @@ async def on_message(message):
                         await message.channel.send(
                             f"❌ `{current_model}` 모델은 현재 OpenRouter에서 실제 endpoint를 찾지 못했습니다.\n"
                             f"목록과 실제 라우팅 상태가 어긋났거나 provider 정책(`{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`)으로 endpoint가 걸러졌을 수 있습니다.\n"
-                            f"`/refresh_models` 후 `/model set`으로 다시 선택하거나 `/provider policy balanced`로 완화해보세요."
+                            f"`/model refresh` 후 `/model set`으로 다시 선택하거나 `/model provider balanced`로 완화해보세요."
                         )
                         return
 
@@ -1933,7 +1857,6 @@ async def on_message(message):
                 await send_generated_images(message.channel.send, images, on_sent=_register)
 
                 await update_speaker_memory(message.guild, config, history_buffer, user_text, message)
-                await update_channel_summary(message.guild, config, history_buffer, user_text, message)
 
             except Exception as e:
                 print(f"❌ 오류: {str(e)}")
@@ -1952,7 +1875,6 @@ async def image_generation_model_autocomplete(interaction: discord.Interaction, 
 
 model_group = app_commands.Group(name="model", description="모델 관련 설정")
 reset_group = app_commands.Group(name="reset", description="메모리/맥락 초기화")
-provider_group = app_commands.Group(name="provider", description="프로바이더 라우팅 설정")
 
 
 @model_group.command(name="set", description="기본 채팅 모델 변경")
@@ -1964,7 +1886,7 @@ async def set_model(interaction: discord.Interaction, model_id: str):
     model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_endpoint_check=True)
     if error:
         await interaction.followup.send(
-            f"❌ {error}\n`/refresh_models` 후 다시 시도해보세요.",
+            f"❌ {error}\n`/model refresh` 후 다시 시도해보세요.",
         )
         return
 
@@ -2020,18 +1942,17 @@ async def reset_speaker_state(interaction: discord.Interaction):
     await interaction.response.send_message(f"🧼 {interaction.user.display_name}님이 화자 상태 메모리를 초기화했습니다.")
 
 
-@reset_group.command(name="context", description="채널 요약 메모리와 원문 기준 시점을 초기화")
+@reset_group.command(name="context", description="원문 대화 기준 시점을 초기화")
 async def reset_context(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
     bot.save_config()
-    bot.memory_store.clear_context(interaction.guild_id)
     await interaction.response.send_message(
-        f"🧹 {interaction.user.display_name}님이 채널 요약 메모리와 원문 기준 시점을 초기화했습니다."
+        f"🧹 {interaction.user.display_name}님이 원문 대화 기준 시점을 초기화했습니다."
     )
 
 
-@provider_group.command(name="policy", description="기본 프로바이더 라우팅 정책 설정")
+@model_group.command(name="provider", description="기본 프로바이더 라우팅 정책 설정")
 @app_commands.choices(
     policy=[
         app_commands.Choice(name="cheap", value="cheap"),
@@ -2045,6 +1966,25 @@ async def set_provider_policy(interaction: discord.Interaction, policy: app_comm
     bot.save_config()
     await interaction.response.send_message(
         f"✅ {interaction.user.display_name}님이 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
+    )
+
+
+@model_group.command(name="history", description="대화 원문 히스토리 참조 개수 설정")
+@app_commands.describe(count=f"참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)")
+async def set_history_limit(interaction: discord.Interaction, count: int | None = None):
+    config = bot.get_config(interaction.guild_id)
+    if count is None:
+        await interaction.response.send_message(
+            f"현재 원문 히스토리 참조: **{get_history_limit(config)}개** "
+            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)"
+        )
+        return
+    limit = clamp_history_limit(count)
+    config["history_limit"] = limit
+    bot.save_config()
+    suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
+    await interaction.response.send_message(
+        f"✅ {interaction.user.display_name}님이 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
     )
 
 @bot.tree.command(name="dashboard", description="현재 모델 스펙 확인")
@@ -2065,7 +2005,6 @@ async def dashboard(interaction: discord.Interaction):
     endpoints = await bot.or_client.fetch_model_endpoints(curr_model)
     server_memory = bot.memory_store.get_server(interaction.guild_id)
     speaker_users = len(server_memory.get("speaker_state", {}))
-    has_summary = bool(server_memory.get("channel_summary", {}).get("summary"))
 
     color = 0x00bcd4 if is_multimodal else 0x4caf50
     embed = discord.Embed(title="🎛️ OpenRouter Dashboard", color=color)
@@ -2110,8 +2049,8 @@ async def dashboard(interaction: discord.Interaction):
         f"• **Chat Image:** {image_command_status}",
         f"• **Image Models:** {count_image_generation_models()} discovered",
         f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
+        f"• **History:** {get_history_limit(config)} messages",
         f"• **Speaker Memory:** {speaker_users} users",
-        f"• **Channel Summary:** {'SET' if has_summary else 'EMPTY'}",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
 
@@ -2240,7 +2179,7 @@ async def generate_image_cmd(
     if sent == 0:
         await interaction.followup.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다.")
 
-@bot.tree.command(name="refresh_models", description="OpenRouter 모델 리스트 즉시 갱신")
+@model_group.command(name="refresh", description="OpenRouter 모델 리스트 즉시 갱신")
 async def refresh_models_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     before = len(bot.or_client.models_list)
@@ -2262,7 +2201,6 @@ async def refresh_models_cmd(interaction: discord.Interaction):
 
 bot.tree.add_command(model_group)
 bot.tree.add_command(reset_group)
-bot.tree.add_command(provider_group)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
