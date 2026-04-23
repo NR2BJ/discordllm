@@ -725,7 +725,9 @@ class OpenRouterClient:
             print("⏳ OpenRouter 모델 리스트 동기화 중...")
             async with aiohttp.ClientSession() as session:
                 endpoints = [
+                    (f"{self.base_url}/models/user?output_modalities=all", "user-filtered-all"),
                     (f"{self.base_url}/models/user", "user-filtered"),
+                    (f"{self.base_url}/models?output_modalities=all", "global-all-fallback"),
                     (f"{self.base_url}/models", "global-fallback"),
                 ]
                 for url, source in endpoints:
@@ -769,6 +771,11 @@ class OpenRouterClient:
             return {"input": input_mod, "output": output_mod}
 
         arch = model.get('architecture', {})
+        arch_input_mod = arch.get("input_modalities")
+        arch_output_mod = arch.get("output_modalities")
+        if arch_input_mod and arch_output_mod:
+            return {"input": arch_input_mod, "output": arch_output_mod}
+
         modality = arch.get('modality', 'text->text').lower()
         parts = modality.split('->')
         inp = parts[0] if parts else 'text'
@@ -1186,15 +1193,25 @@ async def build_model_choices(current: str, predicate=None) -> List[app_commands
         choices.append(app_commands.Choice(name=name_display, value=m['id']))
     return choices
 
+def count_image_generation_models():
+    return sum(
+        1
+        for model in bot.or_client.models_list
+        if "image" in bot.or_client.analyze_model_capabilities(model["id"], model_info=model)["output"]
+    )
+
 async def resolve_model_bundle(model_id):
     info = await bot.or_client.resolve_model_info(model_id)
     endpoints = await bot.or_client.fetch_model_endpoints(model_id)
     caps = bot.or_client.analyze_model_capabilities(model_id, model_info=info)
     return info, endpoints, caps
 
-async def validate_model_for_use(model_id, *, require_input=None, require_output=None):
+async def validate_model_for_use(model_id, *, require_input=None, require_output=None, require_endpoint_check=False):
     clean_id = model_id.split(":")[0]
     info, endpoints, caps = await resolve_model_bundle(clean_id)
+
+    if require_endpoint_check and endpoints is None:
+        return None, endpoints, caps, f"`{clean_id}` 모델의 endpoint 정보를 확인하지 못했습니다. 모델 목록이 오래됐거나 OpenRouter 응답이 일시적으로 불안정할 수 있습니다."
 
     if endpoints is not None and len(endpoints) == 0:
         return None, endpoints, caps, f"`{clean_id}` 모델은 현재 이 API 키 기준으로 사용 가능한 OpenRouter endpoint가 없습니다."
@@ -1825,7 +1842,8 @@ async def on_message(message):
                         await bot.or_client.fetch_models_metadata()
                         await message.channel.send(
                             f"❌ `{current_model}` 모델은 현재 OpenRouter에서 실제 endpoint를 찾지 못했습니다.\n"
-                            f"목록과 실제 라우팅 상태가 어긋났을 수 있으니 `/refresh_models` 후 `/model set`으로 다시 선택해보세요."
+                            f"목록과 실제 라우팅 상태가 어긋났거나 provider 정책(`{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`)으로 endpoint가 걸러졌을 수 있습니다.\n"
+                            f"`/refresh_models` 후 `/model set`으로 다시 선택하거나 `/provider policy balanced`로 완화해보세요."
                         )
                         return
 
@@ -1937,13 +1955,12 @@ provider_group = app_commands.Group(name="provider", description="프로바이�
 @app_commands.autocomplete(model_id=model_autocomplete)
 @app_commands.describe(model_id="모델 이름 검색")
 async def set_model(interaction: discord.Interaction, model_id: str):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     clean_id = model_id.split(":")[0]
-    model_info, endpoints, _, error = await validate_model_for_use(clean_id)
+    model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_endpoint_check=True)
     if error:
         await interaction.followup.send(
             f"❌ {error}\n`/refresh_models` 후 다시 시도해보세요.",
-            ephemeral=True,
         )
         return
 
@@ -1956,42 +1973,47 @@ async def set_model(interaction: discord.Interaction, model_id: str):
     endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
 
     await interaction.followup.send(
-        f"✅ 모델 변경 완료!\n**{model_info['name']}** (`{model_info['id']}`)\n타입: **{type_str}** | 출시일: {created}{endpoint_suffix}",
-        ephemeral=True,
+        f"✅ {interaction.user.display_name}님이 기본 모델을 변경했습니다.\n"
+        f"**{model_info['name']}** (`{model_info['id']}`)\n"
+        f"타입: **{type_str}** | 출시일: {created}{endpoint_suffix}",
     )
 
 @model_group.command(name="image", description="채팅/고급 이미지 생성용 폴백 모델 설정")
 @app_commands.autocomplete(model_id=image_generation_model_autocomplete)
 @app_commands.describe(model_id="이미지 생성 폴백 모델 ID 또는 clear")
 async def set_fallback_model(interaction: discord.Interaction, model_id: str):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     clean_id = model_id.split(":")[0]
     config = bot.get_config(interaction.guild_id)
 
     if clean_id.lower() in ("clear", "none", "off"):
         config["fallback_model"] = None
         bot.save_config()
-        await interaction.followup.send("✅ 이미지 폴백 모델 설정을 해제했습니다.", ephemeral=True)
+        await interaction.followup.send(f"✅ {interaction.user.display_name}님이 이미지 폴백 모델 설정을 해제했습니다.")
         return
 
-    model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_output="image")
+    model_info, endpoints, _, error = await validate_model_for_use(
+        clean_id,
+        require_output="image",
+        require_endpoint_check=True,
+    )
     if error:
-        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        await interaction.followup.send(f"❌ {error}")
         return
 
     config["fallback_model"] = model_info["id"]
     bot.save_config()
     endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
     await interaction.followup.send(
-        f"✅ 이미지 폴백 모델 설정 완료: **{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
-        ephemeral=True,
+        f"✅ {interaction.user.display_name}님이 이미지 폴백 모델을 설정했습니다.\n"
+        f"**{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
     )
 
 
 @reset_group.command(name="speaker", description="화자 상태 메모리만 초기화")
 async def reset_speaker_state(interaction: discord.Interaction):
     bot.memory_store.clear_speaker_state(interaction.guild_id)
-    await interaction.response.send_message("🧼 화자 상태 메모리를 초기화했습니다.", ephemeral=True)
+    await interaction.response.send_message(f"🧼 {interaction.user.display_name}님이 화자 상태 메모리를 초기화했습니다.")
 
 
 @reset_group.command(name="context", description="채널 요약 메모리와 원문 기준 시점을 초기화")
@@ -2000,7 +2022,9 @@ async def reset_context(interaction: discord.Interaction):
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
     bot.save_config()
     bot.memory_store.clear_context(interaction.guild_id)
-    await interaction.response.send_message("🧹 채널 요약 메모리와 원문 기준 시점을 초기화했습니다.", ephemeral=True)
+    await interaction.response.send_message(
+        f"🧹 {interaction.user.display_name}님이 채널 요약 메모리와 원문 기준 시점을 초기화했습니다."
+    )
 
 
 @provider_group.command(name="policy", description="기본 프로바이더 라우팅 정책 설정")
@@ -2016,8 +2040,7 @@ async def set_provider_policy(interaction: discord.Interaction, policy: app_comm
     config["provider_policy"] = policy.value
     bot.save_config()
     await interaction.response.send_message(
-        f"✅ 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
-        ephemeral=True,
+        f"✅ {interaction.user.display_name}님이 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
     )
 
 @bot.tree.command(name="dashboard", description="현재 모델 스펙 확인")
@@ -2081,6 +2104,7 @@ async def dashboard(interaction: discord.Interaction):
     helpers = [
         f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
         f"• **Chat Image:** {image_command_status}",
+        f"• **Image Models:** {count_image_generation_models()} discovered",
         f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
         f"• **Speaker Memory:** {speaker_users} users",
         f"• **Channel Summary:** {'SET' if has_summary else 'EMPTY'}",
@@ -2184,7 +2208,7 @@ async def generate_image_cmd(
         capabilities=caps,
         image_config=build_image_config(aspect_ratio=aspect_ratio, image_size=image_size),
         provider=build_provider_preferences(config.get("provider_policy")),
-        require_parameter_support=True,
+        require_parameter_support=bool(aspect_ratio or image_size),
         cache_control=build_prompt_cache_control(model_info["id"], messages),
     )
 
@@ -2220,14 +2244,21 @@ async def refresh_models_cmd(interaction: discord.Interaction):
     await bot.or_client.fetch_models_metadata()
     after = len(bot.or_client.models_list)
     source = bot.or_client.models_source
+    image_count = count_image_generation_models()
     if after == 0:
         await interaction.followup.send("[ERROR] 모델 리스트 갱신 실패 — OpenRouter API 응답 확인 필요", ephemeral=True)
     elif after == before:
-        await interaction.followup.send(f"✅ 갱신 완료 (변동 없음, {after}개 모델 | source={source})", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ 갱신 완료 (변동 없음, {after}개 모델 / 이미지 출력 {image_count}개 | source={source})",
+            ephemeral=True,
+        )
     else:
         delta = after - before
         sign = "+" if delta > 0 else ""
-        await interaction.followup.send(f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) | source={source}", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) / 이미지 출력 {image_count}개 | source={source}",
+            ephemeral=True,
+        )
 
 bot.tree.add_command(model_group)
 bot.tree.add_command(reset_group)

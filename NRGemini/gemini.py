@@ -2342,7 +2342,9 @@ async def set_ch(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["channel_id"] = interaction.channel_id
     bot.save_config()
-    await temp_reply(interaction, "[OK] 설정 완료")
+    await interaction.response.send_message(
+        f"[OK] {interaction.user.display_name}님이 봇 활성화 채널을 {interaction.channel.mention} 으로 설정했습니다."
+    )
 
 @bot.tree.command(name="reset", description="대화 초기화")
 async def reset(interaction: discord.Interaction):
@@ -2352,7 +2354,9 @@ async def reset(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
     bot.save_config()
-    await temp_reply(interaction, "[OK] 초기화 완료")
+    await interaction.response.send_message(
+        f"[OK] {interaction.user.display_name}님이 Gemini 대화 원문 기준 시점을 초기화했습니다."
+    )
 
 # ================= 6. User Install 슬래시 커맨드 =================
 
@@ -3103,12 +3107,15 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
             server_im = cfg.get("image_model", IMAGE_MODEL)
             server_hist = get_history_limit_for_text_model(server_tm)
             global_hist = get_history_limit_for_text_model(TEXT_MODEL)
-            await temp_reply(interaction,
-                f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개) / `{server_im}` (이미지)\n글로벌 기본값: `{TEXT_MODEL}` (히스토리 {global_hist}개) / `{IMAGE_MODEL}`")
+            await interaction.response.send_message(
+                f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개) / `{server_im}` (이미지)\n"
+                f"글로벌 기본값: `{TEXT_MODEL}` (히스토리 {global_hist}개) / `{IMAGE_MODEL}`"
+            )
         else:
             global_hist = get_history_limit_for_text_model(TEXT_MODEL)
-            await temp_reply(interaction,
-                f"글로벌 기본 모델: `{TEXT_MODEL}` (텍스트, 히스토리 {global_hist}개) / `{IMAGE_MODEL}` (이미지)")
+            await interaction.response.send_message(
+                f"글로벌 기본 모델: `{TEXT_MODEL}` (텍스트, 히스토리 {global_hist}개) / `{IMAGE_MODEL}` (이미지)"
+            )
         return
     if name not in AVAILABLE_MODELS:
         available = ', '.join(AVAILABLE_MODELS.keys())
@@ -3122,8 +3129,10 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         cfg["image_model"] = IMAGE_MODEL
         bot.save_config()
     history_limit = get_history_limit_for_text_model(TEXT_MODEL)
-    await temp_reply(interaction,
-        f"모델 변경됨: **{name}**\n텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n히스토리 참조: {history_limit}개")
+    await interaction.response.send_message(
+        f"모델 변경됨: **{name}** by {interaction.user.display_name}\n"
+        f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n히스토리 참조: {history_limit}개"
+    )
 
 @switch_model.autocomplete('name')
 async def model_autocomplete(interaction: discord.Interaction, current: str):
