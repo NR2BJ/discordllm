@@ -1539,8 +1539,13 @@ async def on_message(message):
                         continue
                     if reset_dt and msg.created_at < reset_dt:
                         break
-                    if msg.author == bot.user and msg.interaction_metadata is not None:
-                        continue
+                    if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
+                        has_generated_media = any(
+                            (att.content_type or "").startswith(("image", "video"))
+                            for att in msg.attachments
+                        )
+                        if not has_generated_media:
+                            continue
 
                     is_bot = msg.author == bot.user
                     role = "assistant" if is_bot else "user"

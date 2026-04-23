@@ -2785,6 +2785,8 @@ async def on_message(message):
                     if msg.id == message.id: continue
                     if msg.id > message.id and msg.author != bot.user: continue
                     if reset_ts and msg.created_at < reset_ts: break
+                    if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
+                        continue
 
                     cached_doc_blocks = []
                     if msg.author != bot.user:
