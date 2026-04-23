@@ -1507,8 +1507,10 @@ def add_markdownish_text(story, text, styles):
 
 
 DEEP_RESEARCH_PDF_FONT_CANDIDATES = (
-    ("NanumGothic", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf", None),
     ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+    ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf", None),
+    ("NotoSansCJK", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
+    ("NanumGothic", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf", None),
     ("AppleSDGothicNeo", "/System/Library/Fonts/AppleSDGothicNeo.ttc", 0),
     ("AppleGothic", "/System/Library/Fonts/Supplemental/AppleGothic.ttf", None),
 )
