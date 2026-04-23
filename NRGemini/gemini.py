@@ -17,6 +17,7 @@ import re
 import tempfile
 import time as time_module
 import math
+import inspect
 from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta, timezone
@@ -80,23 +81,43 @@ AVAILABLE_MODELS = {
         "text": "gemini-3.1-flash-lite-preview",
         "image": "gemini-3.1-flash-image-preview",
     },
+    "deep-research": {
+        "text": "deep-research-preview-04-2026",
+        "image": "gemini-3.1-flash-image-preview",
+    },
+    "deep-research-max": {
+        "text": "deep-research-max-preview-04-2026",
+        "image": "gemini-3.1-flash-image-preview",
+    },
 }
 TEXT_MODEL = AVAILABLE_MODELS["3.1-pro"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro"]["image"]
+DEEP_RESEARCH_AGENT_IDS = {
+    AVAILABLE_MODELS["deep-research"]["text"],
+    AVAILABLE_MODELS["deep-research-max"]["text"],
+}
+ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3-flash"]["text"])
+GEMINI_MEMORY_MODEL = os.environ.get("GEMINI_MEMORY_MODEL", ROUTING_MODEL)
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
-DEFAULT_HISTORY_LIMIT = 100
+DEFAULT_HISTORY_LIMIT = 20
 IMAGE_SEARCH_LIMIT = 2
 MAX_REF_IMAGES = 1
 MAX_DOC_CHARS = 12000
+MEMORY_EXCERPT_MAX_CHARS = 5000
+MEMORY_UPDATE_WINDOW = 8
+MEMORY_MAX_ITEMS_PER_USER = 12
+MEMORY_MAX_RECENT_NAMES = 5
 TEXT_ATTACHMENT_EXTENSIONS = (
     ".txt", ".py", ".json", ".md", ".c", ".cpp", ".js", ".html", ".css",
     ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
 )
 MODEL_HISTORY_LIMITS = {
     AVAILABLE_MODELS["3.1-pro"]["text"]: 20,
-    AVAILABLE_MODELS["3-flash"]["text"]: 50,
-    AVAILABLE_MODELS["3.1-flash-lite"]["text"]: 100,
+    AVAILABLE_MODELS["3-flash"]["text"]: 20,
+    AVAILABLE_MODELS["3.1-flash-lite"]["text"]: 20,
+    AVAILABLE_MODELS["deep-research"]["text"]: 20,
+    AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
 }
 
 _COMMON_RULES = """## General Rules
@@ -149,6 +170,7 @@ You are an AI image generator assistant.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
+MEMORY_FILE = os.environ.get("GEMINI_MEMORY_FILE", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_memory.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("GEMINI_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_doc_cache"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
@@ -758,6 +780,50 @@ class DataManager:
         except: pass
 
 
+MEMORY_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "speaker_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["fact", "position", "preference", "reported_claim"]},
+                                "key": {"type": "string"},
+                                "value": {"type": "string"},
+                                "subject": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["type", "key", "value", "subject", "confidence"],
+                        },
+                    },
+                },
+                "required": ["user_id", "display_name", "items"],
+            },
+        },
+    },
+    "required": ["speaker_updates"],
+}
+
+
+CHANNEL_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "topics", "open_questions"],
+}
+
+
 IMAGE_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -771,6 +837,179 @@ IMAGE_ACTION_SCHEMA = {
     },
     "required": ["action", "refined_prompt", "use_recent_images", "reason"],
 }
+
+
+class MemoryStore:
+    def __init__(self, filename):
+        self.filename = filename
+        self.data = self._load()
+
+    def _default(self):
+        return {"version": 1, "servers": {}}
+
+    def _load(self):
+        data = DataManager.load_json(self.filename, self._default())
+        if isinstance(data, dict):
+            data.setdefault("version", 1)
+            data.setdefault("servers", {})
+            return data
+        return self._default()
+
+    def save(self):
+        DataManager.save_json(self.filename, self.data)
+
+    def get_server(self, guild_id):
+        gid = str(guild_id)
+        servers = self.data.setdefault("servers", {})
+        if gid not in servers:
+            servers[gid] = {
+                "channel_summary": {
+                    "summary": "",
+                    "topics": [],
+                    "open_questions": [],
+                    "updated_at": None,
+                    "last_message_id": None,
+                },
+                "speaker_state": {},
+            }
+        return servers[gid]
+
+    def clear_speaker_state(self, guild_id):
+        server = self.get_server(guild_id)
+        server["speaker_state"] = {}
+        self.save()
+
+    def clear_context(self, guild_id):
+        server = self.get_server(guild_id)
+        server["channel_summary"] = {
+            "summary": "",
+            "topics": [],
+            "open_questions": [],
+            "updated_at": None,
+            "last_message_id": None,
+        }
+        self.save()
+
+    def touch_user(self, guild_id, user_id, display_name):
+        server = self.get_server(guild_id)
+        speaker_state = server.setdefault("speaker_state", {})
+        user_id = str(user_id)
+        display_name = (display_name or user_id).strip()
+        state = speaker_state.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "current_display_name": display_name,
+                "recent_display_names": [display_name],
+                "items": [],
+            },
+        )
+        state["current_display_name"] = display_name
+        recent_names = [display_name] + [name for name in state.get("recent_display_names", []) if name != display_name]
+        state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
+        self.save()
+
+    def render_channel_summary(self, guild_id):
+        summary = self.get_server(guild_id).get("channel_summary", {})
+        lines = []
+        if summary.get("summary"):
+            lines.append(f"Summary: {summary['summary']}")
+        if summary.get("topics"):
+            lines.append("Topics: " + "; ".join(summary["topics"][:8]))
+        if summary.get("open_questions"):
+            lines.append("Open questions: " + "; ".join(summary["open_questions"][:8]))
+        if not lines:
+            return ""
+        return "[Channel Memory]\n" + "\n".join(lines)
+
+    def render_speaker_state(self, guild_id):
+        speaker_state = self.get_server(guild_id).get("speaker_state", {})
+        lines = []
+        for user_id, payload in speaker_state.items():
+            display_name = payload.get("current_display_name") or user_id
+            aliases = [name for name in payload.get("recent_display_names", []) if name != display_name]
+            item_lines = []
+            for item in payload.get("items", [])[:MEMORY_MAX_ITEMS_PER_USER]:
+                prefix = item.get("type", "fact")
+                subject = item.get("subject", "self")
+                item_lines.append(f"{prefix}:{subject}:{item.get('key')}={item.get('value')}")
+            if item_lines:
+                alias_suffix = f" [aka {', '.join(aliases[:3])}]" if aliases else ""
+                lines.append(f"- {display_name}{alias_suffix} ({user_id}): " + " | ".join(item_lines))
+        if not lines:
+            return ""
+        return "[Speaker Memory]\n" + "\n".join(lines)
+
+    def merge_speaker_updates(self, guild_id, updates, *, source_message_id):
+        server = self.get_server(guild_id)
+        speaker_state = server.setdefault("speaker_state", {})
+        now = datetime.now(timezone.utc).isoformat()
+
+        for update in updates:
+            user_id = str(update.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            display_name = (update.get("display_name") or user_id).strip()
+            state = speaker_state.setdefault(
+                user_id,
+                {
+                    "user_id": user_id,
+                    "current_display_name": display_name,
+                    "recent_display_names": [display_name],
+                    "items": [],
+                },
+            )
+
+            state["current_display_name"] = display_name
+            recent_names = [display_name] + [n for n in state.get("recent_display_names", []) if n != display_name]
+            state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
+
+            for item in update.get("items", []):
+                key = (item.get("key") or "").strip()
+                value = (item.get("value") or "").strip()
+                item_type = item.get("type") or "fact"
+                subject = item.get("subject") or "self"
+                confidence = float(item.get("confidence") or 0)
+                if not key or not value:
+                    continue
+                normalized = {
+                    "type": item_type,
+                    "key": key,
+                    "value": value,
+                    "subject": subject,
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "source_message_id": str(source_message_id),
+                    "updated_at": now,
+                }
+
+                items = state.setdefault("items", [])
+                replaced = False
+                for idx, existing in enumerate(items):
+                    if (
+                        existing.get("type") == item_type
+                        and existing.get("key") == key
+                        and existing.get("subject") == subject
+                    ):
+                        items[idx] = normalized
+                        replaced = True
+                        break
+                if not replaced:
+                    items.insert(0, normalized)
+                state["items"] = items[:MEMORY_MAX_ITEMS_PER_USER]
+
+        self.save()
+
+    def update_channel_summary(self, guild_id, payload, *, message_id):
+        server = self.get_server(guild_id)
+        now = datetime.now(timezone.utc).isoformat()
+        server["channel_summary"] = {
+            "summary": (payload.get("summary") or "").strip(),
+            "topics": [t.strip() for t in payload.get("topics", []) if isinstance(t, str) and t.strip()][:8],
+            "open_questions": [q.strip() for q in payload.get("open_questions", []) if isinstance(q, str) and q.strip()][:8],
+            "updated_at": now,
+            "last_message_id": str(message_id),
+        }
+        self.save()
 
 
 class RecentImageStore:
@@ -1135,6 +1374,201 @@ def build_json_generation_config(schema):
         return {**base, "response_json_schema": schema}
 
 
+def is_deep_research_model(text_model):
+    return text_model in DEEP_RESEARCH_AGENT_IDS
+
+
+def get_structured_helper_model(text_model=None):
+    return ROUTING_MODEL if is_deep_research_model(text_model) else (text_model or ROUTING_MODEL)
+
+
+def build_gemini_system_prompt(memory_context=None):
+    if not memory_context:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT}\n\n## Server Memory\n{memory_context}"
+
+
+def sanitize_for_memory_excerpt(text):
+    cleaned = re.sub(
+        r"\[(?:Attached File Content|Current File|Webpage Content):[^\]]+\]\s*```.*?```",
+        "[Large attached content omitted]",
+        text or "",
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:MEMORY_EXCERPT_MAX_CHARS]
+
+
+def build_recent_conversation_excerpt(history_texts, current_user_text):
+    lines = []
+    for text in history_texts[-MEMORY_UPDATE_WINDOW:]:
+        cleaned = sanitize_for_memory_excerpt(text)
+        if cleaned:
+            lines.append(cleaned)
+    if current_user_text:
+        lines.append(sanitize_for_memory_excerpt(current_user_text))
+    return "\n\n".join(line for line in lines if line)
+
+
+def text_from_parts(parts):
+    chunks = []
+    for part in parts or []:
+        text = getattr(part, "text", None)
+        if text:
+            chunks.append(text)
+    return "\n".join(chunks).strip()
+
+
+def flatten_contents_for_interactions(contents):
+    lines = []
+    for content in contents or []:
+        role = getattr(content, "role", "user") or "user"
+        text = text_from_parts(getattr(content, "parts", []))
+        if text:
+            lines.append(f"{role}: {text}")
+    return "\n\n".join(lines).strip()
+
+
+async def maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def call_interaction_get(interactions_api, interaction_id):
+    try:
+        return await maybe_await(interactions_api.get(interaction_id))
+    except TypeError:
+        return await maybe_await(interactions_api.get(id=interaction_id))
+
+
+def extract_interaction_text(interaction):
+    outputs = (
+        interaction.get("outputs", [])
+        if isinstance(interaction, dict)
+        else getattr(interaction, "outputs", None) or []
+    )
+    text_parts = []
+    for output in outputs:
+        text = getattr(output, "text", None)
+        if text:
+            text_parts.append(text)
+        elif isinstance(output, dict) and output.get("text"):
+            text_parts.append(output["text"])
+    return "\n\n".join(text_parts).strip()
+
+
+async def call_deep_research(history_contents, agent_id, memory_context=None):
+    if not CLIENT:
+        return "Error: API Client not initialized"
+    conversation = flatten_contents_for_interactions(history_contents)
+    if not conversation:
+        return "[ERROR] Deep Research에 전달할 텍스트가 없습니다."
+    prompt = (
+        f"{build_gemini_system_prompt(memory_context)}\n\n"
+        "## Conversation\n"
+        f"{conversation}"
+    )
+
+    interactions_api = getattr(getattr(CLIENT, "aio", None), "interactions", None)
+    if interactions_api is None:
+        interactions_api = getattr(CLIENT, "interactions", None)
+    if interactions_api is None:
+        return "[ERROR] 현재 google-genai SDK에서 Interactions API를 찾을 수 없습니다. 패키지 업데이트가 필요합니다."
+
+    try:
+        interaction = await maybe_await(
+            interactions_api.create(
+                input=prompt,
+                agent=agent_id,
+                background=True,
+                agent_config={"type": "deep-research", "thinking_summaries": "auto"},
+            )
+        )
+        interaction_id = getattr(interaction, "id", None) or (interaction.get("id") if isinstance(interaction, dict) else None)
+        if not interaction_id:
+            return "[ERROR] Deep Research 작업 ID를 받지 못했습니다."
+
+        for _ in range(90):
+            await asyncio.sleep(10)
+            result = await call_interaction_get(interactions_api, interaction_id)
+            status = getattr(result, "status", None) or (result.get("status") if isinstance(result, dict) else None)
+            if status == "completed":
+                text = extract_interaction_text(result)
+                return text or "[WARN] Deep Research가 완료됐지만 텍스트 출력이 비어 있습니다."
+            if status == "failed":
+                error = getattr(result, "error", None) or (result.get("error") if isinstance(result, dict) else None)
+                return f"[ERROR] Deep Research 실패: {error}"
+        return "[ERROR] Deep Research 작업이 제한 시간 안에 끝나지 않았습니다."
+    except Exception as e:
+        return f"[ERROR] Deep Research 호출 실패: {e}"
+
+
+async def generate_json_with_gemini(prompt, schema):
+    if not CLIENT:
+        return None
+    try:
+        response = await CLIENT.aio.models.generate_content(
+            model=get_structured_helper_model(GEMINI_MEMORY_MODEL),
+            contents=prompt,
+            config=build_json_generation_config(schema),
+        )
+        return coerce_json_object(response.text)
+    except Exception as e:
+        print(f"[MEMORY] JSON 생성 실패: {e}")
+        return None
+
+
+async def update_speaker_memory(guild, history_texts, current_user_text, message):
+    excerpt = build_recent_conversation_excerpt(history_texts, current_user_text)
+    if not excerpt:
+        return
+
+    current_state = bot.memory_store.render_speaker_state(guild.id)
+    memory_prompt = (
+        "You extract durable, user-specific conversation memory.\n"
+        "Only record facts, positions, preferences, and reported claims that are useful later.\n"
+        "Do not store tone, jokes, one-off phrasing, or speculative guesses.\n"
+        "For second-hand statements like 'my friend said...', use type=reported_claim and subject accordingly.\n"
+        "If nothing worth storing changed, return an empty speaker_updates array.\n\n"
+        f"Current speaker memory:\n{current_state or '(empty)'}\n\n"
+        f"Conversation excerpt:\n{excerpt}"
+    )
+    payload = await generate_json_with_gemini(memory_prompt, MEMORY_EXTRACTION_SCHEMA)
+    if not payload:
+        return
+    updates = payload.get("speaker_updates", [])
+    if updates:
+        bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
+
+
+async def update_channel_summary(guild, history_texts, current_user_text, message):
+    excerpt = build_recent_conversation_excerpt(history_texts, current_user_text)
+    if not excerpt:
+        return
+
+    current_summary = bot.memory_store.render_channel_summary(guild.id)
+    summary_prompt = (
+        "You maintain a concise server-level channel memory.\n"
+        "Summarize the ongoing topic, key agreements/disagreements, and unresolved questions.\n"
+        "Do not repeat user-specific facts that belong in speaker memory unless they matter to the shared discussion.\n"
+        "Keep the summary dense and practical.\n\n"
+        f"Current channel memory:\n{current_summary or '(empty)'}\n\n"
+        f"Recent conversation excerpt:\n{excerpt}"
+    )
+    payload = await generate_json_with_gemini(summary_prompt, CHANNEL_SUMMARY_SCHEMA)
+    if payload:
+        bot.memory_store.update_channel_summary(guild.id, payload, message_id=message.id)
+
+
+async def update_gemini_memory(guild, history_texts, current_user_text, message):
+    try:
+        await update_speaker_memory(guild, history_texts, current_user_text, message)
+        await update_channel_summary(guild, history_texts, current_user_text, message)
+    except Exception as e:
+        print(f"[MEMORY] Gemini 메모리 업데이트 실패: {e}")
+
+
 async def route_message_action(last_user_msg, *, guild_id, has_current_images=False, text_model=None):
     if not CLIENT:
         return {
@@ -1145,6 +1579,7 @@ async def route_message_action(last_user_msg, *, guild_id, has_current_images=Fa
         }
     if text_model is None:
         text_model = TEXT_MODEL
+    text_model = get_structured_helper_model(text_model)
 
     prompt = f"""
 You are a routing planner for a Discord AI bot.
@@ -1320,10 +1755,12 @@ async def check_media_intent(last_user_msg, text_model=None):
     except:
         return "NONE"
 
-async def call_gemini(history_contents, last_user_msg="", text_model=None):
+async def call_gemini(history_contents, last_user_msg="", text_model=None, memory_context=None):
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
+    if is_deep_research_model(text_model):
+        return await call_deep_research(history_contents, text_model, memory_context=memory_context), 0
     tools = [types.Tool(google_search=types.GoogleSearch())]
 
     safety_settings = [
@@ -1338,7 +1775,7 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None):
             model=text_model,
             contents=history_contents,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=build_gemini_system_prompt(memory_context),
                 tools=tools,
                 temperature=0.7,
                 safety_settings=safety_settings
@@ -1368,6 +1805,7 @@ class GeminiBot(commands.Bot):
         self.loop_monitor_expected = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
         self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
+        self.memory_store = MemoryStore(MEMORY_FILE)
         self.sound_files = scan_sound_files()
         self.sound_volume = SOUND_VOLUME
         self._sound_dir_mtime = self._get_sound_dir_mtime()
@@ -2136,6 +2574,7 @@ async def on_message(message):
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
                 history_list = []
+                history_texts = []
                 history_position = 0
 
                 async for msg in message.channel.history(limit=history_limit + 10):
@@ -2182,9 +2621,11 @@ async def on_message(message):
 
                     role = "model" if msg.author == bot.user else "user"
                     history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
+                    history_texts.insert(0, content)
                     history_position += 1
 
                 _cur_member = message.guild.get_member(message.author.id) or message.author
+                bot.memory_store.touch_user(message.guild.id, message.author.id, _cur_member.display_name)
                 current_parts = [types.Part(text=f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}")]
                 current_ref_images = []
                 has_current_images = False
@@ -2284,6 +2725,7 @@ async def on_message(message):
                         err_msg = f"[ERROR] Image Generation Failed: {str(e)}"
                         print(err_msg)
                         await status_msg.edit(content=err_msg)
+                    await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
                     return
 
                 if route.get("action") == "inspect_recent_images" and not has_current_images and route.get("use_recent_images"):
@@ -2292,11 +2734,28 @@ async def on_message(message):
                         current_parts = recent_parts + current_parts
 
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
+                memory_context = "\n\n".join(
+                    block for block in [
+                        bot.memory_store.render_channel_summary(message.guild.id),
+                        bot.memory_store.render_speaker_state(message.guild.id),
+                    ] if block
+                )
 
-                response, token_usage = await call_gemini(full_contents, message.content, text_model=server_text_model)
+                if is_deep_research_model(server_text_model):
+                    await message.channel.send(
+                        f"[Deep Research] `{server_text_model}` 작업을 시작했습니다. 몇 분 정도 걸릴 수 있습니다."
+                    )
+
+                response, token_usage = await call_gemini(
+                    full_contents,
+                    message.content,
+                    text_model=server_text_model,
+                    memory_context=memory_context,
+                )
 
                 if isinstance(response, str):
-                    await message.channel.send(response)
+                    await send_long_message(message.channel, response)
+                    await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
                     return
 
                 if not response.candidates:
@@ -2323,6 +2782,7 @@ async def on_message(message):
                 if text_reply.strip():
                     print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Finish: {finish_reason})")
                     await send_long_message(message.channel, text_reply)
+                    await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
 
                 # video_calls 처리 — 비용 절감으로 임시 비활성화
 
@@ -2346,29 +2806,31 @@ async def set_ch(interaction: discord.Interaction):
         f"[OK] {interaction.user.display_name}님이 봇 활성화 채널을 {interaction.channel.mention} 으로 설정했습니다."
     )
 
-reset_group = app_commands.Group(name="reset", description="Gemini 대화/캐시 초기화")
+reset_group = app_commands.Group(name="reset", description="Gemini 메모리/맥락 초기화")
 
 
-@reset_group.command(name="context", description="Gemini 원문 대화 기준 시점을 초기화")
+@reset_group.command(name="context", description="채널 요약 메모리와 원문 기준 시점을 초기화")
 async def reset_context(interaction: discord.Interaction):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
         return
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
+    bot.memory_store.clear_context(interaction.guild_id)
     bot.save_config()
     await interaction.response.send_message(
-        f"[OK] {interaction.user.display_name}님이 Gemini 대화 원문 기준 시점을 초기화했습니다."
+        f"[OK] {interaction.user.display_name}님이 Gemini 채널 요약 메모리와 원문 기준 시점을 초기화했습니다."
     )
 
 
-@reset_group.command(name="speaker", description="Gemini 화자 상태 메모리 상태 확인")
+@reset_group.command(name="speaker", description="화자 상태 메모리만 초기화")
 async def reset_speaker(interaction: discord.Interaction):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
         return
+    bot.memory_store.clear_speaker_state(interaction.guild_id)
     await interaction.response.send_message(
-        "[INFO] Gemini 봇에는 LLM 봇처럼 별도의 화자 상태 메모리가 아직 없어 초기화할 항목이 없습니다."
+        f"[OK] {interaction.user.display_name}님이 Gemini 화자 상태 메모리를 초기화했습니다."
     )
 
 # ================= 6. User Install 슬래시 커맨드 =================
@@ -2426,16 +2888,30 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
         ]
 
-        response = await CLIENT.aio.models.generate_content(
-            model=TEXT_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=CHAT_SYSTEM_PROMPT,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.7,
-                safety_settings=safety_settings
+        if is_deep_research_model(TEXT_MODEL):
+            await interaction.followup.send(
+                f"[Deep Research] `{TEXT_MODEL}` 작업을 시작했습니다. 몇 분 정도 걸릴 수 있습니다."
             )
-        )
+            response, token_usage = await call_gemini(contents, message, text_model=TEXT_MODEL)
+        else:
+            response = await CLIENT.aio.models.generate_content(
+                model=TEXT_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=CHAT_SYSTEM_PROMPT,
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0.7,
+                    safety_settings=safety_settings
+                )
+            )
+            token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
+
+        if isinstance(response, str):
+            for chunk in [response[i:i+1900] for i in range(0, len(response), 1900)]:
+                await interaction.followup.send(chunk)
+            print(f"  [BOT]({TEXT_MODEL}): {response}")
+            print("-------")
+            return
 
         if not response.candidates:
             await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
@@ -2444,8 +2920,6 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
         text_reply = ""
         for part in response.candidates[0].content.parts:
             if part.text: text_reply += part.text
-
-        token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
 
         if text_reply.strip():
             if len(text_reply) > 2000:

@@ -2112,7 +2112,6 @@ async def dashboard(interaction: discord.Interaction):
         f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
         f"• **Speaker Memory:** {speaker_users} users",
         f"• **Channel Summary:** {'SET' if has_summary else 'EMPTY'}",
-        f"• **Model Source:** `{bot.or_client.models_source}`",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
 
@@ -2247,19 +2246,18 @@ async def refresh_models_cmd(interaction: discord.Interaction):
     before = len(bot.or_client.models_list)
     await bot.or_client.fetch_models_metadata()
     after = len(bot.or_client.models_list)
-    source = bot.or_client.models_source
     image_count = count_image_generation_models()
     if after == 0:
         await interaction.followup.send("[ERROR] 모델 리스트 갱신 실패 — OpenRouter API 응답 확인 필요")
     elif after == before:
         await interaction.followup.send(
-            f"✅ 갱신 완료 (변동 없음, {after}개 모델 / 이미지 출력 {image_count}개 | source={source})",
+            f"✅ 갱신 완료 (변동 없음, {after}개 모델 / 이미지 출력 {image_count}개)",
         )
     else:
         delta = after - before
         sign = "+" if delta > 0 else ""
         await interaction.followup.send(
-            f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) / 이미지 출력 {image_count}개 | source={source}",
+            f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) / 이미지 출력 {image_count}개",
         )
 
 bot.tree.add_command(model_group)
