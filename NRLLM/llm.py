@@ -80,9 +80,6 @@ _COMMON_RULES = """## General Rules
 - Keep responses concise and Discord-appropriate.
 - If web search is enabled for the request, use the available search tool for up-to-date information when needed. Otherwise rely on your training knowledge."""
 
-IMAGE_ASPECT_RATIO_CHOICES = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
-IMAGE_SIZE_CHOICES = ["1K", "2K", "4K"]
-
 SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
@@ -1124,18 +1121,6 @@ async def ensure_model_cache_loaded():
     if not bot.or_client.models_list:
         await bot.or_client.fetch_models_metadata()
 
-def is_image_attachment(att):
-    ct = att.content_type or ""
-    return ct.startswith('image')
-
-def build_image_config(aspect_ratio=None, image_size=None):
-    config = {}
-    if aspect_ratio:
-        config["aspect_ratio"] = aspect_ratio
-    if image_size:
-        config["image_size"] = image_size
-    return config or None
-
 async def build_model_choices(current: str, predicate=None) -> List[app_commands.Choice[str]]:
     await ensure_model_cache_loaded()
 
@@ -1435,7 +1420,7 @@ async def handle_natural_image_request(message, config, history_messages, curren
 
     sent = await send_generated_images(message.channel.send, images, filename_prefix="chat_image", on_sent=_register)
     if sent == 0:
-        await message.channel.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다. `/image`로 다시 시도해보세요.")
+        await message.channel.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다. 문장을 조금 더 구체적으로 바꿔 다시 요청해보세요.")
     return True
 
 # ================= 6. 이벤트 핸들러 =================
@@ -1540,12 +1525,7 @@ async def on_message(message):
                     if reset_dt and msg.created_at < reset_dt:
                         break
                     if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
-                        has_generated_media = any(
-                            (att.content_type or "").startswith(("image", "video"))
-                            for att in msg.attachments
-                        )
-                        if not has_generated_media:
-                            continue
+                        continue
 
                     is_bot = msg.author == bot.user
                     role = "assistant" if is_bot else "user"
@@ -2082,107 +2062,6 @@ async def toggle_search(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"✅ 웹 검색: **{state}**\n방식: `openrouter:web_search` server tool\n기본 모델: `{config['model']}`"
     )
-
-@bot.tree.command(name="image", description="이미지를 생성하거나 참조 이미지를 기반으로 편집")
-@app_commands.describe(
-    prompt="이미지 생성 프롬프트",
-    reference="편집/참조용 이미지",
-    aspect_ratio="원하는 비율",
-    image_size="원하는 해상도",
-)
-@app_commands.choices(
-    aspect_ratio=[app_commands.Choice(name=value, value=value) for value in IMAGE_ASPECT_RATIO_CHOICES],
-    image_size=[app_commands.Choice(name=value, value=value) for value in IMAGE_SIZE_CHOICES],
-)
-async def generate_image_cmd(
-    interaction: discord.Interaction,
-    prompt: str,
-    reference: discord.Attachment | None = None,
-    aspect_ratio: str | None = None,
-    image_size: str | None = None,
-):
-    await interaction.response.defer()
-    config = bot.get_config(interaction.guild_id)
-    base_model_info = await bot.or_client.resolve_model_info(config["model"])
-    base_caps = bot.or_client.analyze_model_capabilities(config["model"], model_info=base_model_info)
-    generation_model, generation_source = get_active_generation_model(config, base_caps)
-
-    if not generation_model:
-        await interaction.followup.send(
-            "❌ 현재 설정에서는 `/image`를 사용할 수 없습니다. 이미지 출력을 지원하는 `/model set` 또는 `/model image`를 설정해보세요."
-        )
-        return
-
-    model_info, _, caps, error = await validate_model_for_use(generation_model, require_output="image")
-    if error:
-        await interaction.followup.send(f"❌ {error}")
-        return
-
-    content = [{"type": "text", "text": prompt}]
-    if reference:
-        if not is_image_attachment(reference):
-            await interaction.followup.send("❌ 참조 파일은 이미지여야 합니다.")
-            return
-        if "image" not in caps["input"]:
-            await interaction.followup.send(
-                f"❌ `{model_info['id']}` 모델은 참조 이미지 입력을 지원하지 않습니다. 이미지 입력을 지원하는 `/model`을 선택하거나 참조 없이 생성해보세요."
-            )
-            return
-        if (reference.size or 0) > MAX_MEDIA_BASE64_MB * 1024 * 1024:
-            await interaction.followup.send(f"❌ 참조 이미지가 너무 큽니다. 최대 {MAX_MEDIA_BASE64_MB}MB까지 지원합니다.")
-            return
-        b64, mime = await encode_image(reference.url)
-        if not b64:
-            await interaction.followup.send("❌ 참조 이미지를 읽지 못했습니다.")
-            return
-        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Generate the requested image. "
-                "If a reference image is attached, use it as a direct editing/reference input. "
-                "Keep any text response brief."
-            ),
-        },
-        {"role": "user", "content": content},
-    ]
-
-    response, usage, images, _ = await bot.or_client.chat_completion(
-        model_info["id"],
-        messages,
-        capabilities=caps,
-        image_config=build_image_config(aspect_ratio=aspect_ratio, image_size=image_size),
-        provider=build_provider_preferences(config.get("provider_policy")),
-        require_parameter_support=bool(aspect_ratio or image_size),
-        cache_control=build_prompt_cache_control(model_info["id"], messages),
-    )
-
-    if response and response != "...":
-        summary = response
-    elif generation_source == "current-model":
-        summary = f"🖼️ 현재 모델 `{model_info['id']}`로 이미지 생성 완료"
-    else:
-        summary = f"🖼️ 폴백 모델 `{model_info['id']}`로 이미지 생성 완료"
-    total_tokens = usage.get("total_tokens", "N/A")
-    await interaction.followup.send(f"{summary}\n(Tokens: {total_tokens})")
-
-    async def _register(binary, ext, idx):
-        bot.recent_image_store.register_bytes(
-            interaction.guild_id,
-            channel_id=interaction.channel_id,
-            message_id=interaction.id,
-            author_id=bot.user.id,
-            display_name=get_bot_display_name(),
-            filename=f"image_{idx}.{ext}",
-            image_bytes=binary,
-            source_kind="bot_generated",
-        )
-
-    sent = await send_generated_images(interaction.followup.send, images, filename_prefix="image", on_sent=_register)
-    if sent == 0:
-        await interaction.followup.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다.")
 
 @model_group.command(name="refresh", description="OpenRouter 모델 리스트 즉시 갱신")
 async def refresh_models_cmd(interaction: discord.Interaction):
