@@ -500,9 +500,11 @@ class OpenRouterBot(commands.Bot):
             self.server_configs[gid] = {
                 "channel_id": None,
                 "model": DEFAULT_MODEL,
+                "fallback_model": DEFAULT_IMAGE_MODEL,
                 "reset_time": None,
                 "search": False
             }
+        self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -666,8 +668,9 @@ async def validate_model_for_use(model_id, *, require_input=None, require_output
 def get_active_generation_model(config, base_caps):
     if "image" in base_caps["output"]:
         return config["model"], "current-model"
-    if DEFAULT_IMAGE_MODEL:
-        return DEFAULT_IMAGE_MODEL, "hidden-helper"
+    fallback_model = config.get("fallback_model") or DEFAULT_IMAGE_MODEL
+    if fallback_model:
+        return fallback_model, "configured-fallback"
     return None, None
 
 # ================= 6. 이벤트 핸들러 =================
@@ -1004,6 +1007,12 @@ async def on_message(message):
 async def model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     return await build_model_choices(current)
 
+async def image_generation_model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return await build_model_choices(
+        current,
+        predicate=lambda m: "image" in bot.or_client.analyze_model_capabilities(m["id"], model_info=m)["output"],
+    )
+
 @bot.tree.command(name="model", description="사용할 AI 모델 변경")
 @app_commands.autocomplete(model_id=model_autocomplete)
 @app_commands.describe(model_id="모델 이름 검색")
@@ -1028,6 +1037,33 @@ async def set_model(interaction: discord.Interaction, model_id: str):
 
     await interaction.followup.send(
         f"✅ 모델 변경 완료!\n**{model_info['name']}** (`{model_info['id']}`)\n타입: **{type_str}** | 출시일: {created}{endpoint_suffix}",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="fallbackmodel", description="고급용 이미지 폴백 모델 설정")
+@app_commands.autocomplete(model_id=image_generation_model_autocomplete)
+@app_commands.describe(model_id="이미지 생성 폴백 모델 ID 또는 clear")
+async def set_fallback_model(interaction: discord.Interaction, model_id: str):
+    await interaction.response.defer(ephemeral=True)
+    clean_id = model_id.split(":")[0]
+    config = bot.get_config(interaction.guild_id)
+
+    if clean_id.lower() in ("clear", "none", "off"):
+        config["fallback_model"] = None
+        bot.save_config()
+        await interaction.followup.send("✅ 이미지 폴백 모델 설정을 해제했습니다.", ephemeral=True)
+        return
+
+    model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_output="image")
+    if error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+
+    config["fallback_model"] = model_info["id"]
+    bot.save_config()
+    endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
+    await interaction.followup.send(
+        f"✅ 이미지 폴백 모델 설정 완료: **{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
         ephemeral=True,
     )
 
@@ -1084,7 +1120,7 @@ async def dashboard(interaction: discord.Interaction):
     elif image_command_source == "current-model":
         image_command_status = "Uses current model"
     else:
-        image_command_status = "Uses internal helper"
+        image_command_status = f"Uses fallback `{image_command_model}`"
 
     helpers = [
         f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
@@ -1202,7 +1238,7 @@ async def generate_image_cmd(
     elif generation_source == "current-model":
         summary = f"🖼️ 현재 모델 `{model_info['id']}`로 이미지 생성 완료"
     else:
-        summary = f"🖼️ 내부 이미지 helper `{model_info['id']}`로 이미지 생성 완료"
+        summary = f"🖼️ 폴백 모델 `{model_info['id']}`로 이미지 생성 완료"
     total_tokens = usage.get("total_tokens", "N/A")
     await interaction.followup.send(f"{summary}\n(Tokens: {total_tokens})")
 
