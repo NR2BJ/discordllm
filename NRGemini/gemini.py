@@ -1506,6 +1506,39 @@ def add_markdownish_text(story, text, styles):
     flush_code()
 
 
+DEEP_RESEARCH_PDF_FONT_CANDIDATES = (
+    ("NanumGothic", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf", None),
+    ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+    ("AppleSDGothicNeo", "/System/Library/Fonts/AppleSDGothicNeo.ttc", 0),
+    ("AppleGothic", "/System/Library/Fonts/Supplemental/AppleGothic.ttf", None),
+)
+
+
+def register_deep_research_pdf_font(pdfmetrics, TTFont, UnicodeCIDFont):
+    for font_name, font_path, subfont_index in DEEP_RESEARCH_PDF_FONT_CANDIDATES:
+        if not os.path.exists(font_path):
+            continue
+        try:
+            if font_name not in pdfmetrics.getRegisteredFontNames():
+                try:
+                    kwargs = {"subfontIndex": subfont_index} if subfont_index is not None else {}
+                    pdfmetrics.registerFont(TTFont(font_name, font_path, **kwargs))
+                except TypeError:
+                    pdfmetrics.registerFont(TTFont(font_name, font_path))
+            print(f"[DeepResearch PDF] using font: {font_name} ({font_path})")
+            return font_name
+        except Exception as e:
+            print(f"[DeepResearch PDF] font unavailable: {font_path} ({e})")
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGoThic-Medium"))
+        print("[DeepResearch PDF] using fallback CID font: HYGoThic-Medium")
+        return "HYGoThic-Medium"
+    except Exception as e:
+        print(f"[DeepResearch PDF] Korean font fallback failed, using Helvetica ({e})")
+        return "Helvetica"
+
+
 def build_deep_research_pdf(outputs, *, agent_id):
     try:
         from reportlab.lib.pagesizes import A4
@@ -1514,14 +1547,11 @@ def build_deep_research_pdf(outputs, *, agent_id):
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as PdfImage
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.pdfbase.ttfonts import TTFont
     except Exception as e:
         raise RuntimeError("reportlab 패키지가 설치되어 있지 않습니다.") from e
 
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HYGoThic-Medium"))
-        body_font = "HYGoThic-Medium"
-    except Exception:
-        body_font = "Helvetica"
+    body_font = register_deep_research_pdf_font(pdfmetrics, TTFont, UnicodeCIDFont)
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
