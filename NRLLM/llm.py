@@ -695,6 +695,16 @@ def sanitize_for_memory_excerpt(text):
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:MEMORY_EXCERPT_MAX_CHARS]
 
+
+def get_bot_display_name():
+    user = getattr(bot, "user", None)
+    return getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
+
+
+def get_bot_username():
+    user = getattr(bot, "user", None)
+    return getattr(user, "name", None) or get_bot_display_name()
+
 # ================= 3. OpenRouter API 클라이언트 =================
 class OpenRouterClient:
     def __init__(self, api_key):
@@ -1265,20 +1275,25 @@ async def decide_message_action(config, history_messages, current_user_text, gui
         f"Recent conversation excerpt:\n{excerpt or '(empty)'}\n\n"
         f"Current user message:\n{current_user_text}"
     )
-    response_text, _, _, _ = await bot.or_client.chat_completion(
-        DEFAULT_MEMORY_MODEL,
-        [
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": route_prompt},
-        ],
-        response_format={"type": "json_schema", "json_schema": IMAGE_ROUTE_SCHEMA},
-        provider=build_provider_preferences(config.get("provider_policy"), strict=True),
-        require_parameter_support=True,
-        cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
-            {"content": route_prompt},
-        ]),
-    )
-    payload = coerce_json_object(response_text)
+    try:
+        response_text, _, _, _ = await bot.or_client.chat_completion(
+            DEFAULT_MEMORY_MODEL,
+            [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": route_prompt},
+            ],
+            response_format={"type": "json_schema", "json_schema": IMAGE_ROUTE_SCHEMA},
+            provider=build_provider_preferences(config.get("provider_policy"), strict=True),
+            require_parameter_support=True,
+            cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+                {"content": route_prompt},
+            ]),
+        )
+        payload = coerce_json_object(response_text)
+    except Exception as e:
+        print(f"⚠️ 이미지 라우팅 실패: {e}")
+        payload = None
+
     if not payload:
         return {
             "action": "respond_text",
@@ -1286,7 +1301,15 @@ async def decide_message_action(config, history_messages, current_user_text, gui
             "use_recent_images": False,
             "reason": "route_parse_failed",
         }
-    return payload
+    action = payload.get("action", "respond_text")
+    if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
+        action = "respond_text"
+    return {
+        "action": action,
+        "refined_prompt": (payload.get("refined_prompt") or "").strip(),
+        "use_recent_images": bool(payload.get("use_recent_images", False)),
+        "reason": (payload.get("reason") or "").strip(),
+    }
 
 
 def coerce_json_object(text):
@@ -1301,6 +1324,10 @@ def coerce_json_object(text):
         match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", candidate, re.DOTALL)
         if match:
             candidate = match.group(1).strip()
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        candidate = candidate[start:end + 1]
     try:
         return json.loads(candidate)
     except Exception:
@@ -1337,25 +1364,28 @@ async def update_speaker_memory(guild, config, history_messages, current_user_te
         f"Current speaker memory:\n{current_state or '(empty)'}\n\n"
         f"Conversation excerpt:\n{excerpt}"
     )
-    response_text, _, _, _ = await bot.or_client.chat_completion(
-        DEFAULT_MEMORY_MODEL,
-        [
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": memory_prompt},
-        ],
-        response_format={"type": "json_schema", "json_schema": MEMORY_EXTRACTION_SCHEMA},
-        provider=build_provider_preferences(config.get("provider_policy"), strict=True),
-        require_parameter_support=True,
-        cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
-            {"content": memory_prompt},
-        ]),
-    )
-    payload = coerce_json_object(response_text)
-    if not payload:
-        return
-    updates = payload.get("speaker_updates", [])
-    if updates:
-        bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
+    try:
+        response_text, _, _, _ = await bot.or_client.chat_completion(
+            DEFAULT_MEMORY_MODEL,
+            [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": memory_prompt},
+            ],
+            response_format={"type": "json_schema", "json_schema": MEMORY_EXTRACTION_SCHEMA},
+            provider=build_provider_preferences(config.get("provider_policy"), strict=True),
+            require_parameter_support=True,
+            cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+                {"content": memory_prompt},
+            ]),
+        )
+        payload = coerce_json_object(response_text)
+        if not payload:
+            return
+        updates = payload.get("speaker_updates", [])
+        if updates:
+            bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
+    except Exception as e:
+        print(f"⚠️ 화자 메모리 업데이트 실패: {e}")
 
 
 async def update_channel_summary(guild, config, history_messages, current_user_text, message):
@@ -1372,22 +1402,25 @@ async def update_channel_summary(guild, config, history_messages, current_user_t
         f"Current channel memory:\n{current_summary or '(empty)'}\n\n"
         f"Recent conversation excerpt:\n{excerpt}"
     )
-    response_text, _, _, _ = await bot.or_client.chat_completion(
-        DEFAULT_MEMORY_MODEL,
-        [
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": summary_prompt},
-        ],
-        response_format={"type": "json_schema", "json_schema": CHANNEL_SUMMARY_SCHEMA},
-        provider=build_provider_preferences(config.get("provider_policy"), strict=True),
-        require_parameter_support=True,
-        cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
-            {"content": summary_prompt},
-        ]),
-    )
-    payload = coerce_json_object(response_text)
-    if payload:
-        bot.memory_store.update_channel_summary(guild.id, payload, message_id=message.id)
+    try:
+        response_text, _, _, _ = await bot.or_client.chat_completion(
+            DEFAULT_MEMORY_MODEL,
+            [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": summary_prompt},
+            ],
+            response_format={"type": "json_schema", "json_schema": CHANNEL_SUMMARY_SCHEMA},
+            provider=build_provider_preferences(config.get("provider_policy"), strict=True),
+            require_parameter_support=True,
+            cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+                {"content": summary_prompt},
+            ]),
+        )
+        payload = coerce_json_object(response_text)
+        if payload:
+            bot.memory_store.update_channel_summary(guild.id, payload, message_id=message.id)
+    except Exception as e:
+        print(f"⚠️ 채널 요약 메모리 업데이트 실패: {e}")
 
 
 async def handle_natural_image_request(message, config, history_messages, current_user_text, *, reference_inputs=None):
@@ -1450,7 +1483,7 @@ async def handle_natural_image_request(message, config, history_messages, curren
             channel_id=message.channel.id,
             message_id=message.id,
             author_id=bot.user.id,
-            display_name=bot.user.display_name,
+            display_name=get_bot_display_name(),
             filename=f"chat_image_{idx}.{ext}",
             image_bytes=binary,
             source_kind="bot_generated",
@@ -1578,7 +1611,7 @@ async def on_message(message):
                         clean_content = msg.content
                         if ":" in clean_content[:20]:
                             parts = clean_content.split(": ", 1)
-                            if len(parts) > 1 and parts[0] in [bot.user.display_name, bot.user.name, "Bot", "Model"]:
+                            if len(parts) > 1 and parts[0] in [get_bot_display_name(), get_bot_username(), "Bot", "Model"]:
                                 clean_content = parts[1]
                         text_content = clean_content
                         for att in msg.attachments:
@@ -1844,8 +1877,9 @@ async def on_message(message):
                         cache_control=cache_control,
                     )
 
-                if response.startswith(f"{bot.user.display_name}:"):
-                    response = response.replace(f"{bot.user.display_name}:", "", 1).strip()
+                bot_display_name = get_bot_display_name()
+                if response.startswith(f"{bot_display_name}:"):
+                    response = response.replace(f"{bot_display_name}:", "", 1).strip()
 
                 total_tokens = usage.get("total_tokens", "N/A")
                 prompt_details = usage.get("prompt_tokens_details", {}) if isinstance(usage, dict) else {}
@@ -1868,7 +1902,7 @@ async def on_message(message):
                         channel_id=message.channel.id,
                         message_id=message.id,
                         author_id=bot.user.id,
-                        display_name=bot.user.display_name,
+                        display_name=get_bot_display_name(),
                         filename=f"response_image_{idx}.{ext}",
                         image_bytes=binary,
                         source_kind="bot_generated",
@@ -2169,7 +2203,7 @@ async def generate_image_cmd(
             channel_id=interaction.channel_id,
             message_id=interaction.id,
             author_id=bot.user.id,
-            display_name=bot.user.display_name,
+            display_name=get_bot_display_name(),
             filename=f"image_{idx}.{ext}",
             image_bytes=binary,
             source_kind="bot_generated",

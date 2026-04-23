@@ -1089,6 +1089,52 @@ def build_recent_image_hint(guild_id):
     )
 
 
+def get_bot_display_name():
+    user = getattr(bot, "user", None)
+    return getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
+
+
+def coerce_json_object(text):
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        return None
+
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if "```" in candidate:
+        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", candidate, re.DOTALL)
+        if match:
+            candidate = match.group(1).strip()
+
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        candidate = candidate[start:end + 1]
+
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
+def build_json_generation_config(schema):
+    base = {
+        "temperature": 0.0,
+        "response_mime_type": "application/json",
+    }
+    for schema_key in ("response_json_schema", "response_schema"):
+        try:
+            return types.GenerateContentConfig(**base, **{schema_key: schema})
+        except Exception:
+            continue
+    try:
+        return types.GenerateContentConfig(**base)
+    except Exception:
+        return {**base, "response_json_schema": schema}
+
+
 async def route_message_action(last_user_msg, *, guild_id, has_current_images=False, text_model=None):
     if not CLIENT:
         return {
@@ -1127,15 +1173,16 @@ User message:
         response = await CLIENT.aio.models.generate_content(
             model=text_model,
             contents=prompt,
-            config={
-                "temperature": 0.0,
-                "response_mime_type": "application/json",
-                "response_json_schema": IMAGE_ACTION_SCHEMA,
-            },
+            config=build_json_generation_config(IMAGE_ACTION_SCHEMA),
         )
-        payload = json.loads((response.text or "").strip())
+        payload = coerce_json_object(response.text)
+        if not payload:
+            raise ValueError("empty or invalid JSON route response")
+        action = payload.get("action", "respond_text")
+        if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
+            action = "respond_text"
         return {
-            "action": payload.get("action", "respond_text"),
+            "action": action,
             "refined_prompt": (payload.get("refined_prompt") or "").strip(),
             "use_recent_images": bool(payload.get("use_recent_images", False)),
             "reason": (payload.get("reason") or "").strip(),
@@ -2222,7 +2269,7 @@ async def on_message(message):
                             channel_id=message.channel.id,
                             message_id=message.id,
                             author_id=bot.user.id,
-                            display_name=bot.user.display_name,
+                            display_name=get_bot_display_name(),
                             filename="generated.png",
                             image_bytes=img_data,
                             source_kind="bot_generated",
@@ -2527,7 +2574,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
             channel_id=interaction.channel_id,
             message_id=interaction.id,
             author_id=bot.user.id,
-            display_name=bot.user.display_name,
+            display_name=get_bot_display_name(),
             filename="generated.png",
             image_bytes=img_data,
             source_kind="bot_generated",
