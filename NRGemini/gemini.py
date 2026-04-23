@@ -187,6 +187,8 @@ SOUND_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.
 os.makedirs(SOUND_DIR, exist_ok=True)
 os.makedirs(os.path.join(SOUND_DIR, "discord"), exist_ok=True)
 SOUND_VOLUME = 0.15  # 기본 볼륨 (0.0~1.0)
+MIN_SOUND_VOLUME = 0.01
+MAX_SOUND_VOLUME = 1.0
 SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
 SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
 LAVALINK_POST_CONNECT_GRACE = 0.50  # Lavalink 최초 연결 직후 첫 재생 앞머리 손실 완충
@@ -344,6 +346,17 @@ def clamp_history_limit(value):
 
 def get_history_limit(config):
     return clamp_history_limit((config or {}).get("history_limit", DEFAULT_HISTORY_LIMIT))
+
+
+def clamp_sound_volume(value):
+    try:
+        volume = float(value)
+    except (TypeError, ValueError):
+        return SOUND_VOLUME
+    if volume > 1:
+        volume /= 100.0
+    return max(MIN_SOUND_VOLUME, min(MAX_SOUND_VOLUME, volume))
+
 
 def get_voice_unhealthy_reason(vc):
     if vc is None:
@@ -1974,7 +1987,9 @@ class GeminiBot(commands.Bot):
         self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
         self.memory_store = MemoryStore(MEMORY_FILE)
         self.sound_files = scan_sound_files()
-        self.sound_volume = SOUND_VOLUME
+        global_cfg = self.get_global_config()
+        self.sound_volume = clamp_sound_volume(global_cfg.get("sound_volume", SOUND_VOLUME))
+        global_cfg["sound_volume"] = self.sound_volume
         self._sound_dir_mtime = self._get_sound_dir_mtime()
         global SIBO_LATENCY_COMP
         SIBO_LATENCY_COMP = self.server_configs.get("_global", {}).get("sibo_comp", SIBO_LATENCY_COMP)
@@ -2045,6 +2060,11 @@ class GeminiBot(commands.Bot):
         if cfg.get("lavalink_session_id") == session_id:
             return
         cfg["lavalink_session_id"] = session_id
+        self.save_config()
+
+    def set_sound_volume(self, volume):
+        self.sound_volume = clamp_sound_volume(volume)
+        self.get_global_config()["sound_volume"] = self.sound_volume
         self.save_config()
 
     def save_config(self):
@@ -3533,7 +3553,7 @@ class VolumeModal(discord.ui.Modal, title="사운드보드 볼륨 설정"):
         except ValueError:
             await temp_reply(interaction, "숫자를 입력해주세요.")
             return
-        bot.sound_volume = percent / 100.0
+        bot.set_sound_volume(percent / 100.0)
         self.soundboard_view._refresh_keys()
         self.soundboard_view._update_components()
         await interaction.response.edit_message(embed=self.soundboard_view._make_embed(), view=self.soundboard_view)
