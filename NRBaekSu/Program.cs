@@ -7,6 +7,8 @@ const int StartupRestoreDelayMs = 5000;
 const int ReconcileIntervalMs = 30000;
 const int ReconnectDelayMs = 5000;
 const int FailedConnectCooldownMs = 20000;
+const int AudioRecoveryDelayMs = 1500;
+const int AudioRecoveryCooldownMs = 15000;
 
 var token = Environment.GetEnvironmentVariable("BAEKSU_DISCORD_TOKEN")
     ?? throw new InvalidOperationException("BAEKSU_DISCORD_TOKEN is required");
@@ -26,11 +28,17 @@ var client = new DiscordSocketClient(new DiscordSocketConfig
 var state = new StayVcState(configFile);
 var reconnectLocks = new ConcurrentDictionary<ulong, SemaphoreSlim>();
 var failedConnectCooldowns = new ConcurrentDictionary<ulong, DateTimeOffset>();
+var audioRecoveryCooldowns = new ConcurrentDictionary<ulong, DateTimeOffset>();
 Task? reconcileTask = null;
 
-client.Log += message =>
+client.Log += log =>
 {
-    Console.WriteLine($"[BAEKSU] {message}");
+    Console.WriteLine($"[BAEKSU] {log}");
+    if (ShouldRecoverFromAudioLog(log))
+    {
+        QueueAudioRecoveryAsync($"audio-log:{log.Source}");
+    }
+
     return Task.CompletedTask;
 };
 
@@ -244,6 +252,46 @@ void QueueSlashConnectAsync(
     });
 }
 
+void QueueAudioRecoveryAsync(string reason)
+{
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(AudioRecoveryDelayMs);
+        foreach (var guild in client.Guilds)
+        {
+            if (state.GetTargetChannelId(guild.Id) is not ulong targetChannelId)
+            {
+                continue;
+            }
+
+            if (audioRecoveryCooldowns.TryGetValue(guild.Id, out var cooldownUntil)
+                && cooldownUntil > DateTimeOffset.UtcNow)
+            {
+                Console.WriteLine(
+                    $"[BAEKSU] guild={guild.Id} skip audio recovery cooldown-until={cooldownUntil:O} reason={reason}"
+                );
+                continue;
+            }
+
+            audioRecoveryCooldowns[guild.Id] = DateTimeOffset.UtcNow.AddMilliseconds(AudioRecoveryCooldownMs);
+            await EnsureConnectedAsync(guild.Id, targetChannelId, reason, bypassCooldown: true, forceReconnect: true);
+        }
+    });
+}
+
+static bool ShouldRecoverFromAudioLog(LogMessage log)
+{
+    if (!log.Source.StartsWith("Audio", StringComparison.OrdinalIgnoreCase) || log.Exception is null)
+    {
+        return false;
+    }
+
+    var text = $"{log.Message} {log.Exception.GetType().Name} {log.Exception.Message}";
+    return text.Contains("WebSocket", StringComparison.OrdinalIgnoreCase)
+        || text.Contains("connection was closed", StringComparison.OrdinalIgnoreCase)
+        || text.Contains("NullReferenceException", StringComparison.OrdinalIgnoreCase);
+}
+
 async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
 {
     IReadOnlyCollection<SocketGuild> guilds = onlyGuild is null
@@ -270,7 +318,13 @@ async Task RegisterCommandsAsync(SocketGuild? onlyGuild = null)
     }
 }
 
-async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string reason, bool bypassCooldown = false)
+async Task<bool> EnsureConnectedAsync(
+    ulong guildId,
+    ulong channelId,
+    string reason,
+    bool bypassCooldown = false,
+    bool forceReconnect = false
+)
 {
     var gate = reconnectLocks.GetOrAdd(guildId, _ => new SemaphoreSlim(1, 1));
     await gate.WaitAsync();
@@ -306,10 +360,27 @@ async Task<bool> EnsureConnectedAsync(ulong guildId, ulong channelId, string rea
             return false;
         }
 
-        if (guild.CurrentUser?.VoiceChannel?.Id == channelId)
+        var currentChannel = guild.CurrentUser?.VoiceChannel;
+        if (currentChannel?.Id == channelId && !forceReconnect)
         {
             failedConnectCooldowns.TryRemove(guildId, out _);
             return true;
+        }
+
+        if (forceReconnect && currentChannel is not null)
+        {
+            try
+            {
+                Console.WriteLine(
+                    $"[BAEKSU] guild={guildId} recycling voice connection current={currentChannel.Id} target={channelId} reason={reason}"
+                );
+                await currentChannel.DisconnectAsync();
+                await Task.Delay(1000);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[BAEKSU] guild={guildId} recycle disconnect failed reason={reason}: {ex.Message}");
+            }
         }
 
         try
