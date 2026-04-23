@@ -6,6 +6,7 @@ import mafic
 from google import genai
 from google.genai import types
 from bs4 import BeautifulSoup
+import base64
 import json
 import os
 import asyncio
@@ -23,6 +24,7 @@ from PIL import Image
 from datetime import datetime, timedelta, timezone
 import glob as glob_module
 import unicodedata
+from xml.sax.saxutils import escape as xml_escape
 
 try:
     from pypdf import PdfReader
@@ -1458,6 +1460,196 @@ def extract_interaction_text(interaction):
     return "\n\n".join(text_parts).strip()
 
 
+def get_interaction_output_value(output, key, default=None):
+    if isinstance(output, dict):
+        return output.get(key, default)
+    return getattr(output, key, default)
+
+
+def decode_interaction_image(data):
+    if not data:
+        return None
+    if isinstance(data, bytes):
+        return data
+    if not isinstance(data, str):
+        return None
+    payload = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+    try:
+        return base64.b64decode(payload)
+    except Exception:
+        return None
+
+
+def collect_interaction_outputs(interaction):
+    outputs = (
+        interaction.get("outputs", [])
+        if isinstance(interaction, dict)
+        else getattr(interaction, "outputs", None) or []
+    )
+    collected = []
+    for output in outputs:
+        output_type = get_interaction_output_value(output, "type", "")
+        text = get_interaction_output_value(output, "text")
+        data = get_interaction_output_value(output, "data")
+        mime_type = get_interaction_output_value(output, "mime_type") or get_interaction_output_value(output, "mimeType")
+        if output_type == "text" and text:
+            collected.append({"type": "text", "text": text})
+        elif output_type == "image" and data:
+            image_bytes = decode_interaction_image(data)
+            if image_bytes:
+                collected.append({"type": "image", "data": image_bytes, "mime_type": mime_type or "image/png"})
+        elif text:
+            collected.append({"type": "text", "text": text})
+    return collected
+
+
+def add_markdownish_text(story, text, styles):
+    from reportlab.platypus import Paragraph, Spacer
+
+    in_code = False
+    code_lines = []
+
+    def flush_code():
+        nonlocal code_lines
+        if code_lines:
+            escaped = xml_escape("\n".join(code_lines)).replace("\n", "<br/>")
+            story.append(Paragraph(escaped, styles["Code"]))
+            story.append(Spacer(1, 8))
+            code_lines = []
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code:
+                flush_code()
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        if not stripped:
+            story.append(Spacer(1, 6))
+            continue
+        if stripped.startswith("# "):
+            story.append(Paragraph(xml_escape(stripped[2:].strip()), styles["Heading1"]))
+        elif stripped.startswith("## "):
+            story.append(Paragraph(xml_escape(stripped[3:].strip()), styles["Heading2"]))
+        elif stripped.startswith("### "):
+            story.append(Paragraph(xml_escape(stripped[4:].strip()), styles["Heading3"]))
+        elif re.match(r"^[-*]\s+", stripped):
+            story.append(Paragraph("• " + xml_escape(re.sub(r"^[-*]\s+", "", stripped)), styles["Body"]))
+        elif re.match(r"^\d+[.)]\s+", stripped):
+            story.append(Paragraph(xml_escape(stripped), styles["Body"]))
+        else:
+            story.append(Paragraph(xml_escape(stripped), styles["Body"]))
+    flush_code()
+
+
+def build_deep_research_pdf(outputs, *, agent_id):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as PdfImage
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    except Exception as e:
+        raise RuntimeError("reportlab 패키지가 설치되어 있지 않습니다.") from e
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGoThic-Medium"))
+        body_font = "HYGoThic-Medium"
+    except Exception:
+        body_font = "Helvetica"
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+        title="Gemini Deep Research Report",
+    )
+    styles = {
+        "Title": ParagraphStyle("Title", fontName=body_font, fontSize=18, leading=24, spaceAfter=14),
+        "Meta": ParagraphStyle("Meta", fontName=body_font, fontSize=9, leading=12, textColor="#555555", spaceAfter=12),
+        "Heading1": ParagraphStyle("Heading1", fontName=body_font, fontSize=15, leading=20, spaceBefore=10, spaceAfter=6),
+        "Heading2": ParagraphStyle("Heading2", fontName=body_font, fontSize=13, leading=18, spaceBefore=8, spaceAfter=5),
+        "Heading3": ParagraphStyle("Heading3", fontName=body_font, fontSize=11, leading=16, spaceBefore=6, spaceAfter=4),
+        "Body": ParagraphStyle("Body", fontName=body_font, fontSize=9.5, leading=14, spaceAfter=4),
+        "Code": ParagraphStyle("Code", fontName=body_font, fontSize=8, leading=11, leftIndent=8, backColor="#f2f2f2", spaceAfter=6),
+    }
+
+    story = [
+        Paragraph("Gemini Deep Research Report", styles["Title"]),
+        Paragraph(
+            xml_escape(f"Agent: {agent_id} | Generated: {datetime.now(KST).strftime('%Y-%m-%d %H:%M JST')}"),
+            styles["Meta"],
+        ),
+    ]
+    image_index = 1
+    max_width = A4[0] - doc.leftMargin - doc.rightMargin
+    max_height = 165 * mm
+
+    for output in outputs:
+        if output["type"] == "text":
+            add_markdownish_text(story, output.get("text", ""), styles)
+        elif output["type"] == "image":
+            raw = output.get("data")
+            if not raw:
+                continue
+            try:
+                image = Image.open(io.BytesIO(raw))
+                width, height = image.size
+                scale = min(max_width / width, max_height / height, 1.0)
+                story.append(Spacer(1, 8))
+                story.append(Paragraph(f"Visualization {image_index}", styles["Heading3"]))
+                story.append(PdfImage(io.BytesIO(raw), width=width * scale, height=height * scale))
+                story.append(Spacer(1, 8))
+                image_index += 1
+            except Exception as e:
+                story.append(Paragraph(xml_escape(f"[Image omitted: {e}]"), styles["Body"]))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_deep_research_report(interaction, *, agent_id):
+    outputs = collect_interaction_outputs(interaction)
+    if not outputs:
+        raise RuntimeError("Deep Research outputs가 비어 있습니다.")
+    pdf_bytes = build_deep_research_pdf(outputs, agent_id=agent_id)
+    text_preview = "\n\n".join(output["text"] for output in outputs if output["type"] == "text").strip()
+    image_count = sum(1 for output in outputs if output["type"] == "image")
+    return {
+        "kind": "deep_research_report",
+        "pdf_bytes": pdf_bytes,
+        "filename": f"deep_research_{datetime.now(KST).strftime('%Y%m%d_%H%M%S')}.pdf",
+        "summary": (
+            f"[Deep Research] 완료했습니다. PDF 레포트를 첨부합니다."
+            f"\n텍스트 출력 {len(text_preview):,}자, 이미지 {image_count}개"
+        ),
+        "text_preview": text_preview[:MEMORY_EXCERPT_MAX_CHARS],
+    }
+
+
+async def send_deep_research_report(channel, report):
+    pdf = report.get("pdf_bytes")
+    if not pdf:
+        await channel.send("[ERROR] Deep Research PDF 데이터가 비어 있습니다.")
+        return
+    await channel.send(
+        report.get("summary") or "[Deep Research] 완료했습니다.",
+        file=discord.File(fp=io.BytesIO(pdf), filename=report.get("filename") or "deep_research_report.pdf"),
+    )
+
+
 async def call_deep_research(history_contents, agent_id, memory_context=None):
     if not CLIENT:
         return "Error: API Client not initialized"
@@ -1482,7 +1674,7 @@ async def call_deep_research(history_contents, agent_id, memory_context=None):
                 input=prompt,
                 agent=agent_id,
                 background=True,
-                agent_config={"type": "deep-research", "thinking_summaries": "auto"},
+                agent_config={"type": "deep-research", "thinking_summaries": "auto", "visualization": "auto"},
             )
         )
         interaction_id = getattr(interaction, "id", None) or (interaction.get("id") if isinstance(interaction, dict) else None)
@@ -1494,8 +1686,13 @@ async def call_deep_research(history_contents, agent_id, memory_context=None):
             result = await call_interaction_get(interactions_api, interaction_id)
             status = getattr(result, "status", None) or (result.get("status") if isinstance(result, dict) else None)
             if status == "completed":
-                text = extract_interaction_text(result)
-                return text or "[WARN] Deep Research가 완료됐지만 텍스트 출력이 비어 있습니다."
+                try:
+                    return build_deep_research_report(result, agent_id=agent_id)
+                except Exception as e:
+                    text = extract_interaction_text(result)
+                    if text:
+                        return f"[ERROR] Deep Research PDF 생성 실패: {e}\n\n{text}"
+                    return f"[ERROR] Deep Research PDF 생성 실패: {e}"
             if status == "failed":
                 error = getattr(result, "error", None) or (result.get("error") if isinstance(result, dict) else None)
                 return f"[ERROR] Deep Research 실패: {error}"
@@ -2753,6 +2950,16 @@ async def on_message(message):
                     memory_context=memory_context,
                 )
 
+                if isinstance(response, dict) and response.get("kind") == "deep_research_report":
+                    await send_deep_research_report(message.channel, response)
+                    await update_gemini_memory(
+                        message.guild,
+                        history_texts,
+                        response.get("text_preview") or text_from_parts(current_parts),
+                        message,
+                    )
+                    return
+
                 if isinstance(response, str):
                     await send_long_message(message.channel, response)
                     await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
@@ -2892,7 +3099,11 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             await interaction.followup.send(
                 f"[Deep Research] `{TEXT_MODEL}` 작업을 시작했습니다. 몇 분 정도 걸릴 수 있습니다."
             )
-            response, token_usage = await call_gemini(contents, message, text_model=TEXT_MODEL)
+            response, token_usage = await call_gemini(
+                [types.Content(role="user", parts=parts)],
+                message,
+                text_model=TEXT_MODEL,
+            )
         else:
             response = await CLIENT.aio.models.generate_content(
                 model=TEXT_MODEL,
@@ -2905,6 +3116,18 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
                 )
             )
             token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
+
+        if isinstance(response, dict) and response.get("kind") == "deep_research_report":
+            await interaction.followup.send(
+                response.get("summary") or "[Deep Research] 완료했습니다.",
+                file=discord.File(
+                    fp=io.BytesIO(response["pdf_bytes"]),
+                    filename=response.get("filename") or "deep_research_report.pdf",
+                ),
+            )
+            print(f"  [BOT]({TEXT_MODEL}): [Deep Research PDF]")
+            print("-------")
+            return
 
         if isinstance(response, str):
             for chunk in [response[i:i+1900] for i in range(0, len(response), 1900)]:
