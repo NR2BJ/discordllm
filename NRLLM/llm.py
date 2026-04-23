@@ -10,6 +10,7 @@ import io
 import re
 from datetime import datetime, timedelta, timezone
 from typing import List
+from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 ENABLE_UVLOOP = os.environ.get("LLM_ENABLE_UVLOOP", "0") == "1"
@@ -231,20 +232,27 @@ class OpenRouterClient:
             "User-Agent": "DiscordBot (OpenRouterClient, 1.0)"
         }
         self.models_list = []
+        self.models_source = "unknown"
 
     async def fetch_models_metadata(self):
         try:
             print("⏳ OpenRouter 모델 리스트 동기화 중...")
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.base_url}/models", headers=self.headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        raw_list = data.get('data', [])
-                        raw_list.sort(key=lambda x: x.get('created') or 0, reverse=True)
-                        self.models_list = raw_list
-                        print(f"📚 {len(self.models_list)}개 모델 로드 완료")
-                    else:
-                        print(f"⚠️ 모델 정보 로드 실패: {resp.status}")
+                endpoints = [
+                    (f"{self.base_url}/models/user", "user-filtered"),
+                    (f"{self.base_url}/models", "global-fallback"),
+                ]
+                for url, source in endpoints:
+                    async with session.get(url, headers=self.headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            raw_list = data.get('data', [])
+                            raw_list.sort(key=lambda x: x.get('created') or 0, reverse=True)
+                            self.models_list = raw_list
+                            self.models_source = source
+                            print(f"📚 {len(self.models_list)}개 모델 로드 완료 ({source})")
+                            return
+                        print(f"⚠️ 모델 정보 로드 실패 ({source}): {resp.status}")
         except Exception as e:
             print(f"⚠️ 모델 정보 로드 중 오류: {e}")
 
@@ -254,10 +262,7 @@ class OpenRouterClient:
             if m['id'] == clean_id: return m
         return None
 
-    def analyze_model_capabilities(self, model_id):
-        """모델의 입출력 capability 반환: {"input": [...], "output": [...]}"""
-        clean_id = model_id.split(":")[0]
-        model = self.get_model_info(clean_id)
+    def _capabilities_from_model(self, model):
         if not model:
             return {"input": ["text"], "output": ["text"]}
 
@@ -267,7 +272,6 @@ class OpenRouterClient:
         if input_mod and output_mod:
             return {"input": input_mod, "output": output_mod}
 
-        # fallback: architecture.modality 파싱 ("text+image->text" 등)
         arch = model.get('architecture', {})
         modality = arch.get('modality', 'text->text').lower()
         parts = modality.split('->')
@@ -277,14 +281,44 @@ class OpenRouterClient:
         output_list = [m.strip() for m in out.split('+')]
         return {"input": input_list, "output": output_list}
 
-    def analyze_model_type(self, model_id):
-        caps = self.analyze_model_capabilities(model_id)
+    async def fetch_model_details(self, model_id):
+        clean_id = model_id.split(":")[0]
+        if "/" not in clean_id:
+            return None
+
+        author, slug = clean_id.split("/", 1)
+        url = f"{self.base_url}/models/{quote(author, safe='')}/{quote(slug, safe='')}/endpoints"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    return data.get("data")
+        except Exception:
+            return None
+
+    async def fetch_model_endpoints(self, model_id):
+        details = await self.fetch_model_details(model_id)
+        if not details:
+            return None
+        return details.get("endpoints", [])
+
+    def analyze_model_capabilities(self, model_id, model_info=None):
+        """모델의 입출력 capability 반환: {"input": [...], "output": [...]}"""
+        clean_id = model_id.split(":")[0]
+        model = model_info or self.get_model_info(clean_id)
+        return self._capabilities_from_model(model)
+
+    def analyze_model_type(self, model_id, model_info=None):
+        caps = self.analyze_model_capabilities(model_id, model_info=model_info)
         if "image" in caps["input"]:
             return 'multimodal'
         return 'text'
 
-    def get_type_string(self, model_id):
-        caps = self.analyze_model_capabilities(model_id)
+    def get_type_string(self, model_id, model_info=None):
+        caps = self.analyze_model_capabilities(model_id, model_info=model_info)
         parts = []
         if "image" in caps["input"]: parts.append("Vision")
         if "video" in caps["input"]: parts.append("Video")
@@ -755,13 +789,41 @@ async def on_message(message):
                     response, usage, images = await bot.or_client.chat_completion(current_model, messages, capabilities=caps)
                 except Exception as e:
                     err_msg = str(e).lower()
+                    if "no endpoints found for" in err_msg:
+                        print(f"⚠️ [Routing Error] {current_model}: endpoint 없음, 모델 목록 재동기화")
+                        await bot.or_client.fetch_models_metadata()
+                        await message.channel.send(
+                            f"❌ `{current_model}` 모델은 현재 OpenRouter에서 실제 endpoint를 찾지 못했습니다.\n"
+                            f"목록과 실제 라우팅 상태가 어긋났을 수 있으니 `/refresh_models` 후 `/model`로 다시 선택해보세요."
+                        )
+                        return
+
                     # 이미지 관련 400: 현재 메시지 미디어 없어도 히스토리 이미지가 원인일 수 있음
                     has_any_media = has_media or any(
                         isinstance(m.get('content'), list) and
                         any(p.get('type') in ('image_url', 'video_url', 'input_audio') for p in m['content'])
                         for m in messages
                     )
-                    is_media_error = "400" in err_msg or "404" in err_msg or "endpoint" in err_msg or "'choices'" in err_msg
+                    media_error_markers = (
+                        "image_url",
+                        "video_url",
+                        "input_audio",
+                        "unsupported content",
+                        "unsupported input",
+                        "invalid image",
+                        "invalid video",
+                        "invalid audio",
+                        "does not support images",
+                        "does not support image",
+                        "does not support videos",
+                        "does not support video",
+                        "does not support audio",
+                        "multimodal",
+                        "modalit",
+                        "base64",
+                        "'choices'",
+                    )
+                    is_media_error = has_any_media and any(marker in err_msg for marker in media_error_markers)
                     if is_media_error and has_any_media:
                         print(f"⚠️ [Media Error] {current_model}: 텍스트 모드로 전환.")
                         await message.channel.send(f"⚠️ `{current_model}` 모델이 미디어를 처리하지 못했습니다. 텍스트 모드로 재시도합니다.")
@@ -836,24 +898,45 @@ async def model_autocomplete(interaction: discord.Interaction, current: str) -> 
 @app_commands.autocomplete(model_id=model_autocomplete)
 @app_commands.describe(model_id="모델 이름 검색")
 async def set_model(interaction: discord.Interaction, model_id: str):
+    await interaction.response.defer(ephemeral=True)
     clean_id = model_id.split(":")[0]
     model_info = bot.or_client.get_model_info(clean_id)
-    
+
+    if not model_info and not bot.or_client.models_list:
+        await bot.or_client.fetch_models_metadata()
+        model_info = bot.or_client.get_model_info(clean_id)
+
     if not model_info:
-        config = bot.get_config(interaction.guild_id)
-        config["model"] = clean_id
-        bot.save_config()
-        await interaction.response.send_message(f"✅ 모델 변경 완료: `{clean_id}` (정보 없음)")
+        model_info = await bot.or_client.fetch_model_details(clean_id)
+
+    endpoints = await bot.or_client.fetch_model_endpoints(clean_id)
+    if endpoints is not None and len(endpoints) == 0:
+        await interaction.followup.send(
+            f"❌ `{clean_id}` 모델은 현재 이 API 키 기준으로 사용 가능한 OpenRouter endpoint가 없습니다.\n"
+            f"`/refresh_models` 후 다시 선택해보세요.",
+            ephemeral=True,
+        )
+        return
+
+    if not model_info:
+        await interaction.followup.send(
+            f"❌ `{clean_id}` 모델 정보를 찾지 못했습니다. `/refresh_models` 후 다시 시도해보세요.",
+            ephemeral=True,
+        )
         return
 
     config = bot.get_config(interaction.guild_id)
     config["model"] = model_info['id']
     bot.save_config()
     
-    type_str = bot.or_client.get_type_string(model_info['id'])
+    type_str = bot.or_client.get_type_string(model_info['id'], model_info=model_info)
     created = format_date(model_info.get('created'))
+    endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
 
-    await interaction.response.send_message(f"✅ 모델 변경 완료!\n**{model_info['name']}** (`{model_info['id']}`)\n타입: **{type_str}** | 출시일: {created}")
+    await interaction.followup.send(
+        f"✅ 모델 변경 완료!\n**{model_info['name']}** (`{model_info['id']}`)\n타입: **{type_str}** | 출시일: {created}{endpoint_suffix}",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="dashboard", description="현재 모델 스펙 확인")
 async def dashboard(interaction: discord.Interaction):
@@ -865,9 +948,12 @@ async def dashboard(interaction: discord.Interaction):
         await bot.or_client.fetch_models_metadata()
         
     model_meta = bot.or_client.get_model_info(curr_model) or {}
-    type_str = bot.or_client.get_type_string(curr_model)
-    caps = bot.or_client.analyze_model_capabilities(curr_model)
+    if not model_meta:
+        model_meta = await bot.or_client.fetch_model_details(curr_model) or {}
+    type_str = bot.or_client.get_type_string(curr_model, model_info=model_meta)
+    caps = bot.or_client.analyze_model_capabilities(curr_model, model_info=model_meta)
     is_multimodal = len(caps["input"]) > 1 or len(caps["output"]) > 1
+    endpoints = await bot.or_client.fetch_model_endpoints(curr_model)
 
     color = 0x00bcd4 if is_multimodal else 0x4caf50
     embed = discord.Embed(title="🎛️ OpenRouter Dashboard", color=color)
@@ -896,6 +982,8 @@ async def dashboard(interaction: discord.Interaction):
     input_str = ", ".join(caps["input"]) if caps["input"] else "text"
     output_str = ", ".join(caps["output"]) if caps["output"] else "text"
     embed.add_field(name="🔄 Modalities", value=f"• **Input:** {input_str}\n• **Output:** {output_str}", inline=True)
+    if endpoints is not None:
+        embed.add_field(name="🛰️ Routing", value=f"• **Available Endpoints:** {len(endpoints)}", inline=True)
 
     desc = model_meta.get('description', '설명 없음')
     if len(desc) > 300: desc = desc[:297] + "..."
@@ -933,14 +1021,15 @@ async def refresh_models_cmd(interaction: discord.Interaction):
     before = len(bot.or_client.models_list)
     await bot.or_client.fetch_models_metadata()
     after = len(bot.or_client.models_list)
+    source = bot.or_client.models_source
     if after == 0:
         await interaction.followup.send("[ERROR] 모델 리스트 갱신 실패 — OpenRouter API 응답 확인 필요", ephemeral=True)
     elif after == before:
-        await interaction.followup.send(f"✅ 갱신 완료 (변동 없음, {after}개 모델)", ephemeral=True)
+        await interaction.followup.send(f"✅ 갱신 완료 (변동 없음, {after}개 모델 | source={source})", ephemeral=True)
     else:
         delta = after - before
         sign = "+" if delta > 0 else ""
-        await interaction.followup.send(f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta})", ephemeral=True)
+        await interaction.followup.send(f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) | source={source}", ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
