@@ -4,4 +4,7 @@ google-genai
 aiohttp
 beautifulsoup4
 pillow
+pypdf
+python-docx
+openpyxl
 uvloop

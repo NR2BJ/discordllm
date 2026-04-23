@@ -1,17 +1,34 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+import csv
 import json
 import os
 import aiohttp
 import asyncio
 import base64
+import copy
 import io
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from bs4 import BeautifulSoup
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
 
 ENABLE_UVLOOP = os.environ.get("LLM_ENABLE_UVLOOP", "0") == "1"
 if ENABLE_UVLOOP:
@@ -34,14 +51,22 @@ IMAGE_HISTORY_LIMIT = 2
 VIDEO_HISTORY_LIMIT = 1
 AUDIO_HISTORY_LIMIT = 1
 MAX_MEDIA_BASE64_MB = 20
+MAX_DOC_CHARS = 12000
+MEMORY_EXCERPT_MAX_CHARS = 5000
 
 # 읽을 수 있는 텍스트 파일 확장자
 SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html', 
-                        '.css', '.md', '.json', '.xml', '.yaml', '.sh', '.rb', '.go', '.rs')
+                        '.css', '.md', '.json', '.xml', '.yaml', '.yml', '.toml', '.ini',
+                        '.sh', '.rb', '.go', '.rs', '.csv', '.tsv', '.log')
 
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
+DEFAULT_MEMORY_MODEL = os.environ.get("LLM_MEMORY_MODEL", DEFAULT_MODEL)
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
+DEFAULT_PROVIDER_POLICY = "cheap"
+MEMORY_UPDATE_WINDOW = 8
+MEMORY_MAX_ITEMS_PER_USER = 12
+MEMORY_MAX_RECENT_NAMES = 5
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -79,9 +104,86 @@ You are an AI member of this Discord server.
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
+MEMORY_FILE = os.environ.get("LLM_MEMORY_FILE", os.path.join(os.path.dirname(CONFIG_FILE), "llm_memory.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
+RECENT_IMAGE_DIR = os.environ.get("LLM_RECENT_IMAGE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_recent_images"))
+RECENT_IMAGE_INDEX_FILE = os.path.join(RECENT_IMAGE_DIR, "index.json")
+RECENT_IMAGE_LIMIT = 2
 HISTORY_DEBUG_LOGS = False
+
+MEMORY_EXTRACTION_SCHEMA = {
+    "name": "speaker_memory_update",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "speaker_updates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string"},
+                        "display_name": {"type": "string"},
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["fact", "position", "preference", "reported_claim"]},
+                                    "key": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "subject": {"type": "string"},
+                                    "confidence": {"type": "number"},
+                                },
+                                "required": ["type", "key", "value", "subject", "confidence"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["user_id", "display_name", "items"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["speaker_updates"],
+        "additionalProperties": False,
+    },
+}
+
+CHANNEL_SUMMARY_SCHEMA = {
+    "name": "channel_summary_update",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "topics": {"type": "array", "items": {"type": "string"}},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["summary", "topics", "open_questions"],
+        "additionalProperties": False,
+    },
+}
+
+IMAGE_ROUTE_SCHEMA = {
+    "name": "image_route_decision",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["respond_text", "inspect_recent_images", "generate_image"],
+            },
+            "refined_prompt": {"type": "string"},
+            "use_recent_images": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "required": ["action", "refined_prompt", "use_recent_images", "reason"],
+        "additionalProperties": False,
+    },
+}
 
 # ================= 2. 데이터 관리자 =================
 class DataManager:
@@ -102,6 +204,77 @@ class DataManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except:
             pass
+
+
+class RecentImageStore:
+    def __init__(self, base_dir, index_file, *, limit=2):
+        self.base_dir = base_dir
+        self.index_file = index_file
+        self.limit = limit
+        os.makedirs(self.base_dir, exist_ok=True)
+        self.index = DataManager.load_json(self.index_file, {})
+
+    def _save(self):
+        DataManager.save_json(self.index_file, self.index)
+
+    def _entries(self, guild_id):
+        gid = str(guild_id)
+        entries = self.index.get(gid, [])
+        if not isinstance(entries, list):
+            entries = []
+        self.index[gid] = entries
+        return entries
+
+    def register_bytes(self, guild_id, *, channel_id, message_id, author_id, display_name, filename, image_bytes, source_kind):
+        gid = str(guild_id)
+        guild_dir = os.path.join(self.base_dir, gid)
+        os.makedirs(guild_dir, exist_ok=True)
+        ext = os.path.splitext(filename or "")[1].lower() or ".png"
+        safe_kind = re.sub(r"[^a-z0-9_]+", "_", (source_kind or "image").lower())
+        safe_name = re.sub(r"[^a-z0-9_]+", "_", os.path.splitext((filename or "image").lower())[0]).strip("_") or "image"
+        output_name = f"{int(message_id)}_{safe_kind}_{safe_name}{ext}"
+        output_path = os.path.join(guild_dir, output_name)
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
+
+        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
+        entries = [entry for entry in entries if entry.get("path") != output_path]
+        entries.append(
+            {
+                "guild_id": int(guild_id),
+                "channel_id": int(channel_id),
+                "message_id": int(message_id),
+                "author_id": int(author_id),
+                "display_name": display_name or str(author_id),
+                "filename": filename or output_name,
+                "path": output_path,
+                "source_kind": source_kind,
+                "created_at": datetime.now(KST).isoformat(),
+            }
+        )
+        while len(entries) > self.limit:
+            old = entries.pop(0)
+            try:
+                os.remove(old.get("path", ""))
+            except OSError:
+                pass
+        self.index[gid] = entries
+        self._save()
+
+    def list_recent(self, guild_id):
+        gid = str(guild_id)
+        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
+        self.index[gid] = entries
+        return entries[-self.limit:]
+
+    def describe_recent(self, guild_id):
+        entries = self.list_recent(guild_id)
+        if not entries:
+            return "No recent images are stored."
+        return "\n".join(
+            f"{idx}. {entry.get('source_kind', 'image')} | {entry.get('display_name', 'unknown')} | {entry.get('filename', 'image')}"
+            for idx, entry in enumerate(reversed(entries), start=1)
+        )
 
 class DocumentCache:
     def __init__(self, cache_dir):
@@ -219,9 +392,308 @@ class DocumentCache:
                 blocks.append(f"[{title}: {doc_id} | {label}]")
         return blocks
 
+
+class MemoryStore:
+    def __init__(self, filename):
+        self.filename = filename
+        self.data = self._load()
+
+    def _default(self):
+        return {"version": 1, "servers": {}}
+
+    def _load(self):
+        if os.path.exists(self.filename):
+            try:
+                with open(self.filename, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("version", 1)
+                    data.setdefault("servers", {})
+                    return data
+            except Exception:
+                pass
+        return self._default()
+
+    def save(self):
+        try:
+            with open(self.filename, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def get_server(self, guild_id):
+        gid = str(guild_id)
+        servers = self.data.setdefault("servers", {})
+        if gid not in servers:
+            servers[gid] = {
+                "channel_summary": {
+                    "summary": "",
+                    "topics": [],
+                    "open_questions": [],
+                    "updated_at": None,
+                    "last_message_id": None,
+                },
+                "speaker_state": {},
+            }
+        return servers[gid]
+
+    def clear_speaker_state(self, guild_id):
+        server = self.get_server(guild_id)
+        server["speaker_state"] = {}
+        self.save()
+
+    def clear_context(self, guild_id):
+        server = self.get_server(guild_id)
+        server["channel_summary"] = {
+            "summary": "",
+            "topics": [],
+            "open_questions": [],
+            "updated_at": None,
+            "last_message_id": None,
+        }
+        self.save()
+
+    def touch_user(self, guild_id, user_id, display_name):
+        server = self.get_server(guild_id)
+        speaker_state = server.setdefault("speaker_state", {})
+        user_id = str(user_id)
+        display_name = (display_name or user_id).strip()
+        state = speaker_state.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "current_display_name": display_name,
+                "recent_display_names": [display_name],
+                "items": [],
+            },
+        )
+        state["current_display_name"] = display_name
+        recent_names = [display_name] + [name for name in state.get("recent_display_names", []) if name != display_name]
+        state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
+        self.save()
+
+    def render_channel_summary(self, guild_id):
+        summary = self.get_server(guild_id).get("channel_summary", {})
+        lines = []
+        if summary.get("summary"):
+            lines.append(f"Summary: {summary['summary']}")
+        if summary.get("topics"):
+            lines.append("Topics: " + "; ".join(summary["topics"][:8]))
+        if summary.get("open_questions"):
+            lines.append("Open questions: " + "; ".join(summary["open_questions"][:8]))
+        if not lines:
+            return ""
+        return "[Channel Memory]\n" + "\n".join(lines)
+
+    def render_speaker_state(self, guild_id):
+        speaker_state = self.get_server(guild_id).get("speaker_state", {})
+        lines = []
+        for user_id, payload in speaker_state.items():
+            display_name = payload.get("current_display_name") or user_id
+            aliases = [name for name in payload.get("recent_display_names", []) if name != display_name]
+            item_lines = []
+            for item in payload.get("items", [])[:MEMORY_MAX_ITEMS_PER_USER]:
+                prefix = item.get("type", "fact")
+                subject = item.get("subject", "self")
+                item_lines.append(f"{prefix}:{subject}:{item.get('key')}={item.get('value')}")
+            if item_lines:
+                alias_suffix = f" [aka {', '.join(aliases[:3])}]" if aliases else ""
+                lines.append(f"- {display_name}{alias_suffix} ({user_id}): " + " | ".join(item_lines))
+        if not lines:
+            return ""
+        return "[Speaker Memory]\n" + "\n".join(lines)
+
+    def merge_speaker_updates(self, guild_id, updates, *, source_message_id):
+        server = self.get_server(guild_id)
+        speaker_state = server.setdefault("speaker_state", {})
+        now = datetime.now(timezone.utc).isoformat()
+
+        for update in updates:
+            user_id = str(update.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            display_name = (update.get("display_name") or user_id).strip()
+            state = speaker_state.setdefault(
+                user_id,
+                {
+                    "user_id": user_id,
+                    "current_display_name": display_name,
+                    "recent_display_names": [display_name],
+                    "items": [],
+                },
+            )
+
+            state["current_display_name"] = display_name
+            recent_names = [display_name] + [n for n in state.get("recent_display_names", []) if n != display_name]
+            state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
+
+            for item in update.get("items", []):
+                key = (item.get("key") or "").strip()
+                value = (item.get("value") or "").strip()
+                item_type = item.get("type") or "fact"
+                subject = item.get("subject") or "self"
+                confidence = float(item.get("confidence") or 0)
+                if not key or not value:
+                    continue
+                normalized = {
+                    "type": item_type,
+                    "key": key,
+                    "value": value,
+                    "subject": subject,
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "source_message_id": str(source_message_id),
+                    "updated_at": now,
+                }
+
+                items = state.setdefault("items", [])
+                replaced = False
+                for idx, existing in enumerate(items):
+                    if (
+                        existing.get("type") == item_type
+                        and existing.get("key") == key
+                        and existing.get("subject") == subject
+                    ):
+                        items[idx] = normalized
+                        replaced = True
+                        break
+                if not replaced:
+                    items.insert(0, normalized)
+                state["items"] = items[:MEMORY_MAX_ITEMS_PER_USER]
+
+        self.save()
+
+    def update_channel_summary(self, guild_id, payload, *, message_id):
+        server = self.get_server(guild_id)
+        now = datetime.now(timezone.utc).isoformat()
+        server["channel_summary"] = {
+            "summary": (payload.get("summary") or "").strip(),
+            "topics": [t.strip() for t in payload.get("topics", []) if isinstance(t, str) and t.strip()][:8],
+            "open_questions": [q.strip() for q in payload.get("open_questions", []) if isinstance(q, str) and q.strip()][:8],
+            "updated_at": now,
+            "last_message_id": str(message_id),
+        }
+        self.save()
+
 def log_history_debug(message):
     if HISTORY_DEBUG_LOGS:
         print(message)
+
+
+def trim_document_text(text, limit=MAX_DOC_CHARS):
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "\n...[truncated]..."
+
+
+def decode_text_bytes(raw_bytes):
+    for encoding in ("utf-8", "cp949", "latin1"):
+        try:
+            return raw_bytes.decode(encoding)
+        except Exception:
+            continue
+    return None
+
+
+def extract_pdf_text(raw_bytes):
+    if PdfReader is None:
+        return None
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        parts = []
+        for page in reader.pages[:20]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return trim_document_text("\n\n".join(part for part in parts if part.strip()))
+    except Exception:
+        return None
+
+
+def extract_docx_text(raw_bytes):
+    if DocxDocument is None:
+        return None
+    try:
+        document = DocxDocument(io.BytesIO(raw_bytes))
+        paragraphs = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+        return trim_document_text("\n".join(paragraphs))
+    except Exception:
+        return None
+
+
+def extract_xlsx_text(raw_bytes):
+    if load_workbook is None:
+        return None
+    try:
+        workbook = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        blocks = []
+        for sheet in workbook.worksheets[:5]:
+            rows = []
+            for row in sheet.iter_rows(max_row=50, values_only=True):
+                cells = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                blocks.append(f"[Sheet: {sheet.title}]\n" + "\n".join(rows))
+        workbook.close()
+        return trim_document_text("\n\n".join(blocks))
+    except Exception:
+        return None
+
+
+def extract_csv_text(raw_bytes, delimiter=","):
+    decoded = decode_text_bytes(raw_bytes)
+    if not decoded:
+        return None
+    try:
+        reader = csv.reader(io.StringIO(decoded), delimiter=delimiter)
+        rows = []
+        for idx, row in enumerate(reader):
+            if idx >= 100:
+                break
+            cells = [cell.strip() for cell in row if cell and cell.strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+        return trim_document_text("\n".join(rows))
+    except Exception:
+        return trim_document_text(decoded)
+
+
+async def extract_attachment_text(att):
+    filename = (att.filename or "").lower()
+    raw_bytes = await att.read()
+
+    if filename.endswith(".pdf"):
+        text = extract_pdf_text(raw_bytes)
+        return text, "pdf"
+    if filename.endswith(".docx"):
+        text = extract_docx_text(raw_bytes)
+        return text, "docx"
+    if filename.endswith(".xlsx"):
+        text = extract_xlsx_text(raw_bytes)
+        return text, "xlsx"
+    if filename.endswith(".csv"):
+        text = extract_csv_text(raw_bytes, delimiter=",")
+        return text, "csv"
+    if filename.endswith(".tsv"):
+        text = extract_csv_text(raw_bytes, delimiter="\t")
+        return text, "tsv"
+    if filename.endswith(SUPPORTED_EXTENSIONS):
+        decoded = decode_text_bytes(raw_bytes)
+        return trim_document_text(decoded), "text"
+    return None, None
+
+
+def sanitize_for_memory_excerpt(text):
+    cleaned = re.sub(
+        r"\[(?:Attached File Content|Current File|Webpage Content):[^\]]+\]\s*```.*?```",
+        "[Large attached content omitted]",
+        text or "",
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:MEMORY_EXCERPT_MAX_CHARS]
 
 # ================= 3. OpenRouter API 클라이언트 =================
 class OpenRouterClient:
@@ -343,6 +815,91 @@ class OpenRouterClient:
             return "Multimodal (" + ", ".join(parts) + ")"
         return "Text Generation"
 
+    def _parse_completion_output(self, data):
+        import ast  # 문자열 형태의 리스트 파싱을 위해 추가
+
+        choice = data['choices'][0]
+        usage = data.get('usage', {})
+        raw_content = choice['message'].get('content', '')
+        msg_keys = list(choice['message'].keys())
+        data_keys = [k for k in data.keys() if k not in ('id', 'object', 'created', 'model', 'choices', 'usage')]
+        print(f"[DEBUG] message keys: {msg_keys}, content type: {type(raw_content).__name__}, extra data keys: {data_keys}")
+        if raw_content is None:
+            print(f"[DEBUG] content is None, full message: {json.dumps({k: str(v)[:200] for k, v in choice['message'].items()}, ensure_ascii=False)}")
+        final_content = ""
+        images = []
+
+        if raw_content is None:
+            raw_content = ''
+
+        def _extract_images(source, keys):
+            found = []
+            for key in keys:
+                extra_imgs = source.get(key, [])
+                if isinstance(extra_imgs, list):
+                    for item in extra_imgs:
+                        if isinstance(item, str):
+                            found.append(item)
+                        elif isinstance(item, dict):
+                            if item.get('type') == 'image_url':
+                                img_url = item.get('image_url', {}).get('url', '')
+                                if img_url:
+                                    found.append(img_url)
+                            else:
+                                url = item.get('url') or item.get('b64_json') or item.get('data', '')
+                                if url:
+                                    found.append(url)
+                elif isinstance(extra_imgs, str) and extra_imgs:
+                    found.append(extra_imgs)
+            return found
+
+        images.extend(_extract_images(choice['message'], ['images', 'image']))
+        images.extend(_extract_images(data, ['data', 'images']))
+
+        if isinstance(raw_content, list):
+            for part in raw_content:
+                if isinstance(part, dict):
+                    if part.get('type') in ('text', 'output_text'):
+                        final_content += part.get('text', '')
+                    elif part.get('type') == 'image_url':
+                        img_url = part.get('image_url', {}).get('url', '')
+                        if img_url:
+                            images.append(img_url)
+                    elif part.get('type') == 'image':
+                        src = part.get('source', {})
+                        if src.get('data'):
+                            mt = src.get('media_type', 'image/png')
+                            images.append(f"data:{mt};base64,{src['data']}")
+        elif isinstance(raw_content, str):
+            stripped = raw_content.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                try:
+                    parsed_list = ast.literal_eval(stripped)
+                    if isinstance(parsed_list, list):
+                        for part in parsed_list:
+                            if isinstance(part, dict):
+                                if part.get('type') in ('text', 'output_text'):
+                                    final_content += part.get('text', '')
+                                elif part.get('type') == 'image_url':
+                                    img_url = part.get('image_url', {}).get('url', '')
+                                    if img_url:
+                                        images.append(img_url)
+                        if not final_content and not images:
+                            final_content = raw_content
+                    else:
+                        final_content = raw_content
+                except Exception:
+                    final_content = raw_content
+            else:
+                final_content = raw_content
+        else:
+            final_content = str(raw_content)
+
+        if not final_content and not images:
+            final_content = "..."
+
+        return final_content, usage, images, data
+
     async def chat_completion(
         self,
         model,
@@ -350,20 +907,35 @@ class OpenRouterClient:
         capabilities=None,
         enable_web_search=False,
         image_config=None,
+        *,
+        tools=None,
+        plugins=None,
+        response_format=None,
+        provider=None,
+        require_parameter_support=False,
+        cache_control=None,
     ):
-        import ast  # 문자열 형태의 리스트 파싱을 위해 추가
-
         payload = {
             "model": model,
             "messages": messages,
-            "transforms": ["middle-out"],
-            # "temperature": 0.7
+            "plugins": [{"id": "context-compression"}],
         }
 
+        tool_list = []
         if enable_web_search:
-            payload["tools"] = [{"type": "openrouter:web_search"}]
+            tool_list.append({"type": "openrouter:web_search"})
+        if tools:
+            tool_list.extend(copy.deepcopy(tools))
+        if tool_list:
+            payload["tools"] = tool_list
+            payload["tool_choice"] = "auto"
 
-        # 이미지 생성 가능 모델이면 output modality에 맞춰 활성화
+        plugin_list = payload["plugins"]
+        if plugins:
+            plugin_list.extend(copy.deepcopy(plugins))
+        if plugin_list:
+            payload["plugins"] = plugin_list
+
         if capabilities and "image" in capabilities.get("output", []):
             if "text" in capabilities.get("output", []):
                 payload["modalities"] = ["image", "text"]
@@ -372,111 +944,23 @@ class OpenRouterClient:
 
         if image_config:
             payload["image_config"] = image_config
+        if response_format:
+            payload["response_format"] = response_format
+        if provider:
+            payload["provider"] = copy.deepcopy(provider)
+            if require_parameter_support:
+                payload["provider"]["require_parameters"] = True
+        if cache_control:
+            payload["cache_control"] = cache_control
 
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    choice = data['choices'][0]
-                    usage = data.get('usage', {})
-
-                    raw_content = choice['message'].get('content', '')
-
-                    # 디버그: raw 응답 구조 로그
-                    msg_keys = list(choice['message'].keys())
-                    data_keys = [k for k in data.keys() if k not in ('id', 'object', 'created', 'model', 'choices', 'usage')]
-                    print(f"[DEBUG] message keys: {msg_keys}, content type: {type(raw_content).__name__}, extra data keys: {data_keys}")
-                    if raw_content is None:
-                        print(f"[DEBUG] content is None, full message: {json.dumps({k: str(v)[:200] for k, v in choice['message'].items()}, ensure_ascii=False)}")
-                    final_content = ""
-                    images = []
-
-                    if raw_content is None:
-                        raw_content = ''
-
-                    # 이미지 추출: choice.message 내 별도 필드
-                    def _extract_images(source, keys):
-                        """source dict에서 keys에 해당하는 이미지 데이터 추출"""
-                        found = []
-                        for key in keys:
-                            extra_imgs = source.get(key, [])
-                            if isinstance(extra_imgs, list):
-                                for item in extra_imgs:
-                                    if isinstance(item, str):
-                                        found.append(item)
-                                    elif isinstance(item, dict):
-                                        if item.get('type') == 'image_url':
-                                            img_url = item.get('image_url', {}).get('url', '')
-                                            if img_url:
-                                                found.append(img_url)
-                                        else:
-                                            url = item.get('url') or item.get('b64_json') or item.get('data', '')
-                                            if url:
-                                                found.append(url)
-                            elif isinstance(extra_imgs, str) and extra_imgs:
-                                found.append(extra_imgs)
-                        return found
-
-                    # choice.message 내 이미지
-                    images.extend(_extract_images(choice['message'], ['images', 'image']))
-                    # 응답 최상위 data 필드 (DALL-E 스타일)
-                    images.extend(_extract_images(data, ['data', 'images']))
-
-                    # 1. 진짜 리스트인 경우 (일반적인 경우)
-                    if isinstance(raw_content, list):
-                        for part in raw_content:
-                            if isinstance(part, dict):
-                                if part.get('type') == 'text':
-                                    final_content += part.get('text', '')
-                                elif part.get('type') == 'image_url':
-                                    img_url = part.get('image_url', {}).get('url', '')
-                                    if img_url:
-                                        images.append(img_url)
-                                elif part.get('type') == 'image':
-                                    # Anthropic-style: {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
-                                    src = part.get('source', {})
-                                    if src.get('data'):
-                                        mt = src.get('media_type', 'image/png')
-                                        images.append(f"data:{mt};base64,{src['data']}")
-
-                    # 2. 문자열인데 리스트처럼 생긴 경우 ("[{'type':...}]") -> DeepSeek 이슈 해결용
-                    elif isinstance(raw_content, str):
-                        stripped = raw_content.strip()
-                        if stripped.startswith('[') and stripped.endswith(']'):
-                            try:
-                                # 문자열을 실제 리스트 객체로 변환 시도
-                                parsed_list = ast.literal_eval(stripped)
-                                if isinstance(parsed_list, list):
-                                    for part in parsed_list:
-                                        if isinstance(part, dict):
-                                            if part.get('type') == 'text':
-                                                final_content += part.get('text', '')
-                                            elif part.get('type') == 'image_url':
-                                                img_url = part.get('image_url', {}).get('url', '')
-                                                if img_url:
-                                                    images.append(img_url)
-                                    # 파싱에 성공했지만 텍스트가 없으면 원본 사용
-                                    if not final_content and not images:
-                                        final_content = raw_content
-                                else:
-                                    final_content = raw_content
-                            except:
-                                # 파싱 실패 시 그냥 원본 문자열 사용
-                                final_content = raw_content
-                        else:
-                            final_content = raw_content
-
-                    else:
-                        final_content = str(raw_content)
-
-                    # 빈 값 처리
-                    if not final_content and not images:
-                        final_content = "..."
-
-                    return final_content, usage, images
-                else:
-                    error_text = await resp.text()
-                    raise Exception(f"API Error ({resp.status}): {error_text}")
+                    final_content, usage, images, full_data = self._parse_completion_output(data)
+                    return final_content, usage, images, full_data
+                error_text = await resp.text()
+                raise Exception(f"API Error ({resp.status}): {error_text}")
 
 # ================= 4. 봇 클래스 =================
 class OpenRouterBot(commands.Bot):
@@ -488,6 +972,8 @@ class OpenRouterBot(commands.Bot):
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
+        self.memory_store = MemoryStore(MEMORY_FILE)
+        self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
 
     async def setup_hook(self):
         await self.or_client.fetch_models_metadata()
@@ -502,9 +988,11 @@ class OpenRouterBot(commands.Bot):
                 "model": DEFAULT_MODEL,
                 "fallback_model": DEFAULT_IMAGE_MODEL,
                 "reset_time": None,
-                "search": False
+                "search": False,
+                "provider_policy": DEFAULT_PROVIDER_POLICY,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
+        self.server_configs[gid].setdefault("provider_policy", DEFAULT_PROVIDER_POLICY)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -547,6 +1035,48 @@ async def encode_image(url):
     except: pass
     return None, None
 
+
+async def download_binary(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read(), resp.headers.get("Content-Type")
+    except Exception:
+        pass
+    return None, None
+
+
+def guess_image_mime(filename):
+    ext = os.path.splitext(filename or "")[1].lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(ext, "image/png")
+
+
+def build_recent_image_hint(guild_id):
+    return (
+        "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
+        f"{bot.recent_image_store.describe_recent(guild_id)}"
+    )
+
+
+async def load_recent_image_inputs(guild_id, *, limit=RECENT_IMAGE_LIMIT):
+    inputs = []
+    for entry in reversed(bot.recent_image_store.list_recent(guild_id)[-limit:]):
+        try:
+            with open(entry["path"], "rb") as f:
+                raw = f.read()
+            mime = guess_image_mime(entry.get("filename", ""))
+            b64 = base64.b64encode(raw).decode("utf-8")
+            inputs.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        except Exception as e:
+            print(f"⚠️ 최근 이미지 로드 실패: {e}")
+    return inputs
+
 async def send_long_message(channel, content):
     if len(content) <= 2000:
         await channel.send(content)
@@ -566,7 +1096,7 @@ async def send_long_message(channel, content):
         await channel.send(chunk)
         await asyncio.sleep(0.5)
 
-async def send_generated_images(send_func, images, filename_prefix="generated"):
+async def send_generated_images(send_func, images, filename_prefix="generated", on_sent=None):
     sent = 0
     for idx, img_data_url in enumerate(images):
         try:
@@ -588,6 +1118,8 @@ async def send_generated_images(send_func, images, filename_prefix="generated"):
                 ext = "png"
                 binary = base64.b64decode(b64_data)
             await send_func(file=discord.File(fp=io.BytesIO(binary), filename=f"{filename_prefix}_{idx}.{ext}"))
+            if on_sent:
+                await on_sent(binary, ext, idx)
             sent += 1
         except Exception as img_err:
             print(f"⚠️ 이미지 전송 실패: {img_err}")
@@ -673,6 +1205,262 @@ def get_active_generation_model(config, base_caps):
         return fallback_model, "configured-fallback"
     return None, None
 
+
+def build_provider_preferences(policy, *, strict=False):
+    policy = (policy or DEFAULT_PROVIDER_POLICY).lower()
+    if policy == "cheap":
+        provider = {
+            "sort": "price",
+            "allow_fallbacks": True,
+        }
+    elif policy == "stable":
+        provider = {
+            "sort": "latency",
+            "allow_fallbacks": True,
+            "data_collection": "deny",
+        }
+    else:
+        provider = {
+            "allow_fallbacks": True,
+        }
+    if strict:
+        provider["require_parameters"] = True
+    return provider
+
+
+def build_prompt_cache_control(model_id, messages):
+    clean_id = (model_id or "").split(":")[0]
+    if not clean_id.startswith("anthropic/"):
+        return None
+    total_text = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total_text += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total_text += len(part.get("text", ""))
+    if total_text < 2048:
+        return None
+    return {"type": "ephemeral"}
+
+
+async def decide_message_action(config, history_messages, current_user_text, guild_id, *, has_current_images=False):
+    excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
+    route_prompt = (
+        "You are a routing planner for a Discord AI bot.\n"
+        "Decide the next action for the assistant.\n\n"
+        "Available actions:\n"
+        "- respond_text: normal text reply.\n"
+        "- inspect_recent_images: the app should reattach the stored recent images before answering.\n"
+        "- generate_image: the app should send a refined English prompt to the image generation model.\n\n"
+        "Rules:\n"
+        "- Do not choose inspect_recent_images if the current message already includes image attachments.\n"
+        "- Do not choose generate_image unless the user clearly wants image creation or a visual edit/transformation.\n"
+        "- If the user is asking about something visible in a previous image, choose inspect_recent_images.\n"
+        "- `use_recent_images` should be true only when the app should attach the stored recent images as references.\n\n"
+        f"Current message has image attachments: {has_current_images}\n\n"
+        f"{build_recent_image_hint(guild_id)}\n\n"
+        f"Recent conversation excerpt:\n{excerpt or '(empty)'}\n\n"
+        f"Current user message:\n{current_user_text}"
+    )
+    response_text, _, _, _ = await bot.or_client.chat_completion(
+        DEFAULT_MEMORY_MODEL,
+        [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": route_prompt},
+        ],
+        response_format={"type": "json_schema", "json_schema": IMAGE_ROUTE_SCHEMA},
+        provider=build_provider_preferences(config.get("provider_policy"), strict=True),
+        require_parameter_support=True,
+        cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+            {"content": route_prompt},
+        ]),
+    )
+    payload = coerce_json_object(response_text)
+    if not payload:
+        return {
+            "action": "respond_text",
+            "refined_prompt": "",
+            "use_recent_images": False,
+            "reason": "route_parse_failed",
+        }
+    return payload
+
+
+def coerce_json_object(text):
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if "```" in candidate:
+        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", candidate, re.DOTALL)
+        if match:
+            candidate = match.group(1).strip()
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
+def build_recent_conversation_excerpt(history_messages, current_user_text):
+    lines = []
+    for message in history_messages[-MEMORY_UPDATE_WINDOW:]:
+        content = message.get("content", [])
+        if isinstance(content, list):
+            text_blocks = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+            if text_blocks:
+                lines.append(sanitize_for_memory_excerpt("\n".join(text_blocks).strip()))
+        elif isinstance(content, str):
+            lines.append(sanitize_for_memory_excerpt(content.strip()))
+    if current_user_text:
+        lines.append(sanitize_for_memory_excerpt(current_user_text.strip()))
+    return "\n\n".join(line for line in lines if line)
+
+
+async def update_speaker_memory(guild, config, history_messages, current_user_text, message):
+    excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
+    if not excerpt:
+        return
+
+    current_state = bot.memory_store.render_speaker_state(guild.id)
+    memory_prompt = (
+        "You extract durable, user-specific conversation memory.\n"
+        "Only record facts, positions, preferences, and reported claims that are useful later.\n"
+        "Do not store tone, jokes, one-off phrasing, or speculative guesses.\n"
+        "For second-hand statements like 'my friend said...', use type=reported_claim and subject accordingly.\n"
+        "If nothing worth storing changed, return an empty speaker_updates array.\n\n"
+        f"Current speaker memory:\n{current_state or '(empty)'}\n\n"
+        f"Conversation excerpt:\n{excerpt}"
+    )
+    response_text, _, _, _ = await bot.or_client.chat_completion(
+        DEFAULT_MEMORY_MODEL,
+        [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": memory_prompt},
+        ],
+        response_format={"type": "json_schema", "json_schema": MEMORY_EXTRACTION_SCHEMA},
+        provider=build_provider_preferences(config.get("provider_policy"), strict=True),
+        require_parameter_support=True,
+        cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+            {"content": memory_prompt},
+        ]),
+    )
+    payload = coerce_json_object(response_text)
+    if not payload:
+        return
+    updates = payload.get("speaker_updates", [])
+    if updates:
+        bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
+
+
+async def update_channel_summary(guild, config, history_messages, current_user_text, message):
+    excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
+    if not excerpt:
+        return
+
+    current_summary = bot.memory_store.render_channel_summary(guild.id)
+    summary_prompt = (
+        "You maintain a concise server-level channel memory.\n"
+        "Summarize the ongoing topic, key agreements/disagreements, and unresolved questions.\n"
+        "Do not repeat user-specific facts that belong in speaker memory unless they matter to the shared discussion.\n"
+        "Keep the summary dense and practical.\n\n"
+        f"Current channel memory:\n{current_summary or '(empty)'}\n\n"
+        f"Recent conversation excerpt:\n{excerpt}"
+    )
+    response_text, _, _, _ = await bot.or_client.chat_completion(
+        DEFAULT_MEMORY_MODEL,
+        [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": summary_prompt},
+        ],
+        response_format={"type": "json_schema", "json_schema": CHANNEL_SUMMARY_SCHEMA},
+        provider=build_provider_preferences(config.get("provider_policy"), strict=True),
+        require_parameter_support=True,
+        cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+            {"content": summary_prompt},
+        ]),
+    )
+    payload = coerce_json_object(response_text)
+    if payload:
+        bot.memory_store.update_channel_summary(guild.id, payload, message_id=message.id)
+
+
+async def handle_natural_image_request(message, config, history_messages, current_user_text, *, reference_inputs=None):
+    base_model_info = await bot.or_client.resolve_model_info(config["model"])
+    base_caps = bot.or_client.analyze_model_capabilities(config["model"], model_info=base_model_info)
+    generation_model, generation_source = get_active_generation_model(config, base_caps)
+    if not generation_model:
+        await message.channel.send("❌ 현재 설정에서는 채팅 이미지 생성을 사용할 수 없습니다. `/model image`로 폴백 이미지를 설정해보세요.")
+        return True
+
+    model_info, _, caps, error = await validate_model_for_use(generation_model, require_output="image")
+    if error:
+        await message.channel.send(f"❌ {error}")
+        return True
+    if reference_inputs and "image" not in caps["input"]:
+        await message.channel.send(
+            f"❌ `{model_info['id']}` 모델은 참조 이미지 입력을 지원하지 않습니다. `/model image`로 이미지 입력을 지원하는 모델을 선택해보세요."
+        )
+        return True
+
+    excerpt = build_recent_conversation_excerpt(history_messages, "")
+    prompt_parts = []
+    if excerpt:
+        prompt_parts.append(f"[Recent Conversation]\n{excerpt}")
+    prompt_parts.append(f"[Current Request]\n{current_user_text}")
+    prompt_text = "\n\n".join(part for part in prompt_parts if part)
+    content = [{"type": "text", "text": prompt_text}]
+    if reference_inputs:
+        content.extend(reference_inputs)
+
+    response, usage, images, _ = await bot.or_client.chat_completion(
+        model_info["id"],
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Generate the requested image. "
+                    "Use recent conversation only when directly relevant to the current visual request. "
+                    "Keep any text response brief."
+                ),
+            },
+            {"role": "user", "content": content},
+        ],
+        capabilities=caps,
+        provider=build_provider_preferences(config.get("provider_policy")),
+        cache_control=build_prompt_cache_control(model_info["id"], [
+            {"content": prompt_text},
+        ]),
+    )
+
+    if response and response != "...":
+        await send_long_message(message.channel, response)
+    else:
+        label = "현재 모델" if generation_source == "current-model" else "폴백 이미지 모델"
+        await message.channel.send(f"🖼️ {label} `{model_info['id']}`로 이미지 생성 완료")
+
+    async def _register(binary, ext, idx):
+        bot.recent_image_store.register_bytes(
+            message.guild.id,
+            channel_id=message.channel.id,
+            message_id=message.id,
+            author_id=bot.user.id,
+            display_name=bot.user.display_name,
+            filename=f"chat_image_{idx}.{ext}",
+            image_bytes=binary,
+            source_kind="bot_generated",
+        )
+
+    sent = await send_generated_images(message.channel.send, images, filename_prefix="chat_image", on_sent=_register)
+    if sent == 0:
+        await message.channel.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다. `/image`로 다시 시도해보세요.")
+    return True
+
 # ================= 6. 이벤트 핸들러 =================
 @tasks.loop(hours=1)
 async def refresh_models_hourly():
@@ -693,10 +1481,13 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    if message.author.bot: return
-    if not message.guild: return
+    if message.author.bot:
+        return
+    if not message.guild:
+        return
     config = bot.get_config(message.guild.id)
-    if message.channel.id != config.get("channel_id"): return
+    if message.channel.id != config.get("channel_id"):
+        return
 
     lock = bot.get_channel_lock(message.channel.id)
     async with lock:
@@ -711,55 +1502,70 @@ async def on_message(message):
                 can_see_video = "video" in caps["input"]
                 can_see_audio = "audio" in caps["input"]
                 can_gen_image = "image" in caps["output"]
-                image_command_model, image_command_source = get_active_generation_model(config, base_caps)
-                has_image_command_support = bool(image_command_model)
+                image_command_model, _ = get_active_generation_model(config, base_caps)
+                has_chat_image_support = bool(image_command_model)
+                current_member = message.guild.get_member(message.author.id) or message.author
+                bot.memory_store.touch_user(message.guild.id, message.author.id, current_member.display_name)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
 
-                # 동적 시스템 프롬프트
                 sys_prompt = SYSTEM_PROMPT
                 capability_hints = []
-                if can_see_image: capability_hints.append("You can analyze images attached by users.")
-                if can_see_video: capability_hints.append("You can analyze video files attached by users.")
-                if can_see_audio: capability_hints.append("You can analyze audio files attached by users.")
-                if can_gen_image: capability_hints.append("You can generate images when the user requests it.")
-                elif has_image_command_support:
-                    capability_hints.append("Advanced image generation or editing is available through the /image command.")
-                if config.get("search"): capability_hints.append("Web search is available for up-to-date information when needed.")
+                if can_see_image:
+                    capability_hints.append("You can analyze images attached by users.")
+                if can_see_video:
+                    capability_hints.append("You can analyze video files attached by users.")
+                if can_see_audio:
+                    capability_hints.append("You can analyze audio files attached by users.")
+                if has_chat_image_support:
+                    capability_hints.append("Chat image generation is available when the user explicitly asks you to create an image.")
+                if config.get("search"):
+                    capability_hints.append("Web search is available for up-to-date information when needed.")
 
                 cannot_hints = []
-                if not can_see_image: cannot_hints.append("analyze images")
-                if not can_see_video: cannot_hints.append("analyze videos")
-                if not can_see_audio: cannot_hints.append("analyze audio")
-                if not can_gen_image: cannot_hints.append("generate images directly in chat")
+                if not can_see_image:
+                    cannot_hints.append("analyze images")
+                if not can_see_video:
+                    cannot_hints.append("analyze videos")
+                if not can_see_audio:
+                    cannot_hints.append("analyze audio")
+                if not has_chat_image_support:
+                    cannot_hints.append("generate images in chat")
                 if cannot_hints:
-                    capability_hints.append(f"You CANNOT {', '.join(cannot_hints)}. If asked, politely tell the user to switch to a model that supports it using /model command.")
-
+                    capability_hints.append(
+                        f"You CANNOT {', '.join(cannot_hints)}. If asked, politely explain the limitation and point the user to the relevant slash command if helpful."
+                    )
                 if capability_hints:
-                    sys_prompt += "\n" + "\n".join(f"- {h}" for h in capability_hints)
+                    sys_prompt += "\n" + "\n".join(f"- {hint}" for hint in capability_hints)
 
-                messages = []
-                messages.append({"role": "system", "content": sys_prompt})
+                messages = [{"role": "system", "content": sys_prompt}]
+                memory_blocks = [
+                    bot.memory_store.render_channel_summary(message.guild.id),
+                    bot.memory_store.render_speaker_state(message.guild.id),
+                ]
+                rendered_memory = "\n\n".join(block for block in memory_blocks if block)
+                if rendered_memory:
+                    messages.append({"role": "system", "content": rendered_memory})
 
-                reset_dt = None
-                if config.get("reset_time"):
-                    reset_dt = datetime.fromisoformat(config["reset_time"])
+                reset_dt = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
-                # 히스토리 구축
                 img_count = 0
                 vid_count = 0
                 aud_count = 0
                 history_buffer = []
                 history_position = 0
-                async for msg in message.channel.history(limit=HISTORY_LIMIT + 10):
-                    if msg.id == message.id: continue
-                    if msg.id > message.id and msg.author != bot.user: continue
-                    if reset_dt and msg.created_at < reset_dt: break
 
+                async for msg in message.channel.history(limit=HISTORY_LIMIT + 10):
+                    if msg.id == message.id:
+                        continue
+                    if msg.id > message.id and msg.author != bot.user:
+                        continue
+                    if reset_dt and msg.created_at < reset_dt:
+                        break
                     if msg.author == bot.user and msg.interaction_metadata is not None:
                         continue
 
-                    is_bot = (msg.author == bot.user)
+                    is_bot = msg.author == bot.user
                     role = "assistant" if is_bot else "user"
                     content_list = []
                     cached_doc_blocks = []
@@ -775,77 +1581,57 @@ async def on_message(message):
                             if len(parts) > 1 and parts[0] in [bot.user.display_name, bot.user.name, "Bot", "Model"]:
                                 clean_content = parts[1]
                         text_content = clean_content
-                        if msg.attachments:
-                            for att in msg.attachments:
-                                ct = att.content_type or ""
-                                file_size = att.size or 0
-                                too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
-                                if ct.startswith('image') and can_see_image and img_count < IMAGE_HISTORY_LIMIT and not too_large:
-                                    b64, mime = await encode_image(att.url)
-                                    if b64:
-                                        content_list.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-                                        img_count += 1
-                                        log_history_debug(f"[HIST] 봇 이미지 히스토리 포함: {att.filename} ({len(b64)} chars)")
-                                    else:
-                                        log_history_debug(f"[HIST] 봇 이미지 인코딩 실패: {att.url[:80]}")
-                                        # 마커 없이 스킵
-                                elif ct.startswith('image'):
-                                    reason = "no_cap" if not can_see_image else f"limit({img_count}>={IMAGE_HISTORY_LIMIT})" if img_count >= IMAGE_HISTORY_LIMIT else f"too_large({file_size})"
-                                    log_history_debug(f"[HIST] 봇 이미지 스킵: {reason}")
-                                    # 마커 없이 스킵
-                                elif ct.startswith('video'):
-                                    text_content += "\n(Bot generated a video here)"
+                        for att in msg.attachments:
+                            ct = att.content_type or ""
+                            if ct.startswith("image"):
+                                text_content += f"\n(Bot sent an image: {att.filename})"
+                            elif ct.startswith("video"):
+                                text_content += "\n(Bot generated a video here)"
                     else:
-                        _member = message.guild.get_member(msg.author.id) or msg.author
-                        text_content = f"[사용자:{_member.display_name}|ID:{msg.author.id}]: {msg.content}"
+                        history_member = message.guild.get_member(msg.author.id) or msg.author
+                        text_content = f"[사용자:{history_member.display_name}|ID:{msg.author.id}]: {msg.content}"
+                        for att in msg.attachments:
+                            ct = att.content_type or ""
+                            file_size = att.size or 0
+                            too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
 
-                        if msg.attachments:
-                            for att in msg.attachments:
-                                ct = att.content_type or ""
-                                file_size = att.size or 0
-                                too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
-
-                                if ct.startswith('image') and can_see_image and img_count < IMAGE_HISTORY_LIMIT and not too_large:
-                                    b64, mime = await encode_image(att.url)
-                                    if b64:
-                                        content_list.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-                                        img_count += 1
-                                    else:
-                                        text_content += f"\n(User attached an image: {att.filename})"
-                                elif ct.startswith('video') and can_see_video and vid_count < VIDEO_HISTORY_LIMIT and not too_large:
-                                    b64, mime = await encode_image(att.url)
-                                    if b64:
-                                        content_list.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
-                                        vid_count += 1
-                                    else:
-                                        text_content += f"\n(User attached a video: {att.filename})"
-                                elif ct.startswith('audio') and can_see_audio and aud_count < AUDIO_HISTORY_LIMIT and not too_large:
-                                    b64, _ = await encode_image(att.url)
-                                    if b64:
-                                        fmt = att.filename.rsplit('.', 1)[-1].lower() if '.' in att.filename else 'mp3'
-                                        content_list.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
-                                        aud_count += 1
-                                    else:
-                                        text_content += f"\n(User attached an audio file: {att.filename})"
-                                elif att.filename.endswith(SUPPORTED_EXTENSIONS) and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
-                                    try:
-                                        raw_bytes = await att.read()
-                                        for enc in ['utf-8', 'cp949', 'latin1']:
-                                            try:
-                                                decoded = raw_bytes.decode(enc)
-                                                text_content += f"\n[File: {att.filename}]\n{decoded}"
-                                                break
-                                            except: continue
-                                    except: pass
+                            if ct.startswith("image"):
+                                text_content += f"\n(User attached an image: {att.filename})"
+                            elif ct.startswith("video") and can_see_video and vid_count < VIDEO_HISTORY_LIMIT and not too_large:
+                                b64, mime = await encode_image(att.url)
+                                if b64:
+                                    content_list.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
+                                    vid_count += 1
                                 else:
-                                    if ct.startswith('image'): text_content += f"\n(User attached an image: {att.filename})"
-                                    elif ct.startswith('video'): text_content += f"\n(User attached a video: {att.filename})"
-                                    elif ct.startswith('audio'): text_content += f"\n(User attached an audio file: {att.filename})"
+                                    text_content += f"\n(User attached a video: {att.filename})"
+                            elif ct.startswith("audio") and can_see_audio and aud_count < AUDIO_HISTORY_LIMIT and not too_large:
+                                b64, _ = await encode_image(att.url)
+                                if b64:
+                                    fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
+                                    content_list.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
+                                    aud_count += 1
+                                else:
+                                    text_content += f"\n(User attached an audio file: {att.filename})"
+                            else:
+                                extracted_text, doc_type = await extract_attachment_text(att)
+                                if extracted_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
+                                    bot.doc_cache.store_document("text_file", att.filename, extracted_text, msg.id, msg.channel.id)
+                                    text_content += f"\n\n[Attached File Content: {att.filename}]\n```\n{extracted_text}\n```"
+                                elif too_large:
+                                    media_type = ct.split("/")[0] if "/" in ct else "file"
+                                    text_content += f"\n(User attached a {media_type} file: {att.filename}, but it was too large to inline.)"
+                                elif ct.startswith("image"):
+                                    text_content += f"\n(User attached an image: {att.filename})"
+                                elif ct.startswith("video"):
+                                    text_content += f"\n(User attached a video: {att.filename})"
+                                elif ct.startswith("audio"):
+                                    text_content += f"\n(User attached an audio file: {att.filename})"
+                                elif doc_type:
+                                    text_content += f"\n(User attached a {doc_type} file: {att.filename})"
 
                     if cached_doc_blocks:
                         text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
 
-                    # 봇 메시지인데 텍스트도 없고 이미지도 없으면 히스토리 제외
                     if is_bot and not text_content.strip() and len(content_list) == 0:
                         continue
                     content_list.append({"type": "text", "text": text_content})
@@ -854,20 +1640,26 @@ async def on_message(message):
 
                 messages.extend(history_buffer)
 
-                # 현재 메시지 처리
                 current_content = []
-                _cur_member = message.guild.get_member(message.author.id) or message.author
-                user_text = f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}"
+                current_image_inputs = []
+                user_text = f"[사용자:{current_member.display_name}|ID:{message.author.id}]: {message.content}"
+                unresolved_urls = []
 
-                # URL 웹 스크래핑
-                urls = re.findall(r'(https?://\S+)', message.content)
+                urls = re.findall(r"(https?://\S+)", message.content)
                 for url in urls:
+                    if url.lower().endswith(".pdf"):
+                        unresolved_urls.append(url)
+                        continue
                     web_content = await scrap_webpage(url)
                     if web_content:
                         doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
                         print(f"[CACHE] webpage 저장: {doc_id} ({url})")
-                        user_text += f"\n\n[Webpage Content: {url}]\n```\n{web_content}\n```"
+                        user_text += f"\n\n[Webpage Content: {url}]\n```\n{trim_document_text(web_content)}\n```"
                         print(f"[WEB] 웹사이트 내용 읽음: {url}")
+                    else:
+                        unresolved_urls.append(url)
+                if unresolved_urls:
+                    user_text += "\n\n[Use web fetch if needed]\n" + "\n".join(unresolved_urls)
 
                 has_media = False
                 if message.attachments:
@@ -877,50 +1669,121 @@ async def on_message(message):
                         too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
                         print(f"[ATT] {att.filename} ct={ct} size={file_size} can_see_image={can_see_image} too_large={too_large}")
 
-                        if ct.startswith('image') and can_see_image and not too_large:
-                            b64, mime = await encode_image(att.url)
-                            if b64:
-                                current_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                        if ct.startswith("image") and not too_large:
+                            raw, mime = await download_binary(att.url)
+                            if raw:
+                                b64 = base64.b64encode(raw).decode("utf-8")
+                                image_part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                                current_image_inputs.append(image_part)
+                                if can_see_image:
+                                    current_content.append(image_part)
+                                    has_media = True
                                 print(f"[ATT] 이미지 base64 인코딩 완료: {att.filename} ({len(b64)} chars)")
-                                has_media = True
-                        elif ct.startswith('video') and can_see_video and not too_large:
+                                bot.recent_image_store.register_bytes(
+                                    message.guild.id,
+                                    channel_id=message.channel.id,
+                                    message_id=message.id,
+                                    author_id=message.author.id,
+                                    display_name=current_member.display_name,
+                                    filename=att.filename,
+                                    image_bytes=raw,
+                                    source_kind="user_upload",
+                                )
+                                if not can_see_image:
+                                    user_text += f"\n(User attached an image: {att.filename})"
+                            else:
+                                user_text += f"\n(User attached an image: {att.filename})"
+                        elif ct.startswith("video") and can_see_video and not too_large:
                             b64, mime = await encode_image(att.url)
                             if b64:
                                 current_content.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
                                 has_media = True
-                        elif ct.startswith('audio') and can_see_audio and not too_large:
+                            else:
+                                user_text += f"\n(User attached a video: {att.filename})"
+                        elif ct.startswith("audio") and can_see_audio and not too_large:
                             b64, _ = await encode_image(att.url)
                             if b64:
-                                fmt = att.filename.rsplit('.', 1)[-1].lower() if '.' in att.filename else 'mp3'
+                                fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
                                 current_content.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
                                 has_media = True
-                        elif att.filename.endswith(SUPPORTED_EXTENSIONS):
-                             try:
-                                raw_bytes = await att.read()
-                                for enc in ['utf-8', 'cp949', 'latin1']:
-                                    try:
-                                        decoded = raw_bytes.decode(enc)
-                                        doc_id = bot.doc_cache.store_document("text_file", att.filename, decoded, message.id, message.channel.id)
-                                        print(f"[CACHE] text file 저장: {doc_id} ({att.filename})")
-                                        user_text += f"\n[Current File: {att.filename}]\n{decoded}"
-                                        break
-                                    except: continue
-                             except: pass
+                            else:
+                                user_text += f"\n(User attached an audio file: {att.filename})"
+                        else:
+                            extracted_text, doc_type = await extract_attachment_text(att)
+                            if extracted_text:
+                                doc_id = bot.doc_cache.store_document("text_file", att.filename, extracted_text, message.id, message.channel.id)
+                                print(f"[CACHE] {doc_type or 'text'} file 저장: {doc_id} ({att.filename})")
+                                user_text += f"\n\n[Attached File Content: {att.filename}]\n```\n{extracted_text}\n```"
+                            elif too_large:
+                                media_type = ct.split("/")[0] if "/" in ct else "file"
+                                user_text += f"\n(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024 * 1024)}MB)"
+                            elif ct.startswith("image"):
+                                user_text += f"\n(User attached an image: {att.filename})"
 
-                        if too_large:
-                            media_type = ct.split('/')[0] if '/' in ct else 'file'
-                            user_text += f"\n(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024*1024)}MB)"
+                route = await decide_message_action(
+                    config,
+                    history_buffer,
+                    user_text,
+                    message.guild.id,
+                    has_current_images=bool(current_image_inputs),
+                )
+
+                if route.get("action") == "generate_image":
+                    reference_inputs = list(current_image_inputs)
+                    if not reference_inputs and route.get("use_recent_images"):
+                        reference_inputs = await load_recent_image_inputs(message.guild.id)
+                    handled = await handle_natural_image_request(
+                        message,
+                        config,
+                        history_buffer,
+                        route.get("refined_prompt") or message.content,
+                        reference_inputs=reference_inputs,
+                    )
+                    if handled:
+                        await update_speaker_memory(message.guild, config, history_buffer, user_text, message)
+                        await update_channel_summary(message.guild, config, history_buffer, user_text, message)
+                        return
+
+                if route.get("action") == "inspect_recent_images" and not current_image_inputs and route.get("use_recent_images"):
+                    if not can_see_image:
+                        await message.channel.send(
+                            f"❌ `{current_model}` 모델은 과거 이미지를 다시 분석할 수 없습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
+                        )
+                        return
+                    current_content = (await load_recent_image_inputs(message.guild.id)) + current_content
 
                 current_content.append({"type": "text", "text": user_text})
                 messages.append({"role": "user", "content": current_content})
 
-                # API 호출
+                chat_tools = []
+                if unresolved_urls:
+                    chat_tools.append(
+                        {
+                            "type": "openrouter:web_fetch",
+                            "parameters": {
+                                "engine": "auto",
+                                "max_uses": min(10, len(unresolved_urls)),
+                                "max_content_tokens": 12000,
+                            },
+                        }
+                    )
+
+                provider_prefs = build_provider_preferences(
+                    config.get("provider_policy"),
+                    strict=bool(chat_tools or config.get("search")),
+                )
+                cache_control = build_prompt_cache_control(current_model, messages)
+
                 try:
-                    response, usage, images = await bot.or_client.chat_completion(
+                    response, usage, images, full_data = await bot.or_client.chat_completion(
                         current_model,
                         messages,
                         capabilities=caps,
                         enable_web_search=config.get("search", False),
+                        tools=chat_tools or None,
+                        provider=provider_prefs,
+                        require_parameter_support=bool(chat_tools or config.get("search")),
+                        cache_control=cache_control,
                     )
                 except Exception as e:
                     err_msg = str(e).lower()
@@ -929,14 +1792,13 @@ async def on_message(message):
                         await bot.or_client.fetch_models_metadata()
                         await message.channel.send(
                             f"❌ `{current_model}` 모델은 현재 OpenRouter에서 실제 endpoint를 찾지 못했습니다.\n"
-                            f"목록과 실제 라우팅 상태가 어긋났을 수 있으니 `/refresh_models` 후 `/model`로 다시 선택해보세요."
+                            f"목록과 실제 라우팅 상태가 어긋났을 수 있으니 `/refresh_models` 후 `/model set`으로 다시 선택해보세요."
                         )
                         return
 
-                    # 이미지 관련 400: 현재 메시지 미디어 없어도 히스토리 이미지가 원인일 수 있음
                     has_any_media = has_media or any(
-                        isinstance(m.get('content'), list) and
-                        any(p.get('type') in ('image_url', 'video_url', 'input_audio') for p in m['content'])
+                        isinstance(m.get("content"), list)
+                        and any(part.get("type") in ("image_url", "video_url", "input_audio") for part in m["content"])
                         for m in messages
                     )
                     media_error_markers = (
@@ -959,44 +1821,63 @@ async def on_message(message):
                         "'choices'",
                     )
                     is_media_error = has_any_media and any(marker in err_msg for marker in media_error_markers)
-                    if is_media_error and has_any_media:
-                        print(f"⚠️ [Media Error] {current_model}: 텍스트 모드로 전환.")
-                        await message.channel.send(f"⚠️ `{current_model}` 모델이 미디어를 처리하지 못했습니다. 텍스트 모드로 재시도합니다.")
-                        for m in messages:
-                            if isinstance(m['content'], list):
-                                m['content'] = [c for c in m['content'] if c.get('type') == 'text']
-                        if has_media:
-                            last_msg = messages[-1]
-                            if isinstance(last_msg['content'], list):
-                                for part in last_msg['content']:
-                                    if part.get('type') == 'text':
-                                        part['text'] += "\n(System: 미디어 첨부가 있었으나 이 모델이 처리하지 못했습니다.)"
-                                        break
-                        response, usage, images = await bot.or_client.chat_completion(
-                            current_model,
-                            messages,
-                            enable_web_search=config.get("search", False),
-                        )
-                    else:
+                    if not is_media_error:
                         raise e
+
+                    print(f"⚠️ [Media Error] {current_model}: 텍스트 모드로 전환.")
+                    await message.channel.send(f"⚠️ `{current_model}` 모델이 미디어를 처리하지 못했습니다. 텍스트 모드로 재시도합니다.")
+                    for payload in messages:
+                        if isinstance(payload.get("content"), list):
+                            payload["content"] = [part for part in payload["content"] if part.get("type") == "text"]
+                    if has_media and isinstance(messages[-1].get("content"), list):
+                        for part in messages[-1]["content"]:
+                            if part.get("type") == "text":
+                                part["text"] += "\n(System: 미디어 첨부가 있었으나 이 모델이 처리하지 못했습니다.)"
+                                break
+                    response, usage, images, full_data = await bot.or_client.chat_completion(
+                        current_model,
+                        messages,
+                        enable_web_search=config.get("search", False),
+                        tools=chat_tools or None,
+                        provider=provider_prefs,
+                        require_parameter_support=bool(chat_tools or config.get("search")),
+                        cache_control=cache_control,
+                    )
 
                 if response.startswith(f"{bot.user.display_name}:"):
                     response = response.replace(f"{bot.user.display_name}:", "", 1).strip()
 
-                total_tokens = usage.get('total_tokens', 'N/A')
-                log_time = datetime.now().strftime('%H:%M:%S')
+                total_tokens = usage.get("total_tokens", "N/A")
+                prompt_details = usage.get("prompt_tokens_details", {}) if isinstance(usage, dict) else {}
+                cached_tokens = prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
+                log_time = datetime.now().strftime("%H:%M:%S")
 
-                print(f"[{log_time}] [{message.guild.name}]{message.author.display_name}: {message.content}")
-                print(f"봇({current_model}): {response} (Tokens: {total_tokens})")
+                print(f"[{log_time}] [{message.guild.name}] {message.author.display_name}: {message.content}")
+                print(f"봇({current_model}): {response} (Tokens: {total_tokens}, Cached: {cached_tokens})")
                 if images:
                     print(f"  [이미지 생성]: {len(images)}장")
+                if isinstance(full_data, dict) and full_data.get("provider"):
+                    print(f"  [provider] {full_data.get('provider')}")
                 print("-------")
 
                 if response:
                     await send_long_message(message.channel, response)
+                async def _register(binary, ext, idx):
+                    bot.recent_image_store.register_bytes(
+                        message.guild.id,
+                        channel_id=message.channel.id,
+                        message_id=message.id,
+                        author_id=bot.user.id,
+                        display_name=bot.user.display_name,
+                        filename=f"response_image_{idx}.{ext}",
+                        image_bytes=binary,
+                        source_kind="bot_generated",
+                    )
 
-                # 생성된 이미지 전송
-                await send_generated_images(message.channel.send, images)
+                await send_generated_images(message.channel.send, images, on_sent=_register)
+
+                await update_speaker_memory(message.guild, config, history_buffer, user_text, message)
+                await update_channel_summary(message.guild, config, history_buffer, user_text, message)
 
             except Exception as e:
                 print(f"❌ 오류: {str(e)}")
@@ -1013,7 +1894,12 @@ async def image_generation_model_autocomplete(interaction: discord.Interaction, 
         predicate=lambda m: "image" in bot.or_client.analyze_model_capabilities(m["id"], model_info=m)["output"],
     )
 
-@bot.tree.command(name="model", description="사용할 AI 모델 변경")
+model_group = app_commands.Group(name="model", description="모델 관련 설정")
+reset_group = app_commands.Group(name="reset", description="메모리/맥락 초기화")
+provider_group = app_commands.Group(name="provider", description="프로바이더 라우팅 설정")
+
+
+@model_group.command(name="set", description="기본 채팅 모델 변경")
 @app_commands.autocomplete(model_id=model_autocomplete)
 @app_commands.describe(model_id="모델 이름 검색")
 async def set_model(interaction: discord.Interaction, model_id: str):
@@ -1040,7 +1926,7 @@ async def set_model(interaction: discord.Interaction, model_id: str):
         ephemeral=True,
     )
 
-@bot.tree.command(name="fallbackmodel", description="고급용 이미지 폴백 모델 설정")
+@model_group.command(name="image", description="채팅/고급 이미지 생성용 폴백 모델 설정")
 @app_commands.autocomplete(model_id=image_generation_model_autocomplete)
 @app_commands.describe(model_id="이미지 생성 폴백 모델 ID 또는 clear")
 async def set_fallback_model(interaction: discord.Interaction, model_id: str):
@@ -1067,6 +1953,39 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
         ephemeral=True,
     )
 
+
+@reset_group.command(name="speaker", description="화자 상태 메모리만 초기화")
+async def reset_speaker_state(interaction: discord.Interaction):
+    bot.memory_store.clear_speaker_state(interaction.guild_id)
+    await interaction.response.send_message("🧼 화자 상태 메모리를 초기화했습니다.", ephemeral=True)
+
+
+@reset_group.command(name="context", description="채널 요약 메모리와 원문 기준 시점을 초기화")
+async def reset_context(interaction: discord.Interaction):
+    config = bot.get_config(interaction.guild_id)
+    config["reset_time"] = datetime.now(timezone.utc).isoformat()
+    bot.save_config()
+    bot.memory_store.clear_context(interaction.guild_id)
+    await interaction.response.send_message("🧹 채널 요약 메모리와 원문 기준 시점을 초기화했습니다.", ephemeral=True)
+
+
+@provider_group.command(name="policy", description="기본 프로바이더 라우팅 정책 설정")
+@app_commands.choices(
+    policy=[
+        app_commands.Choice(name="cheap", value="cheap"),
+        app_commands.Choice(name="balanced", value="balanced"),
+        app_commands.Choice(name="stable", value="stable"),
+    ]
+)
+async def set_provider_policy(interaction: discord.Interaction, policy: app_commands.Choice[str]):
+    config = bot.get_config(interaction.guild_id)
+    config["provider_policy"] = policy.value
+    bot.save_config()
+    await interaction.response.send_message(
+        f"✅ 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
+        ephemeral=True,
+    )
+
 @bot.tree.command(name="dashboard", description="현재 모델 스펙 확인")
 async def dashboard(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -1083,6 +2002,9 @@ async def dashboard(interaction: discord.Interaction):
     caps = bot.or_client.analyze_model_capabilities(curr_model, model_info=model_meta)
     is_multimodal = len(caps["input"]) > 1 or len(caps["output"]) > 1
     endpoints = await bot.or_client.fetch_model_endpoints(curr_model)
+    server_memory = bot.memory_store.get_server(interaction.guild_id)
+    speaker_users = len(server_memory.get("speaker_state", {}))
+    has_summary = bool(server_memory.get("channel_summary", {}).get("summary"))
 
     color = 0x00bcd4 if is_multimodal else 0x4caf50
     embed = discord.Embed(title="🎛️ OpenRouter Dashboard", color=color)
@@ -1124,7 +2046,10 @@ async def dashboard(interaction: discord.Interaction):
 
     helpers = [
         f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
-        f"• **Image Command:** {image_command_status}",
+        f"• **Chat Image:** {image_command_status}",
+        f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
+        f"• **Speaker Memory:** {speaker_users} users",
+        f"• **Channel Summary:** {'SET' if has_summary else 'EMPTY'}",
         f"• **Model Source:** `{bot.or_client.models_source}`",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
@@ -1142,13 +2067,6 @@ async def set_channel(interaction: discord.Interaction):
     config["channel_id"] = interaction.channel_id
     bot.save_config()
     await interaction.response.send_message(f"✅ 활성 채널: {interaction.channel.name}")
-
-@bot.tree.command(name="reset", description="대화 초기화")
-async def reset(interaction: discord.Interaction):
-    config = bot.get_config(interaction.guild_id)
-    config["reset_time"] = datetime.now(timezone.utc).isoformat()
-    bot.save_config()
-    await interaction.response.send_message("🧹 대화 맥락 초기화 완료")
 
 @bot.tree.command(name="search", description="웹 검색 기능 ON/OFF")
 async def toggle_search(interaction: discord.Interaction):
@@ -1186,7 +2104,7 @@ async def generate_image_cmd(
 
     if not generation_model:
         await interaction.followup.send(
-            "❌ 현재 설정에서는 `/image`를 사용할 수 없습니다. 이미지 출력을 지원하는 `/model`을 선택해보세요."
+            "❌ 현재 설정에서는 `/image`를 사용할 수 없습니다. 이미지 출력을 지원하는 `/model set` 또는 `/model image`를 설정해보세요."
         )
         return
 
@@ -1226,11 +2144,14 @@ async def generate_image_cmd(
         {"role": "user", "content": content},
     ]
 
-    response, usage, images = await bot.or_client.chat_completion(
+    response, usage, images, _ = await bot.or_client.chat_completion(
         model_info["id"],
         messages,
         capabilities=caps,
         image_config=build_image_config(aspect_ratio=aspect_ratio, image_size=image_size),
+        provider=build_provider_preferences(config.get("provider_policy")),
+        require_parameter_support=True,
+        cache_control=build_prompt_cache_control(model_info["id"], messages),
     )
 
     if response and response != "...":
@@ -1242,7 +2163,19 @@ async def generate_image_cmd(
     total_tokens = usage.get("total_tokens", "N/A")
     await interaction.followup.send(f"{summary}\n(Tokens: {total_tokens})")
 
-    sent = await send_generated_images(interaction.followup.send, images, filename_prefix="image")
+    async def _register(binary, ext, idx):
+        bot.recent_image_store.register_bytes(
+            interaction.guild_id,
+            channel_id=interaction.channel_id,
+            message_id=interaction.id,
+            author_id=bot.user.id,
+            display_name=bot.user.display_name,
+            filename=f"image_{idx}.{ext}",
+            image_bytes=binary,
+            source_kind="bot_generated",
+        )
+
+    sent = await send_generated_images(interaction.followup.send, images, filename_prefix="image", on_sent=_register)
     if sent == 0:
         await interaction.followup.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다.")
 
@@ -1261,6 +2194,10 @@ async def refresh_models_cmd(interaction: discord.Interaction):
         delta = after - before
         sign = "+" if delta > 0 else ""
         await interaction.followup.send(f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) | source={source}", ephemeral=True)
+
+bot.tree.add_command(model_group)
+bot.tree.add_command(reset_group)
+bot.tree.add_command(provider_group)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)

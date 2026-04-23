@@ -14,6 +14,9 @@ NRGemini/sb/
 # 문서 캐시 (로컬/볼륨에서 관리)
 NRGemini/gemini_doc_cache/
 NRLLM/llm_doc_cache/
+NRLLM/llm_memory.json
+NRGemini/gemini_recent_images/
+NRLLM/llm_recent_images/
 
 # Node 로컬 의존성
 NRStayVC/node_modules/

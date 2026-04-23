@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+import csv
 import mafic
 from google import genai
 from google.genai import types
@@ -9,6 +10,7 @@ import json
 import os
 import asyncio
 import aiohttp
+import hashlib
 import io
 import warnings
 import re
@@ -20,6 +22,21 @@ from PIL import Image
 from datetime import datetime, timedelta, timezone
 import glob as glob_module
 import unicodedata
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.genai._api_client")
 
@@ -71,6 +88,11 @@ IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro"]["image"]
 DEFAULT_HISTORY_LIMIT = 100
 IMAGE_SEARCH_LIMIT = 2
 MAX_REF_IMAGES = 1
+MAX_DOC_CHARS = 12000
+TEXT_ATTACHMENT_EXTENSIONS = (
+    ".txt", ".py", ".json", ".md", ".c", ".cpp", ".js", ".html", ".css",
+    ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
+)
 MODEL_HISTORY_LIMITS = {
     AVAILABLE_MODELS["3.1-pro"]["text"]: 20,
     AVAILABLE_MODELS["3-flash"]["text"]: 50,
@@ -106,14 +128,6 @@ You are an AI member of this Discord server.
 - You may briefly reference a previous topic AT MOST once if naturally relevant, then move on entirely.
 
 {_COMMON_RULES}
-
-## Image Generation Tool (`generate_image`)
-- Use this tool when the user wants visual content (image/picture/illustration).
-- `ref_count` — how many previous images to reference:
-  - 0 = new image (DEFAULT — use this unless the user is clearly asking to modify the existing image)
-  - 1 = modify/refine the most recent image (use ONLY when user explicitly asks to change/adjust/modify the existing image, e.g. "수정해줘", "좀 더 X하게 바꿔줘")
-- NEVER write image placeholders like `[이미지 첨부됨]` or `(Bot generated an image here)` as your reply. Always call the tool.
-- If the tool is unavailable, say so explicitly.
 """
 
 CHAT_SYSTEM_PROMPT = f"""
@@ -138,6 +152,9 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("GEMINI_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_doc_cache"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
+RECENT_IMAGE_DIR = os.environ.get("GEMINI_RECENT_IMAGE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_recent_images"))
+RECENT_IMAGE_INDEX_FILE = os.path.join(RECENT_IMAGE_DIR, "index.json")
+RECENT_IMAGE_LIMIT = 2
 
 SOUND_DIR = os.path.join(BASE_DIR, "sb")
 SOUND_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.weba')
@@ -146,7 +163,9 @@ os.makedirs(os.path.join(SOUND_DIR, "discord"), exist_ok=True)
 SOUND_VOLUME = 0.15  # 기본 볼륨 (0.0~1.0)
 SIBO_LATENCY_COMP = 0.0  # Discord 전송 지연 보정 (초)
 SIBO_PRELOAD_LEAD = 0.3  # 정각 전 ffmpeg 미리 띄워 파이프 버퍼 채우는 시간 (초)
-LAVALINK_POST_CONNECT_GRACE = 0.35  # Lavalink 최초 연결 직후 첫 재생 앞머리 손실 완충
+LAVALINK_POST_CONNECT_GRACE = 0.50  # Lavalink 최초 연결 직후 첫 재생 앞머리 손실 완충
+LAVALINK_SHORT_CLIP_PAD_MS = 220
+LAVALINK_SIBO_PAD_MS = 120
 VOICE_RECONNECT_DELAY = 3.0
 VOICE_STATE_REJOIN_DELAY = 8.0
 VOICE_RECONNECT_COOLDOWN = 20.0
@@ -616,13 +635,46 @@ async def temp_followup(interaction, content, delay=5):
     except Exception:
         pass
 
-async def play_lavalink_local_sound(player, filepath, volume, *, replace=True):
+
+async def ensure_lavalink_lead_in(filepath, lead_in_ms):
+    if lead_in_ms <= 0:
+        return filepath
+    src = Path(filepath)
+    cache_dir = Path(tempfile.gettempdir()) / "gemini_lavalink_pad"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    file_stamp = f"{src.resolve()}::{src.stat().st_mtime_ns}::{lead_in_ms}"
+    digest = hashlib.sha1(file_stamp.encode("utf-8")).hexdigest()[:16]
+    output_path = cache_dir / f"{src.stem}_lead_{lead_in_ms}_{digest}.wav"
+    if output_path.exists():
+        return str(output_path)
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-af",
+        f"adelay={lead_in_ms}:all=1",
+        str(output_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        err = stderr.decode("utf-8", errors="ignore").strip()
+        print(f"[LAVALINK] 선행 무음 패딩 생성 실패: {err}")
+        return filepath
+    return str(output_path)
+
+
+async def play_lavalink_local_sound(player, filepath, volume, *, replace=True, lead_in_ms=0):
     guild = getattr(player, "guild", None)
     if guild is not None:
         connected_age = bot.get_voice_connected_age(guild.id)
         if connected_age is not None and connected_age < LAVALINK_POST_CONNECT_GRACE:
             await asyncio.sleep(LAVALINK_POST_CONNECT_GRACE - connected_age)
-    identifier = build_lavalink_local_identifier(filepath)
+    playback_path = await ensure_lavalink_lead_in(filepath, lead_in_ms)
+    identifier = build_lavalink_local_identifier(playback_path)
     await player.play(
         identifier,
         volume=max(0, min(1000, int(volume * 100))),
@@ -659,7 +711,13 @@ async def play_sound_in_vc(guild, member, sound_name, bot_instance):
         await voice_stop(vc)
 
     if is_lavalink_player(vc):
-        await play_lavalink_local_sound(vc, filepath, bot_instance.sound_volume, replace=True)
+        await play_lavalink_local_sound(
+            vc,
+            filepath,
+            bot_instance.sound_volume,
+            replace=True,
+            lead_in_ms=LAVALINK_SHORT_CLIP_PAD_MS,
+        )
         return True, f"**{sound_name}** 재생 중 (Lavalink, vol {int(bot_instance.sound_volume * 100)}%)"
 
     audio = discord.PCMVolumeTransformer(
@@ -698,6 +756,92 @@ class DataManager:
         try:
             with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2, ensure_ascii=False)
         except: pass
+
+
+IMAGE_ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["respond_text", "inspect_recent_images", "generate_image"],
+        },
+        "refined_prompt": {"type": "string"},
+        "use_recent_images": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["action", "refined_prompt", "use_recent_images", "reason"],
+}
+
+
+class RecentImageStore:
+    def __init__(self, base_dir, index_file, *, limit=2):
+        self.base_dir = base_dir
+        self.index_file = index_file
+        self.limit = limit
+        os.makedirs(self.base_dir, exist_ok=True)
+        self.index = DataManager.load_json(self.index_file, {})
+
+    def _save(self):
+        DataManager.save_json(self.index_file, self.index)
+
+    def _entries(self, guild_id):
+        gid = str(guild_id)
+        entries = self.index.get(gid, [])
+        if not isinstance(entries, list):
+            entries = []
+        self.index[gid] = entries
+        return entries
+
+    def register_bytes(self, guild_id, *, channel_id, message_id, author_id, display_name, filename, image_bytes, source_kind):
+        gid = str(guild_id)
+        guild_dir = os.path.join(self.base_dir, gid)
+        os.makedirs(guild_dir, exist_ok=True)
+        ext = os.path.splitext(filename or "")[1].lower() or ".png"
+        safe_kind = re.sub(r"[^a-z0-9_]+", "_", (source_kind or "image").lower())
+        safe_name = re.sub(r"[^a-z0-9_]+", "_", Path(filename or "image").stem.lower()).strip("_") or "image"
+        output_name = f"{int(message_id)}_{safe_kind}_{safe_name}{ext}"
+        output_path = os.path.join(guild_dir, output_name)
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
+
+        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
+        entries = [entry for entry in entries if entry.get("path") != output_path]
+        entries.append(
+            {
+                "guild_id": int(guild_id),
+                "channel_id": int(channel_id),
+                "message_id": int(message_id),
+                "author_id": int(author_id),
+                "display_name": display_name or str(author_id),
+                "filename": filename or output_name,
+                "path": output_path,
+                "source_kind": source_kind,
+                "created_at": datetime.now(KST).isoformat(),
+            }
+        )
+        while len(entries) > self.limit:
+            old = entries.pop(0)
+            try:
+                os.remove(old.get("path", ""))
+            except OSError:
+                pass
+        self.index[gid] = entries
+        self._save()
+
+    def list_recent(self, guild_id):
+        gid = str(guild_id)
+        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
+        self.index[gid] = entries
+        return entries[-self.limit:]
+
+    def describe_recent(self, guild_id):
+        entries = self.list_recent(guild_id)
+        if not entries:
+            return "No recent images are stored."
+        return "\n".join(
+            f"{idx}. {entry.get('source_kind', 'image')} | {entry.get('display_name', 'unknown')} | {entry.get('filename', 'image')}"
+            for idx, entry in enumerate(reversed(entries), start=1)
+        )
 
 class DocumentCache:
     def __init__(self, cache_dir):
@@ -814,6 +958,196 @@ class DocumentCache:
                 title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
                 blocks.append(f"[{title}: {doc_id} | {label}]")
         return blocks
+
+
+def trim_document_text(text, limit=MAX_DOC_CHARS):
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "\n...[truncated]..."
+
+
+def decode_text_bytes(raw_bytes):
+    for encoding in ("utf-8", "cp949", "latin1"):
+        try:
+            return raw_bytes.decode(encoding)
+        except Exception:
+            continue
+    return None
+
+
+def extract_pdf_text(raw_bytes):
+    if PdfReader is None:
+        return None
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        parts = []
+        for page in reader.pages[:20]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return trim_document_text("\n\n".join(part for part in parts if part.strip()))
+    except Exception:
+        return None
+
+
+def extract_docx_text(raw_bytes):
+    if DocxDocument is None:
+        return None
+    try:
+        document = DocxDocument(io.BytesIO(raw_bytes))
+        paragraphs = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+        return trim_document_text("\n".join(paragraphs))
+    except Exception:
+        return None
+
+
+def extract_xlsx_text(raw_bytes):
+    if load_workbook is None:
+        return None
+    try:
+        workbook = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        blocks = []
+        for sheet in workbook.worksheets[:5]:
+            rows = []
+            for row in sheet.iter_rows(max_row=50, values_only=True):
+                cells = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                blocks.append(f"[Sheet: {sheet.title}]\n" + "\n".join(rows))
+        workbook.close()
+        return trim_document_text("\n\n".join(blocks))
+    except Exception:
+        return None
+
+
+def extract_csv_text(raw_bytes, delimiter=","):
+    decoded = decode_text_bytes(raw_bytes)
+    if not decoded:
+        return None
+    try:
+        reader = csv.reader(io.StringIO(decoded), delimiter=delimiter)
+        rows = []
+        for idx, row in enumerate(reader):
+            if idx >= 100:
+                break
+            cells = [cell.strip() for cell in row if cell and cell.strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+        return trim_document_text("\n".join(rows))
+    except Exception:
+        return trim_document_text(decoded)
+
+
+async def extract_attachment_text(att):
+    filename = (att.filename or "").lower()
+    raw_bytes = await att.read()
+
+    if filename.endswith(".pdf"):
+        return extract_pdf_text(raw_bytes), "pdf"
+    if filename.endswith(".docx"):
+        return extract_docx_text(raw_bytes), "docx"
+    if filename.endswith(".xlsx"):
+        return extract_xlsx_text(raw_bytes), "xlsx"
+    if filename.endswith(".csv"):
+        return extract_csv_text(raw_bytes, delimiter=","), "csv"
+    if filename.endswith(".tsv"):
+        return extract_csv_text(raw_bytes, delimiter="\t"), "tsv"
+    if filename.endswith(TEXT_ATTACHMENT_EXTENSIONS):
+        decoded = decode_text_bytes(raw_bytes)
+        if decoded:
+            return trim_document_text(decoded), "text"
+    return None, None
+
+
+async def load_recent_image_parts(guild_id, *, limit=RECENT_IMAGE_LIMIT):
+    parts = []
+    for entry in reversed(bot.recent_image_store.list_recent(guild_id)[-limit:]):
+        try:
+            with open(entry["path"], "rb") as f:
+                raw = f.read()
+            ext = os.path.splitext(entry.get("filename", ""))[1].lower()
+            mime = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+            }.get(ext, "image/png")
+            parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=raw)))
+        except Exception as e:
+            print(f"[IMG] 최근 이미지 로드 실패: {e}")
+    return parts
+
+
+def build_recent_image_hint(guild_id):
+    recent_desc = bot.recent_image_store.describe_recent(guild_id)
+    return (
+        "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
+        f"{recent_desc}"
+    )
+
+
+async def route_message_action(last_user_msg, *, guild_id, has_current_images=False, text_model=None):
+    if not CLIENT:
+        return {
+            "action": "respond_text",
+            "refined_prompt": "",
+            "use_recent_images": False,
+            "reason": "client unavailable",
+        }
+    if text_model is None:
+        text_model = TEXT_MODEL
+
+    prompt = f"""
+You are a routing planner for a Discord AI bot.
+Decide the next action for the assistant.
+
+Available actions:
+- respond_text: normal text reply.
+- inspect_recent_images: the user is asking about a previously seen image and the app should reattach the recent stored images before answering.
+- generate_image: the user wants a new image or wants to edit/transform an image. In this case, write a refined English prompt for the image model.
+
+Rules:
+- Do not choose inspect_recent_images if the current message already includes image attachments.
+- Do not choose generate_image unless the user clearly wants image creation or visual transformation/editing.
+- If the user is asking a factual question about a past image, choose inspect_recent_images instead of generate_image.
+- `use_recent_images` should be true only when the app should attach the stored recent images as references.
+
+Current message has image attachments: {has_current_images}
+
+{build_recent_image_hint(guild_id)}
+
+User message:
+{last_user_msg}
+""".strip()
+
+    try:
+        response = await CLIENT.aio.models.generate_content(
+            model=text_model,
+            contents=prompt,
+            config={
+                "temperature": 0.0,
+                "response_mime_type": "application/json",
+                "response_json_schema": IMAGE_ACTION_SCHEMA,
+            },
+        )
+        payload = json.loads((response.text or "").strip())
+        return {
+            "action": payload.get("action", "respond_text"),
+            "refined_prompt": (payload.get("refined_prompt") or "").strip(),
+            "use_recent_images": bool(payload.get("use_recent_images", False)),
+            "reason": (payload.get("reason") or "").strip(),
+        }
+    except Exception as e:
+        print(f"[IMG] 라우팅 판정 실패: {e}")
+        return {
+            "action": "respond_text",
+            "refined_prompt": "",
+            "use_recent_images": False,
+            "reason": "routing failure",
+        }
 
 # ================= 3. 유틸리티 & API =================
 async def download_media(url):
@@ -943,42 +1277,7 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None):
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
-
-    media_gen_tool = types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="generate_image",
-                description="Generate, edit, or mix images based on user request.",
-                parameters=types.Schema(
-                    type="OBJECT",
-                    properties={
-                        "prompt": types.Schema(type="STRING", description="Detailed English description for the image."),
-                        "ref_count": types.Schema(type="INTEGER", description="0 = generate new, 1 = edit the most recent image. Only 0 or 1 allowed.")
-                    },
-                    required=["prompt", "ref_count"]
-                )
-            ),
-            # generate_video — 비용 절감으로 임시 비활성화
-        ]
-    )
-
-    media_intent = await check_media_intent(last_user_msg, text_model=text_model)
-
-    if media_intent in ("IMAGE", "VIDEO"):
-        tools = [media_gen_tool]
-        tool_config = types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="AUTO"))
-
-        last_content = history_contents[-1]
-        if last_content.role == "user":
-            hint = "an image" if media_intent == "IMAGE" else "a video"
-            tool_name = "generate_image" if media_intent == "IMAGE" else "generate_video"
-            for part in last_content.parts:
-                if part.text:
-                    part.text += f"\n\n(System: User wants {hint}. Use `{tool_name}`. You are encouraged to provide a text response as well.)"
-                    break
-    else:
-        tools = [types.Tool(google_search=types.GoogleSearch())]
-        tool_config = None
+    tools = [types.Tool(google_search=types.GoogleSearch())]
 
     safety_settings = [
         types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
@@ -995,7 +1294,6 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None):
                 system_instruction=SYSTEM_PROMPT,
                 tools=tools,
                 temperature=0.7,
-                tool_config=tool_config,
                 safety_settings=safety_settings
             )
         )
@@ -1022,6 +1320,7 @@ class GeminiBot(commands.Bot):
         self.voice_bad_state_counts = {}
         self.loop_monitor_expected = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
+        self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
         self.sound_files = scan_sound_files()
         self.sound_volume = SOUND_VOLUME
         self._sound_dir_mtime = self._get_sound_dir_mtime()
@@ -1432,7 +1731,13 @@ async def sibo_loop(my_gen=None):
                 try:
                     if voice_is_playing(vc):
                         await voice_stop(vc)
-                    await play_lavalink_local_sound(vc, filepath, bot.sound_volume, replace=True)
+                    await play_lavalink_local_sound(
+                        vc,
+                        filepath,
+                        bot.sound_volume,
+                        replace=True,
+                        lead_in_ms=LAVALINK_SIBO_PAD_MS,
+                    )
                     play_now = datetime.now(KST)
                     print(f"[SIBO] {play_now.strftime('%H:%M:%S.%f')[:-4]} Guild {gid} 시보 재생(Lavalink): {sound_key}")
                 except Exception as e:
@@ -1777,7 +2082,6 @@ async def on_message(message):
     async with lock:
         async with message.channel.typing():
             try:
-                text_extensions = ('.txt', '.py', '.json', '.md', '.c', '.cpp', '.js', '.html', '.css', '.log', '.xml', '.yaml', '.sh', '.csv')
                 server_text_model = config.get("text_model", TEXT_MODEL)
                 server_image_model = config.get("image_model", IMAGE_MODEL)
                 history_limit = get_history_limit_for_text_model(server_text_model)
@@ -1819,13 +2123,12 @@ async def on_message(message):
                                     media_type = att.content_type.split('/')[0]
                                     content += f"\n(User attached a {media_type} file: {att.filename})"
                                 else:
-                                    is_text = (att.content_type and "text" in att.content_type) or att.filename.lower().endswith(text_extensions)
-                                    if is_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
-                                        try:
-                                            file_bytes = await att.read()
-                                            file_text = file_bytes.decode('utf-8')
-                                            content += f"\n\n[Attached File Content: {att.filename}]\n```\n{file_text}\n```"
-                                        except: pass
+                                    file_text, file_kind = await extract_attachment_text(att)
+                                    if file_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
+                                        bot.doc_cache.store_document("text_file", att.filename, file_text, msg.id, msg.channel.id)
+                                        content += f"\n\n[Attached File Content: {att.filename}]\n```\n{file_text}\n```"
+                                    elif file_kind:
+                                        content += f"\n(User attached a {file_kind} file: {att.filename})"
 
                     if cached_doc_blocks:
                         content += "\n\n" + "\n\n".join(cached_doc_blocks)
@@ -1836,6 +2139,8 @@ async def on_message(message):
 
                 _cur_member = message.guild.get_member(message.author.id) or message.author
                 current_parts = [types.Part(text=f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}")]
+                current_ref_images = []
+                has_current_images = False
 
                 urls = re.findall(r'(https?://\S+)', message.content)
                 for url in urls:
@@ -1851,7 +2156,23 @@ async def on_message(message):
                         if att.content_type and att.content_type.startswith('image'):
                             d, m = await download_media(att.url)
                             if d:
-                                current_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=d.getvalue())))
+                                raw = d.getvalue()
+                                current_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=raw)))
+                                has_current_images = True
+                                try:
+                                    current_ref_images.append(Image.open(io.BytesIO(raw)).copy())
+                                except Exception:
+                                    pass
+                                bot.recent_image_store.register_bytes(
+                                    message.guild.id,
+                                    channel_id=message.channel.id,
+                                    message_id=message.id,
+                                    author_id=message.author.id,
+                                    display_name=_cur_member.display_name,
+                                    filename=att.filename,
+                                    image_bytes=raw,
+                                    source_kind="user_upload",
+                                )
                         elif att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
                             d, m = await download_media(att.url)
                             if d:
@@ -1865,15 +2186,63 @@ async def on_message(message):
                                         current_parts.append(types.Part(file_data=types.FileData(file_uri=file_ref.uri, mime_type=m)))
                                 print(f"[{media_type.upper()}] {media_type} 첨부: {att.filename} ({len(file_bytes)} bytes)")
                         else:
-                            is_text = (att.content_type and "text" in att.content_type) or att.filename.lower().endswith(text_extensions)
-                            if is_text:
-                                try:
-                                    file_bytes = await att.read()
-                                    file_content = file_bytes.decode('utf-8')
-                                    doc_id = bot.doc_cache.store_document("text_file", att.filename, file_content, message.id, message.channel.id)
-                                    print(f"[CACHE] text file 저장: {doc_id} ({att.filename})")
-                                    current_parts.append(types.Part(text=f"\n\n[Attached File Content: {att.filename}]\n```\n{file_content}\n```"))
-                                except: pass
+                            file_content, file_kind = await extract_attachment_text(att)
+                            if file_content:
+                                doc_id = bot.doc_cache.store_document("text_file", att.filename, file_content, message.id, message.channel.id)
+                                print(f"[CACHE] {file_kind or 'text'} file 저장: {doc_id} ({att.filename})")
+                                current_parts.append(types.Part(text=f"\n\n[Attached File Content: {att.filename}]\n```\n{file_content}\n```"))
+
+                route = await route_message_action(
+                    message.content,
+                    guild_id=message.guild.id,
+                    has_current_images=has_current_images,
+                    text_model=server_text_model,
+                )
+
+                if route.get("action") == "generate_image":
+                    prompt = route.get("refined_prompt") or message.content
+                    ref_images = []
+                    if current_ref_images:
+                        ref_images = current_ref_images[:MAX_REF_IMAGES]
+                    elif route.get("use_recent_images"):
+                        for entry in bot.recent_image_store.list_recent(message.guild.id)[-MAX_REF_IMAGES:]:
+                            try:
+                                with open(entry["path"], "rb") as f:
+                                    ref_images.append(Image.open(io.BytesIO(f.read())).copy())
+                            except Exception as e:
+                                print(f"[IMG] 최근 이미지 참조 로드 실패: {e}")
+
+                    print(f"[IMG] 라우팅 생성 요청: '{prompt}' (현재첨부={len(current_ref_images)} 최근참조={len(ref_images)})")
+                    status_msg = await message.channel.send(f"**Prompt:** `{prompt}`")
+                    req_content = ref_images + [prompt]
+                    try:
+                        img_data = await call_nano_banana(req_content, image_model=server_image_model)
+                        bot.recent_image_store.register_bytes(
+                            message.guild.id,
+                            channel_id=message.channel.id,
+                            message_id=message.id,
+                            author_id=bot.user.id,
+                            display_name=bot.user.display_name,
+                            filename="generated.png",
+                            image_bytes=img_data,
+                            source_kind="bot_generated",
+                        )
+                        with io.BytesIO(img_data) as binary:
+                            binary.seek(0)
+                            fn = "edited.png" if ref_images else "generated.png"
+                            await message.channel.send(file=discord.File(fp=binary, filename=fn))
+                        await status_msg.edit(content=f"[OK] **Generated Prompt:** `{prompt}`")
+                        print(f"[BOT]({server_image_model}): [이미지 생성 완료]")
+                    except Exception as e:
+                        err_msg = f"[ERROR] Image Generation Failed: {str(e)}"
+                        print(err_msg)
+                        await status_msg.edit(content=err_msg)
+                    return
+
+                if route.get("action") == "inspect_recent_images" and not has_current_images and route.get("use_recent_images"):
+                    recent_parts = await load_recent_image_parts(message.guild.id)
+                    if recent_parts:
+                        current_parts = recent_parts + current_parts
 
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
 
@@ -1901,139 +2270,12 @@ async def on_message(message):
 
                 text_reply = ""
                 for part in candidate.content.parts:
-                    if part.text: text_reply += part.text
-
-                tool_calls = []
-
-                for part in candidate.content.parts:
-                    if part.function_call:
-                        if part.function_call.name == "generate_image":
-                            tool_calls.append(part.function_call)
-
-                fake_json_detected = False
-                json_matches = re.findall(r'(\{.*"action":.*"generate_image".*\})', text_reply, re.DOTALL)
-                if not json_matches:
-                     json_matches = re.findall(r'(\{.*"prompt":.*\})', text_reply, re.DOTALL)
-
-                if json_matches:
-                    for json_str in json_matches:
-                        try:
-                            data = json.loads(json_str)
-                            input_args = {}
-                            is_valid = False
-
-                            if data.get("action") == "generate_image":
-                                raw_input = data.get("action_input", {})
-                                if isinstance(raw_input, str):
-                                    try: input_args = json.loads(raw_input)
-                                    except: pass
-                                else:
-                                    input_args = raw_input
-                                is_valid = True
-                            elif "prompt" in data:
-                                input_args = data
-                                is_valid = True
-
-                            if is_valid:
-                                fake_call = type("FakeCall", (), {})()
-                                fake_call.name = "generate_image"
-                                fake_call.args = input_args
-                                tool_calls.append(fake_call)
-                                fake_json_detected = True
-                                text_reply = text_reply.replace(json_str, "")
-                        except: pass
-
-                elif "generate_image(" in text_reply:
-                    try:
-                        prompt_match = re.search(r'prompt=["\'](.*?)["\']', text_reply, re.DOTALL)
-                        ref_match = re.search(r'ref_count=(\d+)', text_reply)
-                        if prompt_match:
-                            fake_call = type("FakeCall", (), {})()
-                            fake_call.name = "generate_image"
-                            fake_call.args = {
-                                "prompt": prompt_match.group(1),
-                                "ref_count": int(ref_match.group(1)) if ref_match else 0
-                            }
-                            tool_calls.append(fake_call)
-                            text_reply = re.sub(r'generate_image\(.*?\)', '', text_reply, flags=re.DOTALL)
-                    except: pass
-
-                # 마커를 응답에 출력한 경우 (도구 호출 대신 텍스트로 출력)
-                _fake_img_marker = None
-                for _m in ["[이미지 첨부됨]", "(Bot generated an image here)"]:
-                    if _m in text_reply:
-                        _fake_img_marker = _m
-                        break
-                if _fake_img_marker and not tool_calls:
-                    before = text_reply.split(_fake_img_marker)[0].strip()
-                    # 백틱 안의 실제 프롬프트 우선 추출
-                    backtick_match = re.search(r'`([^`]{15,})`', before, re.DOTALL)
-                    if backtick_match:
-                        extracted = backtick_match.group(1).strip()
-                    else:
-                        # 볼드 헤더([OK], **...**) 제거 후 사용
-                        extracted = re.sub(r'^\[.*?\]\s*', '', before).strip()
-                        extracted = re.sub(r'\*\*[^*]+\*\*:?\s*', '', extracted).strip()
-                    # ref_count: 모델이 텍스트에 명시했으면 사용, 아니면 0
-                    ref_match = re.search(r'ref[_\s-]*count[:\s=]*(\d+)', before, re.IGNORECASE)
-                    ref_count_val = int(ref_match.group(1)) if ref_match else 0
-                    if len(extracted) >= 10:
-                        fake_call = type("FakeCall", (), {})()
-                        fake_call.name = "generate_image"
-                        fake_call.args = {"prompt": extracted, "ref_count": ref_count_val}
-                        tool_calls.append(fake_call)
-                        text_reply = ""  # 이미지로 대체되므로 텍스트 불필요
-                        print(f"[FAKE→REAL] '{_fake_img_marker}' 감지, 실제 생성으로 전환: '{extracted[:80]}'")
-                    else:
-                        text_reply = text_reply.replace(_fake_img_marker, "").strip()
+                    if part.text:
+                        text_reply += part.text
 
                 if text_reply.strip():
                     print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Finish: {finish_reason})")
                     await send_long_message(message.channel, text_reply)
-
-                for fc in tool_calls:
-                    args = fc.args if not isinstance(fc.args, dict) else fc.args
-                    prompt = args.get("prompt") if isinstance(args, dict) else args.get("prompt", "image")
-                    ref_count = int(args.get("ref_count")) if isinstance(args, dict) else int(args.get("ref_count", 0))
-                    # 정책상 0 또는 1만 허용 (2장 이상 블렌딩 미지원)
-                    ref_count = max(0, min(ref_count, 1))
-
-                    print(f"[IMG] 생성 요청: '{prompt}' (참조: {ref_count}장)")
-                    status_msg = await message.channel.send(f"**Prompt:** `{prompt}`\n(Ref: {ref_count})")
-
-                    ref_images = []
-                    if ref_count > 0:
-                        found = 0
-                        async for msg in message.channel.history(limit=IMAGE_SEARCH_LIMIT, before=message):
-                            if reset_ts and msg.created_at < reset_ts: break
-                            if msg.attachments:
-                                for att in msg.attachments:
-                                    if att.content_type.startswith('image'):
-                                        d, _ = await download_media(att.url)
-                                        if d:
-                                            ref_images.append(Image.open(d))
-                                            found += 1
-                                    if found >= MAX_REF_IMAGES: break
-                            if found >= MAX_REF_IMAGES: break
-
-                        if not ref_images:
-                            await status_msg.edit(content=f"[WARN] 참조 이미지를 못 찾아 새로 그립니다.\n`{prompt}`")
-
-                    req_content = ref_images + [prompt]
-                    try:
-                        img_data = await call_nano_banana(req_content, image_model=server_image_model)
-                        with io.BytesIO(img_data) as binary:
-                            binary.seek(0)
-                            fn = "edited.png" if ref_images else "generated.png"
-                            await message.channel.send(file=discord.File(fp=binary, filename=fn))
-
-                        await status_msg.edit(content=f"[OK] **Generated Prompt:** `{prompt}`")
-                        print(f"[BOT]({server_image_model}): [이미지 생성 완료]")
-
-                    except Exception as e:
-                        err_msg = f"[ERROR] Image Generation Failed: {str(e)}"
-                        print(err_msg)
-                        await status_msg.edit(content=err_msg)
 
                 # video_calls 처리 — 비용 절감으로 임시 비활성화
 
@@ -2280,6 +2522,16 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
 
         req_content = ref_images + [generated_prompt] if ref_images else [generated_prompt]
         img_data = await call_nano_banana(req_content)
+        bot.recent_image_store.register_bytes(
+            interaction.guild_id,
+            channel_id=interaction.channel_id,
+            message_id=interaction.id,
+            author_id=bot.user.id,
+            display_name=bot.user.display_name,
+            filename="generated.png",
+            image_bytes=img_data,
+            source_kind="bot_generated",
+        )
         with io.BytesIO(img_data) as binary:
             binary.seek(0)
             fn = "edited.png" if ref_images else "generated.png"
