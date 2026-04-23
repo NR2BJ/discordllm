@@ -2304,40 +2304,39 @@ async def sibo_loop(my_gen=None):
 
         await asyncio.sleep(1)
 
-async def rebuild_panel_channel(guild, channel, *, save_target=False):
-    """사운드보드 전용 채널을 비우고 시보/사운드보드 패널을 재게시."""
+async def ensure_sibo_panel(guild, channel, *, save_target=False):
+    """채널 메시지는 지우지 않고 시보 패널 하나를 준비한다."""
     if save_target:
         config = bot.get_config(guild.id)
         config["sb_channel_id"] = channel.id
         bot.save_config()
 
-    deleted_count = 0
-    try:
-        while True:
-            deleted = await channel.purge(limit=100, bulk=False)
-            deleted_count += len(deleted)
-            if len(deleted) < 100:
-                break
-            await asyncio.sleep(0.25)
-        print(f"[PANEL] {guild.name}: #{channel.name} {deleted_count}개 메시지 삭제")
-    except Exception as e:
-        print(f"[PANEL] {guild.name}: 채널 초기화 실패: {e}")
-        raise
-
     sibo_view = SiboView(guild.id)
     bot.active_views.append(sibo_view)
-    await channel.send(embed=sibo_view._make_embed(), view=sibo_view)
 
-    keys = sorted(bot.sound_files.keys())
-    sb_view = SoundboardView(keys)
-    bot.active_views.append(sb_view)
-    await channel.send(embed=sb_view._make_embed(), view=sb_view)
-    print(f"[PANEL] {guild.name}: 패널 임베드 재생성 완료")
-    return deleted_count
+    existing_panel = None
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author != bot.user:
+                continue
+            if any(embed.title == "⏰ 시보 설정" for embed in msg.embeds):
+                existing_panel = msg
+                break
+    except Exception as e:
+        print(f"[PANEL] {guild.name}: 기존 시보 패널 확인 실패: {e}")
+
+    if existing_panel:
+        await existing_panel.edit(embed=sibo_view._make_embed(), view=sibo_view)
+        print(f"[PANEL] {guild.name}: #{channel.name} 시보 패널 갱신 완료")
+        return "updated"
+
+    await channel.send(embed=sibo_view._make_embed(), view=sibo_view)
+    print(f"[PANEL] {guild.name}: #{channel.name} 시보 패널 생성 완료")
+    return "created"
 
 
 async def setup_panel_channels():
-    """봇 시작 시 사운드보드 채널 메시지 초기화 후 패널 자동 재생성."""
+    """봇 시작 시 저장된 채널의 시보 패널을 갱신한다."""
     for guild in bot.guilds:
         config = bot.get_config(guild.id)
         panel_channel_id = config.get("sb_channel_id")
@@ -2348,7 +2347,7 @@ async def setup_panel_channels():
             print(f"[PANEL] {guild.name}: 패널 채널 없음 (ID: {panel_channel_id})")
             continue
         try:
-            await rebuild_panel_channel(guild, channel)
+            await ensure_sibo_panel(guild, channel)
         except Exception as e:
             print(f"[PANEL] {guild.name}: 임베드 생성 실패: {e}")
 
@@ -2791,7 +2790,7 @@ async def set_history(interaction: discord.Interaction, count: int | None = None
         f"[OK] {interaction.user.display_name}님이 Gemini 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
     )
 
-@bot.tree.command(name="reset", description="원문 대화 기준 시점을 초기화")
+@bot.tree.command(name="reset", description="히스토리 초기화")
 async def reset_history(interaction: discord.Interaction):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
@@ -2799,9 +2798,7 @@ async def reset_history(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
     bot.save_config()
-    await interaction.response.send_message(
-        f"[OK] {interaction.user.display_name}님이 Gemini 원문 대화 기준 시점을 초기화했습니다."
-    )
+    await interaction.response.send_message("[OK] 히스토리 초기화")
 
 # ================= 6. User Install 슬래시 커맨드 =================
 
@@ -2926,6 +2923,149 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
         print(f"  [ERROR]: {e}")
         print("-------")
         await interaction.followup.send(f"[ERROR] 오류 발생: {e}")
+
+
+@bot.tree.command(name="image", description="이미지를 생성하거나 편집합니다")
+@app_commands.allowed_installs(guilds=False, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    prompt="생성할 이미지에 대한 설명",
+    reference="편집할 원본 이미지 파일 (선택)",
+    reference_url="편집할 이미지 URL (선택, Discord에 업로드 후 링크 복사)"
+)
+async def image_command(interaction: discord.Interaction, prompt: str, reference: discord.Attachment = None, reference_url: str = None):
+    await interaction.response.defer()
+
+    log_time = datetime.now().strftime('%H:%M:%S')
+    location = f"[{interaction.guild.name}]" if interaction.guild else "[DM]"
+    print(f"[{log_time}] {location} [/image] {interaction.user.display_name}: {prompt}")
+
+    try:
+        ref_images = []
+        has_reference = False
+        reference_source = None
+
+        if reference and reference.content_type and reference.content_type.startswith('image'):
+            img_data, _ = await download_media(reference.url)
+            if img_data:
+                ref_images.append(Image.open(img_data))
+                has_reference = True
+                reference_source = reference.url
+                print(f"  [IMG] 참조 이미지: {reference.url}")
+        elif reference_url:
+            img_data, _ = await download_media(reference_url)
+            if img_data:
+                ref_images.append(Image.open(img_data))
+                has_reference = True
+                reference_source = reference_url
+                print(f"  [IMG] 참조 이미지 URL: {reference_url}")
+
+        user_display = f"**{interaction.user.display_name}**: {prompt}"
+        if reference_source:
+            embed = discord.Embed(description=user_display)
+            embed.set_image(url=reference_source)
+            embed.set_footer(text="원본 이미지")
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(user_display)
+
+        gen_tool = types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name="generate_image",
+                    description="Generate or edit an image based on the prompt.",
+                    parameters=types.Schema(
+                        type="OBJECT",
+                        properties={
+                            "prompt": types.Schema(type="STRING", description="Detailed English description for the image."),
+                            "ref_count": types.Schema(type="INTEGER", description="0 = generate new, 1 = edit reference image. Only 0 or 1 allowed.")
+                        },
+                        required=["prompt", "ref_count"]
+                    )
+                )
+            ]
+        )
+
+        safety_settings = [
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+        ]
+
+        user_message = f"User request: {prompt}"
+        if has_reference:
+            user_message += "\n(A reference image is provided for editing)"
+        user_message += "\n\n(System: Generate the image using the `generate_image` tool. You may also provide a brief text response.)"
+
+        response = await CLIENT.aio.models.generate_content(
+            model=TEXT_MODEL,
+            contents=[types.Content(role="user", parts=[types.Part(text=user_message)])],
+            config=types.GenerateContentConfig(
+                system_instruction=IMAGE_SYSTEM_PROMPT,
+                tools=[gen_tool],
+                tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="AUTO")),
+                temperature=0.7,
+                safety_settings=safety_settings
+            )
+        )
+
+        if not response.candidates:
+            await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
+            return
+
+        candidate = response.candidates[0]
+        text_reply = ""
+        generated_prompt = None
+
+        for part in candidate.content.parts:
+            if part.text:
+                text_reply += part.text
+            if part.function_call and part.function_call.name == "generate_image":
+                args = part.function_call.args
+                generated_prompt = args.get("prompt", prompt)
+
+        if not generated_prompt:
+            generated_prompt = prompt
+
+        print(f"  [PROMPT] 정제된 프롬프트: {generated_prompt}")
+
+        if text_reply.strip():
+            clean_reply = re.sub(r'\{.*"prompt".*\}', '', text_reply, flags=re.DOTALL).strip()
+            if clean_reply:
+                if len(clean_reply) > 1900:
+                    clean_reply = clean_reply[:1900] + "..."
+                await interaction.followup.send(clean_reply)
+                print(f"  [BOT]({TEXT_MODEL}): {clean_reply}")
+
+        status_msg = await interaction.followup.send(f"**Generating:** `{generated_prompt}`")
+
+        req_content = ref_images + [generated_prompt] if ref_images else [generated_prompt]
+        img_data = await call_nano_banana(req_content)
+        if interaction.guild_id is not None:
+            bot.recent_image_store.register_bytes(
+                interaction.guild_id,
+                channel_id=interaction.channel_id,
+                message_id=interaction.id,
+                author_id=bot.user.id,
+                display_name=get_bot_display_name(),
+                filename="generated.png",
+                image_bytes=img_data,
+                source_kind="bot_generated",
+            )
+        with io.BytesIO(img_data) as binary:
+            binary.seek(0)
+            fn = "edited.png" if ref_images else "generated.png"
+            await interaction.followup.send(file=discord.File(fp=binary, filename=fn))
+
+        await status_msg.edit(content=f"[OK] **Generated:** `{generated_prompt}`")
+        print(f"  [BOT]({IMAGE_MODEL}): [이미지 생성 완료]")
+        print("-------")
+
+    except Exception as e:
+        print(f"  [ERROR]: {e}")
+        print("-------")
+        await interaction.followup.send(f"[ERROR] 이미지 생성 실패: {e}")
 
 # ================= 7. 비디오 생성 (User Install) =================
 
@@ -3150,7 +3290,7 @@ class VolumeModal(discord.ui.Modal, title="사운드보드 볼륨 설정"):
         await interaction.response.edit_message(embed=self.soundboard_view._make_embed(), view=self.soundboard_view)
 
 
-@bot.tree.command(name="sb", description="사운드보드 (이름 입력시 재생, 빈 입력시 현재 채널 패널 재생성)")
+@bot.tree.command(name="sb", description="사운드보드 (이름 입력시 재생, 빈 입력시 현재 채널에 시보 패널 생성)")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(name="재생할 사운드 이름 (비우면 현재 채널을 패널 채널로 설정)")
@@ -3159,18 +3299,17 @@ async def soundboard(interaction: discord.Interaction, name: str = None):
         await temp_reply(interaction, "서버에서만 사용 가능합니다.")
         return
 
-    # 인자 없으면 현재 채널을 사운드보드 전용 채널로 설정하고 패널 재생성
+    # 인자 없으면 현재 채널을 패널 채널로 설정하고 시보 패널만 준비
     if not name:
         await interaction.response.defer()
         try:
-            deleted_count = await rebuild_panel_channel(interaction.guild, interaction.channel, save_target=True)
+            panel_status = await ensure_sibo_panel(interaction.guild, interaction.channel, save_target=True)
             await temp_followup(
                 interaction,
-                f"사운드보드 채널을 {interaction.channel.mention}로 설정하고 패널을 재생성했습니다. "
-                f"(삭제 {deleted_count}개)",
+                f"{interaction.channel.mention}에 시보 패널을 {'갱신' if panel_status == 'updated' else '생성'}했습니다.",
             )
         except Exception as e:
-            await temp_followup(interaction, f"[ERROR] 패널 재생성 실패: {e}")
+            await temp_followup(interaction, f"[ERROR] 시보 패널 생성 실패: {e}")
         return
 
     # 인자 있으면 바로 재생

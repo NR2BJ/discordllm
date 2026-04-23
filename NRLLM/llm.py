@@ -1690,14 +1690,12 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     )
 
 
-@bot.tree.command(name="reset", description="원문 대화 기준 시점을 초기화")
+@bot.tree.command(name="reset", description="히스토리 초기화")
 async def reset_history(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
     bot.save_config()
-    await interaction.response.send_message(
-        f"🧹 {interaction.user.display_name}님이 원문 대화 기준 시점을 초기화했습니다."
-    )
+    await interaction.response.send_message("🧹 히스토리 초기화")
 
 
 @model_group.command(name="provider", description="기본 프로바이더 라우팅 정책 설정")
