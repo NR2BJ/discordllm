@@ -1727,10 +1727,13 @@ async def update_speaker_memory(guild, history_texts, current_user_text, message
     current_state = bot.memory_store.render_speaker_state(guild.id)
     memory_prompt = (
         "You extract durable, user-specific conversation memory.\n"
-        "Only record facts, positions, preferences, and reported claims that are useful later.\n"
-        "Do not store tone, jokes, one-off phrasing, or speculative guesses.\n"
-        "For second-hand statements like 'my friend said...', use type=reported_claim and subject accordingly.\n"
-        "If nothing worth storing changed, return an empty speaker_updates array.\n\n"
+        "Prefer returning an empty speaker_updates array unless the excerpt contains a clear durable user state.\n"
+        "Store only explicit, stable, user-specific facts that are likely useful weeks later: identity, location, job, owned assets, ongoing projects, persistent preferences, constraints, plans, or relationships.\n"
+        "Do NOT store one-off questions, current-event/news discussion, temporary curiosity, jokes, tone, inferred interests, speculative guesses, or generic facts about the world.\n"
+        "Do NOT rewrite the recent conversation into memory. If the same information is only useful for the next few replies, leave it in raw history and return empty.\n"
+        "Only store a preference/position when the user explicitly states a stable preference or stance, not merely because they asked about a topic.\n"
+        "Use reported_claim only for durable second-hand information about the user or a named person close to them; do not store reported claims about world events or news.\n"
+        "Use short normalized values, not verbatim message copies. If uncertain, return empty.\n\n"
         f"Current speaker memory:\n{current_state or '(empty)'}\n\n"
         f"Conversation excerpt:\n{excerpt}"
     )
