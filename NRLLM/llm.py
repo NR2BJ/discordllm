@@ -705,6 +705,10 @@ def get_bot_username():
     user = getattr(bot, "user", None)
     return getattr(user, "name", None) or get_bot_display_name()
 
+
+def normalize_model_id(model_id):
+    return (model_id or "").strip()
+
 # ================= 3. OpenRouter API 클라이언트 =================
 class OpenRouterClient:
     def __init__(self, api_key):
@@ -745,13 +749,13 @@ class OpenRouterClient:
             print(f"⚠️ 모델 정보 로드 중 오류: {e}")
 
     def get_model_info(self, model_id):
-        clean_id = model_id.split(":")[0]
+        clean_id = normalize_model_id(model_id)
         for m in self.models_list:
             if m['id'] == clean_id: return m
         return None
 
     async def resolve_model_info(self, model_id):
-        clean_id = model_id.split(":")[0]
+        clean_id = normalize_model_id(model_id)
         model = self.get_model_info(clean_id)
         if model:
             return model
@@ -785,7 +789,7 @@ class OpenRouterClient:
         return {"input": input_list, "output": output_list}
 
     async def fetch_model_details(self, model_id):
-        clean_id = model_id.split(":")[0]
+        clean_id = normalize_model_id(model_id)
         if "/" not in clean_id:
             return None
 
@@ -810,7 +814,7 @@ class OpenRouterClient:
 
     def analyze_model_capabilities(self, model_id, model_info=None):
         """모델의 입출력 capability 반환: {"input": [...], "output": [...]}"""
-        clean_id = model_id.split(":")[0]
+        clean_id = normalize_model_id(model_id)
         model = model_info or self.get_model_info(clean_id)
         return self._capabilities_from_model(model)
 
@@ -1207,7 +1211,7 @@ async def resolve_model_bundle(model_id):
     return info, endpoints, caps
 
 async def validate_model_for_use(model_id, *, require_input=None, require_output=None, require_endpoint_check=False):
-    clean_id = model_id.split(":")[0]
+    clean_id = normalize_model_id(model_id)
     info, endpoints, caps = await resolve_model_bundle(clean_id)
 
     if require_endpoint_check and endpoints is None:
@@ -1256,7 +1260,7 @@ def build_provider_preferences(policy, *, strict=False):
 
 
 def build_prompt_cache_control(model_id, messages):
-    clean_id = (model_id or "").split(":")[0]
+    clean_id = normalize_model_id(model_id)
     if not clean_id.startswith("anthropic/"):
         return None
     total_text = 0
@@ -1956,7 +1960,7 @@ provider_group = app_commands.Group(name="provider", description="프로바이�
 @app_commands.describe(model_id="모델 이름 검색")
 async def set_model(interaction: discord.Interaction, model_id: str):
     await interaction.response.defer()
-    clean_id = model_id.split(":")[0]
+    clean_id = normalize_model_id(model_id)
     model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_endpoint_check=True)
     if error:
         await interaction.followup.send(
@@ -1983,7 +1987,7 @@ async def set_model(interaction: discord.Interaction, model_id: str):
 @app_commands.describe(model_id="이미지 생성 폴백 모델 ID 또는 clear")
 async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     await interaction.response.defer()
-    clean_id = model_id.split(":")[0]
+    clean_id = normalize_model_id(model_id)
     config = bot.get_config(interaction.guild_id)
 
     if clean_id.lower() in ("clear", "none", "off"):
@@ -2239,25 +2243,23 @@ async def generate_image_cmd(
 
 @bot.tree.command(name="refresh_models", description="OpenRouter 모델 리스트 즉시 갱신")
 async def refresh_models_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     before = len(bot.or_client.models_list)
     await bot.or_client.fetch_models_metadata()
     after = len(bot.or_client.models_list)
     source = bot.or_client.models_source
     image_count = count_image_generation_models()
     if after == 0:
-        await interaction.followup.send("[ERROR] 모델 리스트 갱신 실패 — OpenRouter API 응답 확인 필요", ephemeral=True)
+        await interaction.followup.send("[ERROR] 모델 리스트 갱신 실패 — OpenRouter API 응답 확인 필요")
     elif after == before:
         await interaction.followup.send(
             f"✅ 갱신 완료 (변동 없음, {after}개 모델 / 이미지 출력 {image_count}개 | source={source})",
-            ephemeral=True,
         )
     else:
         delta = after - before
         sign = "+" if delta > 0 else ""
         await interaction.followup.send(
             f"✅ 갱신 완료: {before}개 → **{after}개** ({sign}{delta}) / 이미지 출력 {image_count}개 | source={source}",
-            ephemeral=True,
         )
 
 bot.tree.add_command(model_group)

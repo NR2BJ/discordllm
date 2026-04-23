@@ -2346,8 +2346,11 @@ async def set_ch(interaction: discord.Interaction):
         f"[OK] {interaction.user.display_name}님이 봇 활성화 채널을 {interaction.channel.mention} 으로 설정했습니다."
     )
 
-@bot.tree.command(name="reset", description="대화 초기화")
-async def reset(interaction: discord.Interaction):
+reset_group = app_commands.Group(name="reset", description="Gemini 대화/캐시 초기화")
+
+
+@reset_group.command(name="context", description="Gemini 원문 대화 기준 시점을 초기화")
+async def reset_context(interaction: discord.Interaction):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
         return
@@ -2356,6 +2359,16 @@ async def reset(interaction: discord.Interaction):
     bot.save_config()
     await interaction.response.send_message(
         f"[OK] {interaction.user.display_name}님이 Gemini 대화 원문 기준 시점을 초기화했습니다."
+    )
+
+
+@reset_group.command(name="speaker", description="Gemini 화자 상태 메모리 상태 확인")
+async def reset_speaker(interaction: discord.Interaction):
+    if not interaction.guild:
+        await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
+        return
+    await interaction.response.send_message(
+        "[INFO] Gemini 봇에는 LLM 봇처럼 별도의 화자 상태 메모리가 아직 없어 초기화할 항목이 없습니다."
     )
 
 # ================= 6. User Install 슬래시 커맨드 =================
@@ -3144,6 +3157,8 @@ async def model_autocomplete(interaction: discord.Interaction, current: str):
         for key, info in AVAILABLE_MODELS.items()
         if current.lower() in key.lower() or current.lower() in info['text'].lower()
     ][:25]
+
+bot.tree.add_command(reset_group)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
