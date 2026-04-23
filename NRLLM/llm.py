@@ -40,6 +40,8 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
                         '.css', '.md', '.json', '.xml', '.yaml', '.sh', '.rb', '.go', '.rs')
 
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
+DEFAULT_VISION_MODEL = os.environ.get("LLM_DEFAULT_VISION_MODEL")
+DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 
 _COMMON_RULES = """## General Rules
@@ -50,7 +52,10 @@ _COMMON_RULES = """## General Rules
 - When a URL is in the message, the system fetches it and attaches `[Webpage Content]` — use that content directly.
 - Analyze attached files (images/video/audio) when supported.
 - Keep responses concise and Discord-appropriate.
-- If the model name ends with `:online`, actively use web search for up-to-date info. Otherwise rely on your training knowledge."""
+- If web search is enabled for the request, use the available search tool for up-to-date information when needed. Otherwise rely on your training knowledge."""
+
+IMAGE_ASPECT_RATIO_CHOICES = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
+IMAGE_SIZE_CHOICES = ["1K", "2K", "4K"]
 
 SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
@@ -262,6 +267,16 @@ class OpenRouterClient:
             if m['id'] == clean_id: return m
         return None
 
+    async def resolve_model_info(self, model_id):
+        clean_id = model_id.split(":")[0]
+        model = self.get_model_info(clean_id)
+        if model:
+            return model
+        detailed = await self.fetch_model_details(clean_id)
+        if detailed:
+            return detailed
+        return {"id": clean_id, "name": clean_id}
+
     def _capabilities_from_model(self, model):
         if not model:
             return {"input": ["text"], "output": ["text"]}
@@ -311,6 +326,14 @@ class OpenRouterClient:
         model = model_info or self.get_model_info(clean_id)
         return self._capabilities_from_model(model)
 
+    def supports_input_modality(self, model_id, modality, model_info=None):
+        caps = self.analyze_model_capabilities(model_id, model_info=model_info)
+        return modality in caps["input"]
+
+    def supports_output_modality(self, model_id, modality, model_info=None):
+        caps = self.analyze_model_capabilities(model_id, model_info=model_info)
+        return modality in caps["output"]
+
     def analyze_model_type(self, model_id, model_info=None):
         caps = self.analyze_model_capabilities(model_id, model_info=model_info)
         if "image" in caps["input"]:
@@ -329,7 +352,14 @@ class OpenRouterClient:
             return "Multimodal (" + ", ".join(parts) + ")"
         return "Text Generation"
 
-    async def chat_completion(self, model, messages, capabilities=None):
+    async def chat_completion(
+        self,
+        model,
+        messages,
+        capabilities=None,
+        enable_web_search=False,
+        image_config=None,
+    ):
         import ast  # 문자열 형태의 리스트 파싱을 위해 추가
 
         payload = {
@@ -339,9 +369,18 @@ class OpenRouterClient:
             # "temperature": 0.7
         }
 
-        # 이미지 생성 가능 모델이면 modalities 추가
+        if enable_web_search:
+            payload["tools"] = [{"type": "openrouter:web_search"}]
+
+        # 이미지 생성 가능 모델이면 output modality에 맞춰 활성화
         if capabilities and "image" in capabilities.get("output", []):
-            payload["modalities"] = ["text", "image"]
+            if "text" in capabilities.get("output", []):
+                payload["modalities"] = ["image", "text"]
+            else:
+                payload["modalities"] = ["image"]
+
+        if image_config:
+            payload["image_config"] = image_config
 
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload) as resp:
@@ -470,9 +509,13 @@ class OpenRouterBot(commands.Bot):
             self.server_configs[gid] = {
                 "channel_id": None,
                 "model": DEFAULT_MODEL,
+                "vision_model": DEFAULT_VISION_MODEL,
+                "image_model": DEFAULT_IMAGE_MODEL,
                 "reset_time": None,
                 "search": False
             }
+        self.server_configs[gid].setdefault("vision_model", DEFAULT_VISION_MODEL)
+        self.server_configs[gid].setdefault("image_model", DEFAULT_IMAGE_MODEL)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -534,6 +577,33 @@ async def send_long_message(channel, content):
         await channel.send(chunk)
         await asyncio.sleep(0.5)
 
+async def send_generated_images(send_func, images, filename_prefix="generated"):
+    sent = 0
+    for idx, img_data_url in enumerate(images):
+        try:
+            if img_data_url.startswith("http://") or img_data_url.startswith("https://"):
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_data_url) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"remote image fetch failed: {resp.status}")
+                        binary = await resp.read()
+                        mime = resp.headers.get("Content-Type", "image/png")
+                        ext = mime.split("/")[-1] if "/" in mime else "png"
+            elif img_data_url.startswith("data:"):
+                header, b64_data = img_data_url.split(",", 1)
+                mime = header.split(":")[1].split(";")[0] if ":" in header else "image/png"
+                ext = mime.split("/")[-1] if "/" in mime else "png"
+                binary = base64.b64decode(b64_data)
+            else:
+                b64_data = img_data_url
+                ext = "png"
+                binary = base64.b64decode(b64_data)
+            await send_func(file=discord.File(fp=io.BytesIO(binary), filename=f"{filename_prefix}_{idx}.{ext}"))
+            sent += 1
+        except Exception as img_err:
+            print(f"⚠️ 이미지 전송 실패: {img_err}")
+    return sent
+
 def format_tokens(n):
     if n is None: return "N/A"
     try:
@@ -549,6 +619,70 @@ def format_date(timestamp):
         dt = datetime.fromtimestamp(int(timestamp))
         return dt.strftime("%Y-%m-%d")
     except: return "N/A"
+
+async def ensure_model_cache_loaded():
+    if not bot.or_client.models_list:
+        await bot.or_client.fetch_models_metadata()
+
+def is_image_attachment(att):
+    ct = att.content_type or ""
+    return ct.startswith('image')
+
+def build_image_config(aspect_ratio=None, image_size=None):
+    config = {}
+    if aspect_ratio:
+        config["aspect_ratio"] = aspect_ratio
+    if image_size:
+        config["image_size"] = image_size
+    return config or None
+
+async def build_model_choices(current: str, predicate=None) -> List[app_commands.Choice[str]]:
+    await ensure_model_cache_loaded()
+
+    models = bot.or_client.models_list
+    current_lower = current.lower()
+    filtered = [
+        m for m in models
+        if (current_lower in m['id'].lower() or current_lower in m['name'].lower())
+        and (predicate(m) if predicate else True)
+    ]
+
+    choices = []
+    for m in filtered[:25]:
+        name_display = f"{m['name']} ({format_date(m.get('created'))})"
+        if len(name_display) > 100:
+            name_display = name_display[:100]
+        choices.append(app_commands.Choice(name=name_display, value=m['id']))
+    return choices
+
+async def resolve_model_bundle(model_id):
+    info = await bot.or_client.resolve_model_info(model_id)
+    endpoints = await bot.or_client.fetch_model_endpoints(model_id)
+    caps = bot.or_client.analyze_model_capabilities(model_id, model_info=info)
+    return info, endpoints, caps
+
+async def validate_model_for_use(model_id, *, require_input=None, require_output=None):
+    clean_id = model_id.split(":")[0]
+    info, endpoints, caps = await resolve_model_bundle(clean_id)
+
+    if endpoints is not None and len(endpoints) == 0:
+        return None, endpoints, caps, f"`{clean_id}` 모델은 현재 이 API 키 기준으로 사용 가능한 OpenRouter endpoint가 없습니다."
+
+    if require_input and require_input not in caps["input"]:
+        return None, endpoints, caps, f"`{clean_id}` 모델은 `{require_input}` 입력을 지원하지 않습니다."
+
+    if require_output and require_output not in caps["output"]:
+        return None, endpoints, caps, f"`{clean_id}` 모델은 `{require_output}` 출력을 지원하지 않습니다."
+
+    return info, endpoints, caps, None
+
+def get_active_generation_model(config, base_caps):
+    image_model = config.get("image_model")
+    if image_model:
+        return image_model
+    if "image" in base_caps["output"]:
+        return config["model"]
+    return None
 
 # ================= 6. 이벤트 핸들러 =================
 @tasks.loop(hours=1)
@@ -580,13 +714,26 @@ async def on_message(message):
         async with message.channel.typing():
             try:
                 base_model = config["model"]
-                current_model = base_model + ":online" if config.get("search") else base_model
-                caps = bot.or_client.analyze_model_capabilities(base_model)
+                base_model_info = await bot.or_client.resolve_model_info(base_model)
+                base_caps = bot.or_client.analyze_model_capabilities(base_model, model_info=base_model_info)
+                current_model = base_model
+                caps = base_caps
+                has_current_image = any(is_image_attachment(att) for att in message.attachments)
+                vision_model = config.get("vision_model")
+
+                if has_current_image and "image" not in caps["input"] and vision_model:
+                    vision_info, _, vision_caps, vision_error = await validate_model_for_use(vision_model, require_input="image")
+                    if not vision_error:
+                        current_model = vision_info["id"]
+                        caps = vision_caps
+                        print(f"[ROUTE] 이미지 첨부 감지: `{base_model}` -> vision `{current_model}`")
+
                 can_see_image = "image" in caps["input"]
                 can_see_video = "video" in caps["input"]
                 can_see_audio = "audio" in caps["input"]
                 can_gen_image = "image" in caps["output"]
-                print(f"[CAPS] {base_model}: in={caps['input']} out={caps['output']}")
+                has_dedicated_image_model = bool(get_active_generation_model(config, base_caps))
+                print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
 
                 # 동적 시스템 프롬프트
                 sys_prompt = SYSTEM_PROMPT
@@ -595,12 +742,15 @@ async def on_message(message):
                 if can_see_video: capability_hints.append("You can analyze video files attached by users.")
                 if can_see_audio: capability_hints.append("You can analyze audio files attached by users.")
                 if can_gen_image: capability_hints.append("You can generate images when the user requests it.")
+                elif has_dedicated_image_model:
+                    capability_hints.append("A dedicated image generation model is available through the /image command.")
+                if config.get("search"): capability_hints.append("Web search is available for up-to-date information when needed.")
 
                 cannot_hints = []
                 if not can_see_image: cannot_hints.append("analyze images")
                 if not can_see_video: cannot_hints.append("analyze videos")
                 if not can_see_audio: cannot_hints.append("analyze audio")
-                if not can_gen_image: cannot_hints.append("generate images")
+                if not can_gen_image and not has_dedicated_image_model: cannot_hints.append("generate images")
                 if cannot_hints:
                     capability_hints.append(f"You CANNOT {', '.join(cannot_hints)}. If asked, politely tell the user to switch to a model that supports it using /model command.")
 
@@ -786,7 +936,12 @@ async def on_message(message):
 
                 # API 호출
                 try:
-                    response, usage, images = await bot.or_client.chat_completion(current_model, messages, capabilities=caps)
+                    response, usage, images = await bot.or_client.chat_completion(
+                        current_model,
+                        messages,
+                        capabilities=caps,
+                        enable_web_search=config.get("search", False),
+                    )
                 except Exception as e:
                     err_msg = str(e).lower()
                     if "no endpoints found for" in err_msg:
@@ -837,7 +992,11 @@ async def on_message(message):
                                     if part.get('type') == 'text':
                                         part['text'] += "\n(System: 미디어 첨부가 있었으나 이 모델이 처리하지 못했습니다.)"
                                         break
-                        response, usage, images = await bot.or_client.chat_completion(current_model, messages)
+                        response, usage, images = await bot.or_client.chat_completion(
+                            current_model,
+                            messages,
+                            enable_web_search=config.get("search", False),
+                        )
                     else:
                         raise e
 
@@ -857,20 +1016,7 @@ async def on_message(message):
                     await send_long_message(message.channel, response)
 
                 # 생성된 이미지 전송
-                for idx, img_data_url in enumerate(images):
-                    try:
-                        if img_data_url.startswith("data:"):
-                            header, b64_data = img_data_url.split(",", 1)
-                            # header: "data:image/png;base64"
-                            mime = header.split(":")[1].split(";")[0] if ":" in header else "image/png"
-                            ext = mime.split("/")[-1] if "/" in mime else "png"
-                        else:
-                            b64_data = img_data_url
-                            ext = "png"
-                        binary = base64.b64decode(b64_data)
-                        await message.channel.send(file=discord.File(fp=io.BytesIO(binary), filename=f"generated_{idx}.{ext}"))
-                    except Exception as img_err:
-                        print(f"⚠️ 이미지 전송 실패: {img_err}")
+                await send_generated_images(message.channel.send, images)
 
             except Exception as e:
                 print(f"❌ 오류: {str(e)}")
@@ -879,20 +1025,19 @@ async def on_message(message):
 # ================= 7. 명령어 =================
 
 async def model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    if not bot.or_client.models_list:
-        await bot.or_client.fetch_models_metadata()
-    
-    models = bot.or_client.models_list
-    current_lower = current.lower()
-    
-    filtered = [m for m in models if current_lower in m['id'].lower() or current_lower in m['name'].lower()]
-    
-    choices = []
-    for m in filtered[:25]:
-        name_display = f"{m['name']} ({format_date(m.get('created'))})"
-        if len(name_display) > 100: name_display = name_display[:100]
-        choices.append(app_commands.Choice(name=name_display, value=m['id']))
-    return choices
+    return await build_model_choices(current)
+
+async def vision_model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return await build_model_choices(
+        current,
+        predicate=lambda m: bot.or_client.supports_input_modality(m["id"], "image", model_info=m),
+    )
+
+async def image_model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return await build_model_choices(
+        current,
+        predicate=lambda m: bot.or_client.supports_output_modality(m["id"], "image", model_info=m),
+    )
 
 @bot.tree.command(name="model", description="사용할 AI 모델 변경")
 @app_commands.autocomplete(model_id=model_autocomplete)
@@ -900,27 +1045,10 @@ async def model_autocomplete(interaction: discord.Interaction, current: str) -> 
 async def set_model(interaction: discord.Interaction, model_id: str):
     await interaction.response.defer(ephemeral=True)
     clean_id = model_id.split(":")[0]
-    model_info = bot.or_client.get_model_info(clean_id)
-
-    if not model_info and not bot.or_client.models_list:
-        await bot.or_client.fetch_models_metadata()
-        model_info = bot.or_client.get_model_info(clean_id)
-
-    if not model_info:
-        model_info = await bot.or_client.fetch_model_details(clean_id)
-
-    endpoints = await bot.or_client.fetch_model_endpoints(clean_id)
-    if endpoints is not None and len(endpoints) == 0:
+    model_info, endpoints, _, error = await validate_model_for_use(clean_id)
+    if error:
         await interaction.followup.send(
-            f"❌ `{clean_id}` 모델은 현재 이 API 키 기준으로 사용 가능한 OpenRouter endpoint가 없습니다.\n"
-            f"`/refresh_models` 후 다시 선택해보세요.",
-            ephemeral=True,
-        )
-        return
-
-    if not model_info:
-        await interaction.followup.send(
-            f"❌ `{clean_id}` 모델 정보를 찾지 못했습니다. `/refresh_models` 후 다시 시도해보세요.",
+            f"❌ {error}\n`/refresh_models` 후 다시 시도해보세요.",
             ephemeral=True,
         )
         return
@@ -935,6 +1063,60 @@ async def set_model(interaction: discord.Interaction, model_id: str):
 
     await interaction.followup.send(
         f"✅ 모델 변경 완료!\n**{model_info['name']}** (`{model_info['id']}`)\n타입: **{type_str}** | 출시일: {created}{endpoint_suffix}",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="visionmodel", description="이미지 분석에 사용할 비전 모델 설정")
+@app_commands.autocomplete(model_id=vision_model_autocomplete)
+@app_commands.describe(model_id="비전 모델 ID 또는 clear")
+async def set_vision_model(interaction: discord.Interaction, model_id: str):
+    await interaction.response.defer(ephemeral=True)
+    clean_id = model_id.split(":")[0]
+    config = bot.get_config(interaction.guild_id)
+
+    if clean_id.lower() in ("clear", "none", "off"):
+        config["vision_model"] = None
+        bot.save_config()
+        await interaction.followup.send("✅ 비전 모델 설정을 해제했습니다.", ephemeral=True)
+        return
+
+    model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_input="image")
+    if error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+
+    config["vision_model"] = model_info["id"]
+    bot.save_config()
+    endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
+    await interaction.followup.send(
+        f"✅ 비전 모델 설정 완료: **{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="imagemodel", description="이미지 생성에 사용할 모델 설정")
+@app_commands.autocomplete(model_id=image_model_autocomplete)
+@app_commands.describe(model_id="이미지 생성 모델 ID 또는 clear")
+async def set_image_model(interaction: discord.Interaction, model_id: str):
+    await interaction.response.defer(ephemeral=True)
+    clean_id = model_id.split(":")[0]
+    config = bot.get_config(interaction.guild_id)
+
+    if clean_id.lower() in ("clear", "none", "off"):
+        config["image_model"] = None
+        bot.save_config()
+        await interaction.followup.send("✅ 이미지 생성 모델 설정을 해제했습니다.", ephemeral=True)
+        return
+
+    model_info, endpoints, _, error = await validate_model_for_use(clean_id, require_output="image")
+    if error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+
+    config["image_model"] = model_info["id"]
+    bot.save_config()
+    endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
+    await interaction.followup.send(
+        f"✅ 이미지 생성 모델 설정 완료: **{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
         ephemeral=True,
     )
 
@@ -985,6 +1167,14 @@ async def dashboard(interaction: discord.Interaction):
     if endpoints is not None:
         embed.add_field(name="🛰️ Routing", value=f"• **Available Endpoints:** {len(endpoints)}", inline=True)
 
+    helpers = [
+        f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
+        f"• **Vision Model:** `{config.get('vision_model') or 'none'}`",
+        f"• **Image Model:** `{config.get('image_model') or 'none'}`",
+        f"• **Model Source:** `{bot.or_client.models_source}`",
+    ]
+    embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
+
     desc = model_meta.get('description', '설명 없음')
     if len(desc) > 300: desc = desc[:297] + "..."
     embed.add_field(name="📝 Description", value=desc, inline=False)
@@ -1012,8 +1202,90 @@ async def toggle_search(interaction: discord.Interaction):
     config["search"] = not config.get("search", False)
     bot.save_config()
     state = "ON 🔍" if config["search"] else "OFF"
-    model_display = config["model"] + (":online" if config["search"] else "")
-    await interaction.response.send_message(f"✅ 웹 검색: **{state}**\n모델: `{model_display}`")
+    await interaction.response.send_message(
+        f"✅ 웹 검색: **{state}**\n방식: `openrouter:web_search` server tool\n기본 모델: `{config['model']}`"
+    )
+
+@bot.tree.command(name="image", description="이미지를 생성하거나 참조 이미지를 기반으로 편집")
+@app_commands.describe(
+    prompt="이미지 생성 프롬프트",
+    reference="편집/참조용 이미지",
+    aspect_ratio="원하는 비율",
+    image_size="원하는 해상도",
+)
+@app_commands.choices(
+    aspect_ratio=[app_commands.Choice(name=value, value=value) for value in IMAGE_ASPECT_RATIO_CHOICES],
+    image_size=[app_commands.Choice(name=value, value=value) for value in IMAGE_SIZE_CHOICES],
+)
+async def generate_image_cmd(
+    interaction: discord.Interaction,
+    prompt: str,
+    reference: discord.Attachment | None = None,
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
+):
+    await interaction.response.defer()
+    config = bot.get_config(interaction.guild_id)
+    base_model_info = await bot.or_client.resolve_model_info(config["model"])
+    base_caps = bot.or_client.analyze_model_capabilities(config["model"], model_info=base_model_info)
+    generation_model = get_active_generation_model(config, base_caps)
+
+    if not generation_model:
+        await interaction.followup.send(
+            "❌ 현재 설정에 이미지 생성 모델이 없습니다. `/imagemodel`로 설정하거나 이미지 출력을 지원하는 `/model`을 선택하세요."
+        )
+        return
+
+    model_info, _, caps, error = await validate_model_for_use(generation_model, require_output="image")
+    if error:
+        await interaction.followup.send(f"❌ {error}")
+        return
+
+    content = [{"type": "text", "text": prompt}]
+    if reference:
+        if not is_image_attachment(reference):
+            await interaction.followup.send("❌ 참조 파일은 이미지여야 합니다.")
+            return
+        if "image" not in caps["input"]:
+            await interaction.followup.send(
+                f"❌ `{model_info['id']}` 모델은 참조 이미지 입력을 지원하지 않습니다. 참조 없이 생성하거나 `/imagemodel`을 바꿔보세요."
+            )
+            return
+        if (reference.size or 0) > MAX_MEDIA_BASE64_MB * 1024 * 1024:
+            await interaction.followup.send(f"❌ 참조 이미지가 너무 큽니다. 최대 {MAX_MEDIA_BASE64_MB}MB까지 지원합니다.")
+            return
+        b64, mime = await encode_image(reference.url)
+        if not b64:
+            await interaction.followup.send("❌ 참조 이미지를 읽지 못했습니다.")
+            return
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Generate the requested image. "
+                "If a reference image is attached, use it as a direct editing/reference input. "
+                "Keep any text response brief."
+            ),
+        },
+        {"role": "user", "content": content},
+    ]
+
+    response, usage, images = await bot.or_client.chat_completion(
+        model_info["id"],
+        messages,
+        capabilities=caps,
+        image_config=build_image_config(aspect_ratio=aspect_ratio, image_size=image_size),
+    )
+
+    summary = response if response and response != "..." else f"🖼️ `{model_info['id']}`로 이미지 생성 완료"
+    total_tokens = usage.get("total_tokens", "N/A")
+    await interaction.followup.send(f"{summary}\n(Tokens: {total_tokens})")
+
+    sent = await send_generated_images(interaction.followup.send, images, filename_prefix="image")
+    if sent == 0:
+        await interaction.followup.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다.")
 
 @bot.tree.command(name="refresh_models", description="OpenRouter 모델 리스트 즉시 갱신")
 async def refresh_models_cmd(interaction: discord.Interaction):
