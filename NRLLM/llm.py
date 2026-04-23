@@ -67,8 +67,6 @@ DEFAULT_MEMORY_MODEL = os.environ.get("LLM_MEMORY_MODEL", DEFAULT_MODEL)
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
-MEMORY_MAX_ITEMS_PER_USER = 12
-MEMORY_MAX_RECENT_NAMES = 5
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -103,52 +101,12 @@ You are an AI member of this Discord server.
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
-MEMORY_FILE = os.environ.get("LLM_MEMORY_FILE", os.path.join(os.path.dirname(CONFIG_FILE), "llm_memory.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
 RECENT_IMAGE_DIR = os.environ.get("LLM_RECENT_IMAGE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_recent_images"))
 RECENT_IMAGE_INDEX_FILE = os.path.join(RECENT_IMAGE_DIR, "index.json")
 RECENT_IMAGE_LIMIT = 2
 HISTORY_DEBUG_LOGS = False
-
-MEMORY_EXTRACTION_SCHEMA = {
-    "name": "speaker_memory_update",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "speaker_updates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "user_id": {"type": "string"},
-                        "display_name": {"type": "string"},
-                        "items": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "enum": ["fact", "position", "preference", "reported_claim"]},
-                                    "key": {"type": "string"},
-                                    "value": {"type": "string"},
-                                    "subject": {"type": "string"},
-                                    "confidence": {"type": "number"},
-                                },
-                                "required": ["type", "key", "value", "subject", "confidence"],
-                                "additionalProperties": False,
-                            },
-                        },
-                    },
-                    "required": ["user_id", "display_name", "items"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["speaker_updates"],
-        "additionalProperties": False,
-    },
-}
 
 IMAGE_ROUTE_SCHEMA = {
     "name": "image_route_decision",
@@ -376,144 +334,6 @@ class DocumentCache:
                 blocks.append(f"[{title}: {doc_id} | {label}]")
         return blocks
 
-
-class MemoryStore:
-    def __init__(self, filename):
-        self.filename = filename
-        self.data = self._load()
-
-    def _default(self):
-        return {"version": 1, "servers": {}}
-
-    def _load(self):
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    data.setdefault("version", 1)
-                    data.setdefault("servers", {})
-                    return data
-            except Exception:
-                pass
-        return self._default()
-
-    def save(self):
-        try:
-            with open(self.filename, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def get_server(self, guild_id):
-        gid = str(guild_id)
-        servers = self.data.setdefault("servers", {})
-        if gid not in servers:
-            servers[gid] = {
-                "speaker_state": {},
-            }
-        return servers[gid]
-
-    def clear_speaker_state(self, guild_id):
-        server = self.get_server(guild_id)
-        server["speaker_state"] = {}
-        self.save()
-
-    def touch_user(self, guild_id, user_id, display_name):
-        server = self.get_server(guild_id)
-        speaker_state = server.setdefault("speaker_state", {})
-        user_id = str(user_id)
-        display_name = (display_name or user_id).strip()
-        state = speaker_state.setdefault(
-            user_id,
-            {
-                "user_id": user_id,
-                "current_display_name": display_name,
-                "recent_display_names": [display_name],
-                "items": [],
-            },
-        )
-        state["current_display_name"] = display_name
-        recent_names = [display_name] + [name for name in state.get("recent_display_names", []) if name != display_name]
-        state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
-        self.save()
-
-    def render_speaker_state(self, guild_id):
-        speaker_state = self.get_server(guild_id).get("speaker_state", {})
-        lines = []
-        for user_id, payload in speaker_state.items():
-            display_name = payload.get("current_display_name") or user_id
-            aliases = [name for name in payload.get("recent_display_names", []) if name != display_name]
-            item_lines = []
-            for item in payload.get("items", [])[:MEMORY_MAX_ITEMS_PER_USER]:
-                prefix = item.get("type", "fact")
-                subject = item.get("subject", "self")
-                item_lines.append(f"{prefix}:{subject}:{item.get('key')}={item.get('value')}")
-            if item_lines:
-                alias_suffix = f" [aka {', '.join(aliases[:3])}]" if aliases else ""
-                lines.append(f"- {display_name}{alias_suffix} ({user_id}): " + " | ".join(item_lines))
-        if not lines:
-            return ""
-        return "[Speaker Memory]\n" + "\n".join(lines)
-
-    def merge_speaker_updates(self, guild_id, updates, *, source_message_id):
-        server = self.get_server(guild_id)
-        speaker_state = server.setdefault("speaker_state", {})
-        now = datetime.now(timezone.utc).isoformat()
-
-        for update in updates:
-            user_id = str(update.get("user_id") or "").strip()
-            if not user_id:
-                continue
-            display_name = (update.get("display_name") or user_id).strip()
-            state = speaker_state.setdefault(
-                user_id,
-                {
-                    "user_id": user_id,
-                    "current_display_name": display_name,
-                    "recent_display_names": [display_name],
-                    "items": [],
-                },
-            )
-
-            state["current_display_name"] = display_name
-            recent_names = [display_name] + [n for n in state.get("recent_display_names", []) if n != display_name]
-            state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
-
-            for item in update.get("items", []):
-                key = (item.get("key") or "").strip()
-                value = (item.get("value") or "").strip()
-                item_type = item.get("type") or "fact"
-                subject = item.get("subject") or "self"
-                confidence = float(item.get("confidence") or 0)
-                if not key or not value:
-                    continue
-                normalized = {
-                    "type": item_type,
-                    "key": key,
-                    "value": value,
-                    "subject": subject,
-                    "confidence": max(0.0, min(1.0, confidence)),
-                    "source_message_id": str(source_message_id),
-                    "updated_at": now,
-                }
-
-                items = state.setdefault("items", [])
-                replaced = False
-                for idx, existing in enumerate(items):
-                    if (
-                        existing.get("type") == item_type
-                        and existing.get("key") == key
-                        and existing.get("subject") == subject
-                    ):
-                        items[idx] = normalized
-                        replaced = True
-                        break
-                if not replaced:
-                    items.insert(0, normalized)
-                state["items"] = items[:MEMORY_MAX_ITEMS_PER_USER]
-
-        self.save()
 
 def log_history_debug(message):
     if HISTORY_DEBUG_LOGS:
@@ -946,7 +766,6 @@ class OpenRouterBot(commands.Bot):
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
-        self.memory_store = MemoryStore(MEMORY_FILE)
         self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
 
     async def setup_hook(self):
@@ -1313,48 +1132,6 @@ def build_recent_conversation_excerpt(history_messages, current_user_text):
     return "\n\n".join(line for line in lines if line)
 
 
-async def update_speaker_memory(guild, config, history_messages, current_user_text, message):
-    excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
-    if not excerpt:
-        return
-
-    current_state = bot.memory_store.render_speaker_state(guild.id)
-    memory_prompt = (
-        "You extract durable, user-specific conversation memory.\n"
-        "Prefer returning an empty speaker_updates array unless the excerpt contains a clear durable user state.\n"
-        "Store only explicit, stable, user-specific facts that are likely useful weeks later: identity, location, job, owned assets, ongoing projects, persistent preferences, constraints, plans, or relationships.\n"
-        "Do NOT store one-off questions, current-event/news discussion, temporary curiosity, jokes, tone, inferred interests, speculative guesses, or generic facts about the world.\n"
-        "Do NOT rewrite the recent conversation into memory. If the same information is only useful for the next few replies, leave it in raw history and return empty.\n"
-        "Only store a preference/position when the user explicitly states a stable preference or stance, not merely because they asked about a topic.\n"
-        "Use reported_claim only for durable second-hand information about the user or a named person close to them; do not store reported claims about world events or news.\n"
-        "Use short normalized values, not verbatim message copies. If uncertain, return empty.\n\n"
-        f"Current speaker memory:\n{current_state or '(empty)'}\n\n"
-        f"Conversation excerpt:\n{excerpt}"
-    )
-    try:
-        response_text, _, _, _ = await bot.or_client.chat_completion(
-            DEFAULT_MEMORY_MODEL,
-            [
-                {"role": "system", "content": "Return valid JSON only."},
-                {"role": "user", "content": memory_prompt},
-            ],
-            response_format={"type": "json_schema", "json_schema": MEMORY_EXTRACTION_SCHEMA},
-            provider=build_provider_preferences(config.get("provider_policy"), strict=True),
-            require_parameter_support=True,
-            cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
-                {"content": memory_prompt},
-            ]),
-        )
-        payload = coerce_json_object(response_text)
-        if not payload:
-            return
-        updates = payload.get("speaker_updates", [])
-        if updates:
-            bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
-    except Exception as e:
-        print(f"⚠️ 화자 메모리 업데이트 실패: {e}")
-
-
 async def handle_natural_image_request(message, config, history_messages, current_user_text, *, reference_inputs=None):
     base_model_info = await bot.or_client.resolve_model_info(config["model"])
     base_caps = bot.or_client.analyze_model_capabilities(config["model"], model_info=base_model_info)
@@ -1470,7 +1247,6 @@ async def on_message(message):
                 image_command_model, _ = get_active_generation_model(config, base_caps)
                 has_chat_image_support = bool(image_command_model)
                 current_member = message.guild.get_member(message.author.id) or message.author
-                bot.memory_store.touch_user(message.guild.id, message.author.id, current_member.display_name)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
 
                 sys_prompt = SYSTEM_PROMPT
@@ -1503,12 +1279,6 @@ async def on_message(message):
                     sys_prompt += "\n" + "\n".join(f"- {hint}" for hint in capability_hints)
 
                 messages = [{"role": "system", "content": sys_prompt}]
-                memory_blocks = [
-                    bot.memory_store.render_speaker_state(message.guild.id),
-                ]
-                rendered_memory = "\n\n".join(block for block in memory_blocks if block)
-                if rendered_memory:
-                    messages.append({"role": "system", "content": rendered_memory})
 
                 reset_dt = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
@@ -1707,7 +1477,6 @@ async def on_message(message):
                         reference_inputs=reference_inputs,
                     )
                     if handled:
-                        await update_speaker_memory(message.guild, config, history_buffer, user_text, message)
                         return
 
                 if route.get("action") == "inspect_recent_images" and not current_image_inputs and route.get("use_recent_images"):
@@ -1844,8 +1613,6 @@ async def on_message(message):
 
                 await send_generated_images(message.channel.send, images, on_sent=_register)
 
-                await update_speaker_memory(message.guild, config, history_buffer, user_text, message)
-
             except Exception as e:
                 print(f"❌ 오류: {str(e)}")
                 await message.channel.send(f"❌ 오류: {str(e)}")
@@ -1862,7 +1629,6 @@ async def image_generation_model_autocomplete(interaction: discord.Interaction, 
     )
 
 model_group = app_commands.Group(name="model", description="모델 관련 설정")
-reset_group = app_commands.Group(name="reset", description="메모리/맥락 초기화")
 
 
 @model_group.command(name="set", description="기본 채팅 모델 변경")
@@ -1924,14 +1690,8 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     )
 
 
-@reset_group.command(name="speaker", description="화자 상태 메모리만 초기화")
-async def reset_speaker_state(interaction: discord.Interaction):
-    bot.memory_store.clear_speaker_state(interaction.guild_id)
-    await interaction.response.send_message(f"🧼 {interaction.user.display_name}님이 화자 상태 메모리를 초기화했습니다.")
-
-
-@reset_group.command(name="context", description="원문 대화 기준 시점을 초기화")
-async def reset_context(interaction: discord.Interaction):
+@bot.tree.command(name="reset", description="원문 대화 기준 시점을 초기화")
+async def reset_history(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["reset_time"] = datetime.now(timezone.utc).isoformat()
     bot.save_config()
@@ -1991,8 +1751,6 @@ async def dashboard(interaction: discord.Interaction):
     caps = bot.or_client.analyze_model_capabilities(curr_model, model_info=model_meta)
     is_multimodal = len(caps["input"]) > 1 or len(caps["output"]) > 1
     endpoints = await bot.or_client.fetch_model_endpoints(curr_model)
-    server_memory = bot.memory_store.get_server(interaction.guild_id)
-    speaker_users = len(server_memory.get("speaker_state", {}))
 
     color = 0x00bcd4 if is_multimodal else 0x4caf50
     embed = discord.Embed(title="🎛️ OpenRouter Dashboard", color=color)
@@ -2038,7 +1796,6 @@ async def dashboard(interaction: discord.Interaction):
         f"• **Image Models:** {count_image_generation_models()} discovered",
         f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
         f"• **History:** {get_history_limit(config)} messages",
-        f"• **Speaker Memory:** {speaker_users} users",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
 
@@ -2087,7 +1844,6 @@ async def refresh_models_cmd(interaction: discord.Interaction):
         )
 
 bot.tree.add_command(model_group)
-bot.tree.add_command(reset_group)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)

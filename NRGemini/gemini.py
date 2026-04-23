@@ -99,7 +99,6 @@ DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research-max"]["text"],
 }
 ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3-flash"]["text"])
-GEMINI_MEMORY_MODEL = os.environ.get("GEMINI_MEMORY_MODEL", ROUTING_MODEL)
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
 DEFAULT_HISTORY_LIMIT = 20
@@ -109,9 +108,6 @@ IMAGE_SEARCH_LIMIT = 2
 MAX_REF_IMAGES = 1
 MAX_DOC_CHARS = 12000
 MEMORY_EXCERPT_MAX_CHARS = 5000
-MEMORY_UPDATE_WINDOW = 8
-MEMORY_MAX_ITEMS_PER_USER = 12
-MEMORY_MAX_RECENT_NAMES = 5
 TEXT_ATTACHMENT_EXTENSIONS = (
     ".txt", ".py", ".json", ".md", ".c", ".cpp", ".js", ".html", ".css",
     ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
@@ -174,7 +170,6 @@ You are an AI image generator assistant.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
-MEMORY_FILE = os.environ.get("GEMINI_MEMORY_FILE", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_memory.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("GEMINI_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_doc_cache"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
@@ -807,39 +802,6 @@ class DataManager:
         except: pass
 
 
-MEMORY_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "speaker_updates": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "display_name": {"type": "string"},
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "type": {"type": "string", "enum": ["fact", "position", "preference", "reported_claim"]},
-                                "key": {"type": "string"},
-                                "value": {"type": "string"},
-                                "subject": {"type": "string"},
-                                "confidence": {"type": "number"},
-                            },
-                            "required": ["type", "key", "value", "subject", "confidence"],
-                        },
-                    },
-                },
-                "required": ["user_id", "display_name", "items"],
-            },
-        },
-    },
-    "required": ["speaker_updates"],
-}
-
-
 IMAGE_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -853,136 +815,6 @@ IMAGE_ACTION_SCHEMA = {
     },
     "required": ["action", "refined_prompt", "use_recent_images", "reason"],
 }
-
-
-class MemoryStore:
-    def __init__(self, filename):
-        self.filename = filename
-        self.data = self._load()
-
-    def _default(self):
-        return {"version": 1, "servers": {}}
-
-    def _load(self):
-        data = DataManager.load_json(self.filename, self._default())
-        if isinstance(data, dict):
-            data.setdefault("version", 1)
-            data.setdefault("servers", {})
-            return data
-        return self._default()
-
-    def save(self):
-        DataManager.save_json(self.filename, self.data)
-
-    def get_server(self, guild_id):
-        gid = str(guild_id)
-        servers = self.data.setdefault("servers", {})
-        if gid not in servers:
-            servers[gid] = {
-                "speaker_state": {},
-            }
-        return servers[gid]
-
-    def clear_speaker_state(self, guild_id):
-        server = self.get_server(guild_id)
-        server["speaker_state"] = {}
-        self.save()
-
-    def touch_user(self, guild_id, user_id, display_name):
-        server = self.get_server(guild_id)
-        speaker_state = server.setdefault("speaker_state", {})
-        user_id = str(user_id)
-        display_name = (display_name or user_id).strip()
-        state = speaker_state.setdefault(
-            user_id,
-            {
-                "user_id": user_id,
-                "current_display_name": display_name,
-                "recent_display_names": [display_name],
-                "items": [],
-            },
-        )
-        state["current_display_name"] = display_name
-        recent_names = [display_name] + [name for name in state.get("recent_display_names", []) if name != display_name]
-        state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
-        self.save()
-
-    def render_speaker_state(self, guild_id):
-        speaker_state = self.get_server(guild_id).get("speaker_state", {})
-        lines = []
-        for user_id, payload in speaker_state.items():
-            display_name = payload.get("current_display_name") or user_id
-            aliases = [name for name in payload.get("recent_display_names", []) if name != display_name]
-            item_lines = []
-            for item in payload.get("items", [])[:MEMORY_MAX_ITEMS_PER_USER]:
-                prefix = item.get("type", "fact")
-                subject = item.get("subject", "self")
-                item_lines.append(f"{prefix}:{subject}:{item.get('key')}={item.get('value')}")
-            if item_lines:
-                alias_suffix = f" [aka {', '.join(aliases[:3])}]" if aliases else ""
-                lines.append(f"- {display_name}{alias_suffix} ({user_id}): " + " | ".join(item_lines))
-        if not lines:
-            return ""
-        return "[Speaker Memory]\n" + "\n".join(lines)
-
-    def merge_speaker_updates(self, guild_id, updates, *, source_message_id):
-        server = self.get_server(guild_id)
-        speaker_state = server.setdefault("speaker_state", {})
-        now = datetime.now(timezone.utc).isoformat()
-
-        for update in updates:
-            user_id = str(update.get("user_id") or "").strip()
-            if not user_id:
-                continue
-            display_name = (update.get("display_name") or user_id).strip()
-            state = speaker_state.setdefault(
-                user_id,
-                {
-                    "user_id": user_id,
-                    "current_display_name": display_name,
-                    "recent_display_names": [display_name],
-                    "items": [],
-                },
-            )
-
-            state["current_display_name"] = display_name
-            recent_names = [display_name] + [n for n in state.get("recent_display_names", []) if n != display_name]
-            state["recent_display_names"] = recent_names[:MEMORY_MAX_RECENT_NAMES]
-
-            for item in update.get("items", []):
-                key = (item.get("key") or "").strip()
-                value = (item.get("value") or "").strip()
-                item_type = item.get("type") or "fact"
-                subject = item.get("subject") or "self"
-                confidence = float(item.get("confidence") or 0)
-                if not key or not value:
-                    continue
-                normalized = {
-                    "type": item_type,
-                    "key": key,
-                    "value": value,
-                    "subject": subject,
-                    "confidence": max(0.0, min(1.0, confidence)),
-                    "source_message_id": str(source_message_id),
-                    "updated_at": now,
-                }
-
-                items = state.setdefault("items", [])
-                replaced = False
-                for idx, existing in enumerate(items):
-                    if (
-                        existing.get("type") == item_type
-                        and existing.get("key") == key
-                        and existing.get("subject") == subject
-                    ):
-                        items[idx] = normalized
-                        replaced = True
-                        break
-                if not replaced:
-                    items.insert(0, normalized)
-                state["items"] = items[:MEMORY_MAX_ITEMS_PER_USER]
-
-        self.save()
 
 
 class RecentImageStore:
@@ -1355,32 +1187,8 @@ def get_structured_helper_model(text_model=None):
     return ROUTING_MODEL if is_deep_research_model(text_model) else (text_model or ROUTING_MODEL)
 
 
-def build_gemini_system_prompt(memory_context=None):
-    if not memory_context:
-        return SYSTEM_PROMPT
-    return f"{SYSTEM_PROMPT}\n\n## Server Memory\n{memory_context}"
-
-
-def sanitize_for_memory_excerpt(text):
-    cleaned = re.sub(
-        r"\[(?:Attached File Content|Current File|Webpage Content):[^\]]+\]\s*```.*?```",
-        "[Large attached content omitted]",
-        text or "",
-        flags=re.DOTALL,
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:MEMORY_EXCERPT_MAX_CHARS]
-
-
-def build_recent_conversation_excerpt(history_texts, current_user_text):
-    lines = []
-    for text in history_texts[-MEMORY_UPDATE_WINDOW:]:
-        cleaned = sanitize_for_memory_excerpt(text)
-        if cleaned:
-            lines.append(cleaned)
-    if current_user_text:
-        lines.append(sanitize_for_memory_excerpt(current_user_text))
-    return "\n\n".join(line for line in lines if line)
+def build_gemini_system_prompt():
+    return SYSTEM_PROMPT
 
 
 def text_from_parts(parts):
@@ -1653,14 +1461,14 @@ async def send_deep_research_report(channel, report):
     )
 
 
-async def call_deep_research(history_contents, agent_id, memory_context=None):
+async def call_deep_research(history_contents, agent_id):
     if not CLIENT:
         return "Error: API Client not initialized"
     conversation = flatten_contents_for_interactions(history_contents)
     if not conversation:
         return "[ERROR] Deep Research에 전달할 텍스트가 없습니다."
     prompt = (
-        f"{build_gemini_system_prompt(memory_context)}\n\n"
+        f"{build_gemini_system_prompt()}\n\n"
         "## Conversation\n"
         f"{conversation}"
     )
@@ -1702,54 +1510,6 @@ async def call_deep_research(history_contents, agent_id, memory_context=None):
         return "[ERROR] Deep Research 작업이 제한 시간 안에 끝나지 않았습니다."
     except Exception as e:
         return f"[ERROR] Deep Research 호출 실패: {e}"
-
-
-async def generate_json_with_gemini(prompt, schema):
-    if not CLIENT:
-        return None
-    try:
-        response = await CLIENT.aio.models.generate_content(
-            model=get_structured_helper_model(GEMINI_MEMORY_MODEL),
-            contents=prompt,
-            config=build_json_generation_config(schema),
-        )
-        return coerce_json_object(response.text)
-    except Exception as e:
-        print(f"[MEMORY] JSON 생성 실패: {e}")
-        return None
-
-
-async def update_speaker_memory(guild, history_texts, current_user_text, message):
-    excerpt = build_recent_conversation_excerpt(history_texts, current_user_text)
-    if not excerpt:
-        return
-
-    current_state = bot.memory_store.render_speaker_state(guild.id)
-    memory_prompt = (
-        "You extract durable, user-specific conversation memory.\n"
-        "Prefer returning an empty speaker_updates array unless the excerpt contains a clear durable user state.\n"
-        "Store only explicit, stable, user-specific facts that are likely useful weeks later: identity, location, job, owned assets, ongoing projects, persistent preferences, constraints, plans, or relationships.\n"
-        "Do NOT store one-off questions, current-event/news discussion, temporary curiosity, jokes, tone, inferred interests, speculative guesses, or generic facts about the world.\n"
-        "Do NOT rewrite the recent conversation into memory. If the same information is only useful for the next few replies, leave it in raw history and return empty.\n"
-        "Only store a preference/position when the user explicitly states a stable preference or stance, not merely because they asked about a topic.\n"
-        "Use reported_claim only for durable second-hand information about the user or a named person close to them; do not store reported claims about world events or news.\n"
-        "Use short normalized values, not verbatim message copies. If uncertain, return empty.\n\n"
-        f"Current speaker memory:\n{current_state or '(empty)'}\n\n"
-        f"Conversation excerpt:\n{excerpt}"
-    )
-    payload = await generate_json_with_gemini(memory_prompt, MEMORY_EXTRACTION_SCHEMA)
-    if not payload:
-        return
-    updates = payload.get("speaker_updates", [])
-    if updates:
-        bot.memory_store.merge_speaker_updates(guild.id, updates, source_message_id=message.id)
-
-
-async def update_gemini_memory(guild, history_texts, current_user_text, message):
-    try:
-        await update_speaker_memory(guild, history_texts, current_user_text, message)
-    except Exception as e:
-        print(f"[MEMORY] Gemini 메모리 업데이트 실패: {e}")
 
 
 async def route_message_action(last_user_msg, *, guild_id, has_current_images=False, text_model=None):
@@ -1938,12 +1698,12 @@ async def check_media_intent(last_user_msg, text_model=None):
     except:
         return "NONE"
 
-async def call_gemini(history_contents, last_user_msg="", text_model=None, memory_context=None):
+async def call_gemini(history_contents, last_user_msg="", text_model=None):
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
     if is_deep_research_model(text_model):
-        return await call_deep_research(history_contents, text_model, memory_context=memory_context), 0
+        return await call_deep_research(history_contents, text_model), 0
     tools = [types.Tool(google_search=types.GoogleSearch())]
 
     safety_settings = [
@@ -1958,7 +1718,7 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None, memor
             model=text_model,
             contents=history_contents,
             config=types.GenerateContentConfig(
-                system_instruction=build_gemini_system_prompt(memory_context),
+                system_instruction=build_gemini_system_prompt(),
                 tools=tools,
                 temperature=0.7,
                 safety_settings=safety_settings
@@ -1988,7 +1748,6 @@ class GeminiBot(commands.Bot):
         self.loop_monitor_expected = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
         self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
-        self.memory_store = MemoryStore(MEMORY_FILE)
         self.sound_files = scan_sound_files()
         global_cfg = self.get_global_config()
         self.sound_volume = clamp_sound_volume(global_cfg.get("sound_volume", SOUND_VOLUME))
@@ -2836,7 +2595,6 @@ async def on_message(message):
                         break
 
                 _cur_member = message.guild.get_member(message.author.id) or message.author
-                bot.memory_store.touch_user(message.guild.id, message.author.id, _cur_member.display_name)
                 current_parts = [types.Part(text=f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}")]
                 current_ref_images = []
                 has_current_images = False
@@ -2936,7 +2694,6 @@ async def on_message(message):
                         err_msg = f"[ERROR] Image Generation Failed: {str(e)}"
                         print(err_msg)
                         await status_msg.edit(content=err_msg)
-                    await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
                     return
 
                 if route.get("action") == "inspect_recent_images" and not has_current_images and route.get("use_recent_images"):
@@ -2945,11 +2702,6 @@ async def on_message(message):
                         current_parts = recent_parts + current_parts
 
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
-                memory_context = "\n\n".join(
-                    block for block in [
-                        bot.memory_store.render_speaker_state(message.guild.id),
-                    ] if block
-                )
 
                 if is_deep_research_model(server_text_model):
                     await message.channel.send(
@@ -2960,22 +2712,14 @@ async def on_message(message):
                     full_contents,
                     message.content,
                     text_model=server_text_model,
-                    memory_context=memory_context,
                 )
 
                 if isinstance(response, dict) and response.get("kind") == "deep_research_report":
                     await send_deep_research_report(message.channel, response)
-                    await update_gemini_memory(
-                        message.guild,
-                        history_texts,
-                        response.get("text_preview") or text_from_parts(current_parts),
-                        message,
-                    )
                     return
 
                 if isinstance(response, str):
                     await send_long_message(message.channel, response)
-                    await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
                     return
 
                 if not response.candidates:
@@ -3002,7 +2746,6 @@ async def on_message(message):
                 if text_reply.strip():
                     print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Finish: {finish_reason})")
                     await send_long_message(message.channel, text_reply)
-                    await update_gemini_memory(message.guild, history_texts, text_from_parts(current_parts), message)
 
                 # video_calls 처리 — 비용 절감으로 임시 비활성화
 
@@ -3048,11 +2791,8 @@ async def set_history(interaction: discord.Interaction, count: int | None = None
         f"[OK] {interaction.user.display_name}님이 Gemini 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
     )
 
-reset_group = app_commands.Group(name="reset", description="Gemini 메모리/맥락 초기화")
-
-
-@reset_group.command(name="context", description="원문 대화 기준 시점을 초기화")
-async def reset_context(interaction: discord.Interaction):
+@bot.tree.command(name="reset", description="원문 대화 기준 시점을 초기화")
+async def reset_history(interaction: discord.Interaction):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
         return
@@ -3061,17 +2801,6 @@ async def reset_context(interaction: discord.Interaction):
     bot.save_config()
     await interaction.response.send_message(
         f"[OK] {interaction.user.display_name}님이 Gemini 원문 대화 기준 시점을 초기화했습니다."
-    )
-
-
-@reset_group.command(name="speaker", description="화자 상태 메모리만 초기화")
-async def reset_speaker(interaction: discord.Interaction):
-    if not interaction.guild:
-        await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
-        return
-    bot.memory_store.clear_speaker_state(interaction.guild_id)
-    await interaction.response.send_message(
-        f"[OK] {interaction.user.display_name}님이 Gemini 화자 상태 메모리를 초기화했습니다."
     )
 
 # ================= 6. User Install 슬래시 커맨드 =================
@@ -3746,8 +3475,6 @@ async def model_autocomplete(interaction: discord.Interaction, current: str):
         for key, info in AVAILABLE_MODELS.items()
         if current.lower() in key.lower() or current.lower() in info['text'].lower()
     ][:25]
-
-bot.tree.add_command(reset_group)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
