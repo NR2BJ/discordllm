@@ -792,14 +792,20 @@ class DataManager:
         if os.path.exists(filename):
             try:
                 with open(filename, 'r', encoding='utf-8') as f: return json.load(f)
-            except: pass
+            except Exception as e:
+                print(f"[WARN] JSON 로드 실패: {filename}: {e}")
         return default_data
 
     @staticmethod
     def save_json(filename, data):
         try:
-            with open(filename, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2, ensure_ascii=False)
-        except: pass
+            os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+            tmp_filename = f"{filename}.tmp"
+            with open(tmp_filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_filename, filename)
+        except Exception as e:
+            print(f"[WARN] JSON 저장 실패: {filename}: {e}")
 
 
 IMAGE_ACTION_SCHEMA = {
@@ -1751,7 +1757,10 @@ class GeminiBot(commands.Bot):
         self.sound_files = scan_sound_files()
         global_cfg = self.get_global_config()
         self.sound_volume = clamp_sound_volume(global_cfg.get("sound_volume", SOUND_VOLUME))
-        global_cfg["sound_volume"] = self.sound_volume
+        if global_cfg.get("sound_volume") != self.sound_volume:
+            global_cfg["sound_volume"] = self.sound_volume
+            self.save_config()
+        print(f"[SOUND] 볼륨 로드: {int(self.sound_volume * 100)}% ({CONFIG_FILE})")
         self._sound_dir_mtime = self._get_sound_dir_mtime()
         global SIBO_LATENCY_COMP
         SIBO_LATENCY_COMP = self.server_configs.get("_global", {}).get("sibo_comp", SIBO_LATENCY_COMP)
@@ -1811,8 +1820,11 @@ class GeminiBot(commands.Bot):
         return result
 
     def get_global_config(self):
-        global_cfg = self.server_configs.setdefault("_global", {})
-        return global_cfg if isinstance(global_cfg, dict) else {}
+        global_cfg = self.server_configs.get("_global")
+        if not isinstance(global_cfg, dict):
+            global_cfg = {}
+            self.server_configs["_global"] = global_cfg
+        return global_cfg
 
     def get_lavalink_session_id(self):
         return self.get_global_config().get("lavalink_session_id")
@@ -1828,6 +1840,7 @@ class GeminiBot(commands.Bot):
         self.sound_volume = clamp_sound_volume(volume)
         self.get_global_config()["sound_volume"] = self.sound_volume
         self.save_config()
+        print(f"[SOUND] 볼륨 저장: {int(self.sound_volume * 100)}% ({CONFIG_FILE})")
 
     def save_config(self):
         DataManager.save_json(CONFIG_FILE, self.server_configs)
