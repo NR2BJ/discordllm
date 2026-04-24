@@ -181,6 +181,7 @@ SOUND_DIR = os.path.join(BASE_DIR, "sb")
 SOUND_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.weba')
 os.makedirs(SOUND_DIR, exist_ok=True)
 os.makedirs(os.path.join(SOUND_DIR, "discord"), exist_ok=True)
+LAVALINK_PAD_CACHE_DIR = Path(os.environ.get("GEMINI_LAVALINK_PAD_CACHE_DIR", os.path.join(SOUND_DIR, ".gemini_lavalink_pad")))
 SOUND_VOLUME = 0.15  # 기본 볼륨 (0.0~1.0)
 MIN_SOUND_VOLUME = 0.01
 MAX_SOUND_VOLUME = 1.0
@@ -648,7 +649,10 @@ def scan_sound_files():
     """재귀 스캔. 키: 상대경로(확장자 제외, 소문자). 값: 절대경로."""
     sounds = {}
     for root, dirs, files in os.walk(SOUND_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
         for f in files:
+            if f.startswith("."):
+                continue
             ext = os.path.splitext(f)[1].lower()
             if ext in SOUND_EXTENSIONS:
                 fullpath = os.path.join(root, f)
@@ -684,11 +688,16 @@ async def ensure_lavalink_lead_in(filepath, lead_in_ms):
     if lead_in_ms <= 0:
         return filepath
     src = Path(filepath)
-    cache_dir = Path(tempfile.gettempdir()) / "gemini_lavalink_pad"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = LAVALINK_PAD_CACHE_DIR
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[LAVALINK] 선행 무음 패딩 캐시 생성 실패: {cache_dir}: {e}")
+        return filepath
     file_stamp = f"{src.resolve()}::{src.stat().st_mtime_ns}::{lead_in_ms}"
     digest = hashlib.sha1(file_stamp.encode("utf-8")).hexdigest()[:16]
-    output_path = cache_dir / f"{src.stem}_lead_{lead_in_ms}_{digest}.wav"
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", unicodedata.normalize("NFC", src.stem)).strip("._") or "sound"
+    output_path = cache_dir / f"{safe_stem}_lead_{lead_in_ms}_{digest}.wav"
     if output_path.exists():
         return str(output_path)
 
@@ -1773,7 +1782,10 @@ class GeminiBot(commands.Bot):
         """SOUND_DIR 전체의 최신 mtime 반환."""
         latest = 0
         for root, dirs, files in os.walk(SOUND_DIR):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
             for name in files + dirs:
+                if name.startswith("."):
+                    continue
                 try:
                     mt = os.path.getmtime(os.path.join(root, name))
                     if mt > latest:

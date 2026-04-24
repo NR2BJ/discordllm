@@ -212,16 +212,47 @@ static void ConfigureDaveLogging()
 {
     try
     {
-        Discord.LibDave.Dave.SetLogSink(static (severity, filePath, lineNumber, message) =>
+        var minRank = DaveLogRank(Environment.GetEnvironmentVariable("BAEKSU_DAVE_LOG_LEVEL") ?? "Warning");
+        Discord.LibDave.Dave.SetLogSink((severity, filePath, lineNumber, message) =>
         {
+            if (DaveLogRank(severity.ToString()) < minRank)
+            {
+                return;
+            }
             var fileName = Path.GetFileName(filePath);
             Console.WriteLine($"[BAEKSU][LIBDAVE:{severity}] {fileName}#{lineNumber} {message}");
         });
+        Console.WriteLine($"[BAEKSU] libdave log level >= {DaveLogName(minRank)}");
     }
     catch (Exception ex)
     {
         Console.WriteLine($"[BAEKSU] failed to configure libdave log sink: {ex.Message}");
     }
+}
+
+static int DaveLogRank(string? severity)
+{
+    return severity switch
+    {
+        "Verbose" => 0,
+        "Info" => 1,
+        "Warning" or "Warn" => 2,
+        "Error" => 3,
+        "Critical" or "Fatal" => 4,
+        _ => 2,
+    };
+}
+
+static string DaveLogName(int rank)
+{
+    return rank switch
+    {
+        <= 0 => "Verbose",
+        1 => "Info",
+        2 => "Warning",
+        3 => "Error",
+        _ => "Critical",
+    };
 }
 
 static string FormatVoiceChannelId(SocketVoiceState state)
