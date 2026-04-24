@@ -14,8 +14,12 @@ var token = Environment.GetEnvironmentVariable("BAEKSU_DISCORD_TOKEN")
     ?? throw new InvalidOperationException("BAEKSU_DISCORD_TOKEN is required");
 var configFile = Environment.GetEnvironmentVariable("CONFIG_FILE")
     ?? Path.Combine(AppContext.BaseDirectory, "baeksu.json");
+var hardAudioRecovery = ParseBoolEnv("BAEKSU_AUDIO_HARD_RECOVERY", defaultValue: false);
 
 ConfigureDaveLogging();
+Console.WriteLine(
+    $"[BAEKSU] audio hard recovery {(hardAudioRecovery ? "enabled" : "disabled")} (BAEKSU_AUDIO_HARD_RECOVERY)"
+);
 
 var client = new DiscordSocketClient(new DiscordSocketConfig
 {
@@ -305,9 +309,44 @@ void QueueAudioRecoveryAsync(string reason)
             }
 
             audioRecoveryCooldowns[guild.Id] = DateTimeOffset.UtcNow.AddMilliseconds(AudioRecoveryCooldownMs);
-            await EnsureConnectedAsync(guild.Id, targetChannelId, reason, bypassCooldown: true, forceReconnect: true);
+            await RecoverAudioConnectionAsync(guild.Id, targetChannelId, reason);
         }
     });
+}
+
+async Task RecoverAudioConnectionAsync(ulong guildId, ulong channelId, string reason)
+{
+    var guild = client.GetGuild(guildId);
+    if (guild?.CurrentUser?.VoiceChannel?.Id == channelId)
+    {
+        var refreshed = await EnsureConnectedAsync(
+            guildId,
+            channelId,
+            $"{reason}:soft-refresh",
+            bypassCooldown: true,
+            refreshCurrentConnection: true
+        );
+        if (refreshed)
+        {
+            return;
+        }
+
+        if (!hardAudioRecovery)
+        {
+            Console.WriteLine(
+                $"[BAEKSU] guild={guildId} audio soft refresh failed; keeping visible voice state reason={reason}"
+            );
+            return;
+        }
+    }
+
+    await EnsureConnectedAsync(
+        guildId,
+        channelId,
+        hardAudioRecovery ? $"{reason}:hard-reconnect" : reason,
+        bypassCooldown: true,
+        forceReconnect: hardAudioRecovery
+    );
 }
 
 static bool ShouldRecoverFromAudioLog(LogMessage log)
@@ -354,7 +393,8 @@ async Task<bool> EnsureConnectedAsync(
     ulong channelId,
     string reason,
     bool bypassCooldown = false,
-    bool forceReconnect = false
+    bool forceReconnect = false,
+    bool refreshCurrentConnection = false
 )
 {
     var gate = reconnectLocks.GetOrAdd(guildId, _ => new SemaphoreSlim(1, 1));
@@ -392,7 +432,7 @@ async Task<bool> EnsureConnectedAsync(
         }
 
         var currentChannel = guild.CurrentUser?.VoiceChannel;
-        if (currentChannel?.Id == channelId && !forceReconnect)
+        if (currentChannel?.Id == channelId && !forceReconnect && !refreshCurrentConnection)
         {
             failedConnectCooldowns.TryRemove(guildId, out _);
             return true;
@@ -416,8 +456,10 @@ async Task<bool> EnsureConnectedAsync(
 
         try
         {
-            Console.WriteLine($"[BAEKSU] guild={guildId} joining channel={channelId} ({channel.Name}) reason={reason}");
-            await channel.ConnectAsync(selfDeaf: true, selfMute: false, external: false, disconnect: true);
+            var isSoftRefresh = refreshCurrentConnection && currentChannel?.Id == channelId && !forceReconnect;
+            var action = isSoftRefresh ? "refreshing audio connection" : "joining";
+            Console.WriteLine($"[BAEKSU] guild={guildId} {action} channel={channelId} ({channel.Name}) reason={reason}");
+            await channel.ConnectAsync(selfDeaf: true, selfMute: false, external: false, disconnect: !isSoftRefresh);
             state.SetTargetChannelId(guildId, channelId);
             failedConnectCooldowns.TryRemove(guildId, out _);
             return true;
@@ -433,6 +475,20 @@ async Task<bool> EnsureConnectedAsync(
     {
         gate.Release();
     }
+}
+
+static bool ParseBoolEnv(string name, bool defaultValue)
+{
+    var value = Environment.GetEnvironmentVariable(name);
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return defaultValue;
+    }
+
+    return value.Equals("1", StringComparison.OrdinalIgnoreCase)
+        || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+        || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+        || value.Equals("on", StringComparison.OrdinalIgnoreCase);
 }
 
 sealed class StayVcState
