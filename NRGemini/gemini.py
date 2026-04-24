@@ -2304,39 +2304,59 @@ async def sibo_loop(my_gen=None):
 
         await asyncio.sleep(1)
 
-async def ensure_sibo_panel(guild, channel, *, save_target=False):
-    """채널 메시지는 지우지 않고 시보 패널 하나를 준비한다."""
+PANEL_EMBED_TITLE_PREFIXES = (
+    "🎛 Gemini 패널",
+    "🔊 사운드보드",
+    "⏰ 시보 설정",
+)
+
+
+def is_panel_message(message):
+    if message.author != bot.user:
+        return False
+    return any(
+        (embed.title or "").startswith(prefix)
+        for embed in message.embeds
+        for prefix in PANEL_EMBED_TITLE_PREFIXES
+    )
+
+
+async def ensure_control_panel(guild, channel, *, save_target=False):
+    """채널 전체를 지우지 않고 통합 패널 메시지 하나만 준비한다."""
     if save_target:
         config = bot.get_config(guild.id)
         config["sb_channel_id"] = channel.id
         bot.save_config()
 
-    sibo_view = SiboView(guild.id)
-    bot.active_views.append(sibo_view)
+    panel_view = ControlPanelView(guild.id)
+    bot.active_views.append(panel_view)
 
-    existing_panel = None
+    panel_messages = []
     try:
         async for msg in channel.history(limit=50):
-            if msg.author != bot.user:
-                continue
-            if any(embed.title == "⏰ 시보 설정" for embed in msg.embeds):
-                existing_panel = msg
-                break
+            if is_panel_message(msg):
+                panel_messages.append(msg)
     except Exception as e:
-        print(f"[PANEL] {guild.name}: 기존 시보 패널 확인 실패: {e}")
+        print(f"[PANEL] {guild.name}: 기존 패널 확인 실패: {e}")
 
-    if existing_panel:
-        await existing_panel.edit(embed=sibo_view._make_embed(), view=sibo_view)
-        print(f"[PANEL] {guild.name}: #{channel.name} 시보 패널 갱신 완료")
+    if panel_messages:
+        target = panel_messages[0]
+        await target.edit(embed=panel_view._make_embed(), view=panel_view)
+        for stale in panel_messages[1:4]:
+            try:
+                await stale.delete()
+            except Exception as e:
+                print(f"[PANEL] {guild.name}: 중복 패널 삭제 실패: {e}")
+        print(f"[PANEL] {guild.name}: #{channel.name} 통합 패널 갱신 완료")
         return "updated"
 
-    await channel.send(embed=sibo_view._make_embed(), view=sibo_view)
-    print(f"[PANEL] {guild.name}: #{channel.name} 시보 패널 생성 완료")
+    await channel.send(embed=panel_view._make_embed(), view=panel_view)
+    print(f"[PANEL] {guild.name}: #{channel.name} 통합 패널 생성 완료")
     return "created"
 
 
 async def setup_panel_channels():
-    """봇 시작 시 저장된 채널의 시보 패널을 갱신한다."""
+    """봇 시작 시 저장된 채널의 통합 패널을 갱신한다."""
     for guild in bot.guilds:
         config = bot.get_config(guild.id)
         panel_channel_id = config.get("sb_channel_id")
@@ -2347,7 +2367,7 @@ async def setup_panel_channels():
             print(f"[PANEL] {guild.name}: 패널 채널 없음 (ID: {panel_channel_id})")
             continue
         try:
-            await ensure_sibo_panel(guild, channel)
+            await ensure_control_panel(guild, channel)
         except Exception as e:
             print(f"[PANEL] {guild.name}: 임베드 생성 실패: {e}")
 
@@ -3079,19 +3099,151 @@ SOUNDS_PER_PAGE = 25
 SB_PLAY_LOG = []  # [{"user": name, "sound": key, "time": str}, ...] 최근 20개
 SB_LOG_MAX = 20
 
-class SoundboardView(discord.ui.View):
-    def __init__(self, keys, folder="", search="", user_id=None):
+class VolumeModal(discord.ui.Modal, title="사운드보드 볼륨 설정"):
+    def __init__(self, soundboard_view):
+        super().__init__()
+        self.soundboard_view = soundboard_view
+        self.value = discord.ui.TextInput(
+            label="볼륨 (1~100%)",
+            placeholder=str(int(bot.sound_volume * 100)),
+            max_length=3,
+        )
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            percent = max(1, min(100, int(self.value.value)))
+        except ValueError:
+            await temp_reply(interaction, "숫자를 입력해주세요.")
+            return
+        bot.set_sound_volume(percent / 100.0)
+        self.soundboard_view._refresh_keys()
+        self.soundboard_view._update_components()
+        await interaction.response.edit_message(embed=self.soundboard_view._make_embed(), view=self.soundboard_view)
+
+
+@bot.tree.command(name="sb", description="사운드보드 (이름 입력시 재생, 빈 입력시 현재 채널에 통합 패널 생성)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(name="재생할 사운드 이름 (비우면 현재 채널을 패널 채널로 설정)")
+async def soundboard(interaction: discord.Interaction, name: str = None):
+    if not interaction.guild:
+        await temp_reply(interaction, "서버에서만 사용 가능합니다.")
+        return
+
+    # 인자 없으면 현재 채널을 패널 채널로 설정하고 통합 패널 준비
+    if not name:
+        await interaction.response.defer()
+        try:
+            panel_status = await ensure_control_panel(interaction.guild, interaction.channel, save_target=True)
+            await temp_followup(
+                interaction,
+                f"{interaction.channel.mention}에 통합 패널을 {'갱신' if panel_status == 'updated' else '생성'}했습니다.",
+            )
+        except Exception as e:
+            await temp_followup(interaction, f"[ERROR] 통합 패널 생성 실패: {e}")
+        return
+
+    # 인자 있으면 바로 재생
+    name = unicodedata.normalize("NFC", name.replace("📁 ", "").strip())
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member.voice:
+        await temp_reply(interaction, "음성 채널에 먼저 접속해주세요.")
+        return
+
+    await interaction.response.defer()
+    try:
+        success, msg = await play_sound_in_vc(interaction.guild, member, name, bot)
+        if success:
+            SB_PLAY_LOG.append({
+                "user": interaction.user.display_name,
+                "sound": name,
+                "time": datetime.now(KST).strftime("%H:%M:%S")
+            })
+            if len(SB_PLAY_LOG) > SB_LOG_MAX:
+                SB_PLAY_LOG.pop(0)
+        await temp_followup(interaction, msg)
+    except Exception as e:
+        await temp_followup(interaction, f"[ERROR] {e}")
+
+@soundboard.autocomplete('name')
+async def sb_autocomplete(interaction: discord.Interaction, current: str):
+    current = unicodedata.normalize("NFC", current.lower())
+    all_keys = sorted(bot.sound_files.keys())
+    choices = []
+    for key in all_keys:
+        if current and current not in key:
+            continue
+        display = key if len(key) <= 100 else "..." + key[-97:]
+        choices.append(app_commands.Choice(name=display, value=key))
+    return choices[:25]
+
+class OffsetModal(discord.ui.Modal, title="오프셋 설정"):
+    def __init__(self, sibo_view):
+        super().__init__()
+        self.sibo_view = sibo_view
+        cfg = sibo_view._get_cfg()
+        current = str(cfg.get("offset", 0.0)) if cfg else "0"
+        self.value = discord.ui.TextInput(label="정각 몇 초 전에 재생 (소수점 가능, 0~30)", placeholder=current, max_length=10)
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            offset = max(0.0, min(30.0, float(self.value.value)))
+            gid = self.sibo_view.guild_id
+            cfg = bot.get_sibo(gid)
+            if not cfg or not cfg.get("sound"):
+                await temp_reply(interaction, "먼저 음원을 선택해주세요.")
+                return
+            cfg["offset"] = offset
+            bot.save_config()
+            restart_sibo()
+            self.sibo_view._update_components()
+            await interaction.response.edit_message(embed=self.sibo_view._make_embed(), view=self.sibo_view)
+        except ValueError:
+            await temp_reply(interaction, "숫자를 입력해주세요.")
+
+class CompModal(discord.ui.Modal, title="딜레이 보정값 설정"):
+    def __init__(self, sibo_view):
+        super().__init__()
+        self.sibo_view = sibo_view
+        self.value = discord.ui.TextInput(label="보정 초 (소수점 가능, 음수도 가능)", placeholder=str(SIBO_LATENCY_COMP), max_length=10)
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        global SIBO_LATENCY_COMP
+        try:
+            SIBO_LATENCY_COMP = float(self.value.value)
+            g = bot.server_configs.setdefault("_global", {})
+            g["sibo_comp"] = SIBO_LATENCY_COMP
+            bot.save_config()
+            # comp는 다음 사이클에서 자연 반영, restart 불필요
+            self.sibo_view._update_components()
+            await interaction.response.edit_message(embed=self.sibo_view._make_embed(), view=self.sibo_view)
+        except ValueError:
+            await temp_reply(interaction, "숫자를 입력해주세요.")
+
+
+class ControlPanelView(discord.ui.View):
+    def __init__(self, guild_id, mode="soundboard"):
         super().__init__(timeout=None)
-        self.folder = folder
-        self.search = search
-        self.user_id = user_id
+        self.guild_id = str(guild_id)
+        self.mode = mode
+        self.folder = ""
+        self.search = ""
         self.page = 0
         self.show_log = False
+        self.sibo_folder = ""
+        self.sound_page = 0
         self._refresh_keys()
+        self._rebuild_sound_keys()
         self._update_components()
 
+    def _get_cfg(self):
+        return bot.get_sibo(self.guild_id)
+
     def _refresh_keys(self):
-        """bot.sound_files에서 최신 목록 반영."""
         all_keys = sorted(bot.sound_files.keys())
         if self.folder:
             all_keys = [k for k in all_keys if k.startswith(self.folder + "/")]
@@ -3106,53 +3258,109 @@ class SoundboardView(discord.ui.View):
         start = self.page * SOUNDS_PER_PAGE
         return self.all_keys[start:start + SOUNDS_PER_PAGE]
 
+    def _rebuild_sound_keys(self):
+        all_keys = sorted(bot.sound_files.keys())
+        if self.sibo_folder:
+            self.sound_keys = [k for k in all_keys if k.startswith(self.sibo_folder + "/")]
+        else:
+            self.sound_keys = all_keys
+        self.sound_total_pages = max(1, (len(self.sound_keys) + 24) // 25)
+        self.sound_page = min(self.sound_page, self.sound_total_pages - 1)
+
+    def _page_sound_keys(self):
+        start = self.sound_page * 25
+        return self.sound_keys[start:start + 25]
+
+    def _make_embed(self):
+        if self.mode == "sibo":
+            return self._make_sibo_embed()
+        return self._make_soundboard_embed()
+
+    def _make_soundboard_embed(self):
+        if self.show_log:
+            embed = discord.Embed(title="🎛 Gemini 패널 — 사운드보드 로그", color=0x5865F2)
+            if SB_PLAY_LOG:
+                lines = [f"`{e['time']}` **{e['user']}** → `{e['sound']}`" for e in reversed(SB_PLAY_LOG)]
+                embed.description = "\n".join(lines)
+            else:
+                embed.description = "(재생 기록 없음)"
+            embed.set_footer(text=f"최근 {len(SB_PLAY_LOG)}개 | 시보 설정 버튼으로 전환")
+            return embed
+
+        page_keys = self._page_keys()
+        folder_label = self.folder or "전체"
+        listing = "\n".join(f"`{k}`" for k in page_keys) or "(비어있음)"
+        embed = discord.Embed(title=f"🎛 Gemini 패널 — 사운드보드/{folder_label}", description=listing, color=0x5865F2)
+        if SB_PLAY_LOG:
+            last = SB_PLAY_LOG[-1]
+            embed.set_footer(text=f"총 {len(self.all_keys)}개 | 페이지 {self.page + 1}/{self.total_pages} | 최근: {last['user']} → {last['sound']}")
+        else:
+            embed.set_footer(text=f"총 {len(self.all_keys)}개 | 페이지 {self.page + 1}/{self.total_pages}")
+        return embed
+
+    def _make_sibo_embed(self):
+        cfg = self._get_cfg()
+        embed = discord.Embed(title="🎛 Gemini 패널 — 시보 설정", color=0xF1C40F)
+        if cfg:
+            sound = cfg.get("sound", "없음")
+            offset = cfg.get("offset", 0)
+            vc_id = cfg.get("vc_channel")
+            vc_text = f"<#{vc_id}>" if vc_id else "미설정"
+            embed.add_field(name="음원", value=f"`{sound}`", inline=True)
+            embed.add_field(name="오프셋", value=f"정각 {offset}초 전", inline=True)
+            embed.add_field(name="VC 채널", value=vc_text, inline=True)
+            embed.add_field(name="딜레이 보정", value=f"{SIBO_LATENCY_COMP}초", inline=True)
+            embed.add_field(name="상태", value="✅ 활성", inline=True)
+        else:
+            embed.description = "시보가 설정되어 있지 않습니다."
+            embed.add_field(name="딜레이 보정", value=f"{SIBO_LATENCY_COMP}초", inline=True)
+        folder_label = self.sibo_folder or "전체"
+        embed.set_footer(text=f"시보 음원 폴더: {folder_label} | {len(self.sound_keys)}개 | 페이지 {self.sound_page + 1}/{self.sound_total_pages}")
+        return embed
+
     def _update_components(self):
         self.clear_items()
-        # 폴더 선택 드롭다운
-        folders = sorted(set(
-            k.split("/")[0] for k in bot.sound_files.keys() if "/" in k
-        ))
-        if folders:
-            folder_options = [discord.SelectOption(label="📂 전체", value="_all", default=self.folder == "")]
-            for f in folders[:24]:
-                folder_options.append(discord.SelectOption(label=f"📁 {f}", value=f, default=self.folder == f))
-            folder_select = discord.ui.Select(
-                placeholder="📁 폴더 선택",
-                options=folder_options,
-                row=0
-            )
-            folder_select.callback = self._folder_callback
+        if self.mode == "sibo":
+            self._add_sibo_components()
+        else:
+            self._add_soundboard_components()
+
+    def _folder_options(self, current_folder):
+        folders = sorted(set(k.split("/")[0] for k in bot.sound_files.keys() if "/" in k))
+        if not folders:
+            return []
+        options = [discord.SelectOption(label="📂 전체", value="_all", default=current_folder == "")]
+        for folder in folders[:24]:
+            options.append(discord.SelectOption(label=f"📁 {folder}", value=folder, default=current_folder == folder))
+        return options
+
+    def _add_soundboard_components(self):
+        folder_options = self._folder_options(self.folder)
+        if folder_options:
+            folder_select = discord.ui.Select(placeholder="📁 폴더 선택", options=folder_options, row=0)
+            folder_select.callback = self._soundboard_folder_callback
             self.add_item(folder_select)
 
-        # 사운드 재생 드롭다운
         page_keys = self._page_keys()
         if page_keys:
             sound_options = []
-            for k in page_keys:
-                display = k.split("/")[-1] if "/" in k else k
-                sound_options.append(discord.SelectOption(label=display[:100], value=k, description=k[:100] if "/" in k else None))
-            sound_select = discord.ui.Select(
-                placeholder="🔊 재생할 사운드 선택",
-                options=sound_options,
-                row=1
-            )
+            for key in page_keys:
+                display = key.split("/")[-1] if "/" in key else key
+                sound_options.append(discord.SelectOption(label=display[:100], value=key, description=key[:100] if "/" in key else None))
+            sound_select = discord.ui.Select(placeholder="🔊 재생할 사운드 선택", options=sound_options, row=1)
             sound_select.callback = self._play_callback
             self.add_item(sound_select)
 
-        # 페이지 버튼
         if self.total_pages > 1:
             prev_btn = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=self.page == 0, row=2)
             prev_btn.callback = self._prev_callback
             self.add_item(prev_btn)
-
             page_btn = discord.ui.Button(label=f"{self.page + 1}/{self.total_pages}", style=discord.ButtonStyle.primary, disabled=True, row=2)
             self.add_item(page_btn)
-
             next_btn = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=self.page >= self.total_pages - 1, row=2)
             next_btn.callback = self._next_callback
             self.add_item(next_btn)
 
-        # 퇴장 버튼
         leave_btn = discord.ui.Button(label="🚪 퇴장", style=discord.ButtonStyle.danger, row=2)
         leave_btn.callback = self._leave_callback
         self.add_item(leave_btn)
@@ -3166,47 +3374,82 @@ class SoundboardView(discord.ui.View):
         volume_btn.callback = self._volume_callback
         self.add_item(volume_btn)
 
-    def _make_embed(self):
-        if self.show_log:
-            embed = discord.Embed(title="🔊 사운드보드 — 재생 로그", color=0x5865F2)
-            if SB_PLAY_LOG:
-                lines = [f"`{e['time']}` **{e['user']}** → `{e['sound']}`" for e in reversed(SB_PLAY_LOG)]
-                embed.description = "\n".join(lines)
-            else:
-                embed.description = "(재생 기록 없음)"
-            embed.set_footer(text=f"최근 {len(SB_PLAY_LOG)}개")
-            return embed
+        sibo_btn = discord.ui.Button(label="⏰ 시보 설정", style=discord.ButtonStyle.secondary, row=4)
+        sibo_btn.callback = self._show_sibo_callback
+        self.add_item(sibo_btn)
 
-        page_keys = self._page_keys()
-        if self.folder:
-            title = f"🔊 사운드보드 — {self.folder}/"
-        else:
-            title = "🔊 사운드보드 — 전체"
-        listing = "\n".join(f"`{k}`" for k in page_keys) or "(비어있음)"
-        embed = discord.Embed(title=title, description=listing, color=0x5865F2)
-        # 마지막 재생 표시
-        if SB_PLAY_LOG:
-            last = SB_PLAY_LOG[-1]
-            embed.set_footer(text=f"총 {len(self.all_keys)}개 | 페이지 {self.page + 1}/{self.total_pages} | 최근: {last['user']} → {last['sound']}")
-        else:
-            embed.set_footer(text=f"총 {len(self.all_keys)}개 | 페이지 {self.page + 1}/{self.total_pages}")
-        return embed
+    def _add_sibo_components(self):
+        cfg = self._get_cfg()
+        folder_options = self._folder_options(self.sibo_folder)
+        if folder_options:
+            folder_select = discord.ui.Select(placeholder="📁 폴더 필터", options=folder_options, row=0)
+            folder_select.callback = self._sibo_folder_callback
+            self.add_item(folder_select)
 
-    def _apply_filter(self):
-        self.page = 0
-        self.total_pages = max(1, (len(self.all_keys) + SOUNDS_PER_PAGE - 1) // SOUNDS_PER_PAGE)
+        page_keys = self._page_sound_keys()
+        if page_keys:
+            current_sound = cfg.get("sound") if cfg else None
+            options = []
+            for key in page_keys:
+                desc = key[:100] if "/" in key else None
+                short = key.split("/")[-1] if "/" in key else key
+                options.append(discord.SelectOption(label=short[:100], value=key, description=desc, default=key == current_sound))
+            sound_select = discord.ui.Select(placeholder="🔊 시보 음원 선택", options=options, row=1)
+            sound_select.callback = self._sound_callback
+            self.add_item(sound_select)
+
+        if self.sound_total_pages > 1:
+            prev_btn = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=self.sound_page == 0, row=2)
+            prev_btn.callback = self._sound_prev
+            self.add_item(prev_btn)
+            page_btn = discord.ui.Button(label=f"{self.sound_page + 1}/{self.sound_total_pages}", style=discord.ButtonStyle.primary, disabled=True, row=2)
+            self.add_item(page_btn)
+            next_btn = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=self.sound_page >= self.sound_total_pages - 1, row=2)
+            next_btn.callback = self._sound_next
+            self.add_item(next_btn)
+
+        current_offset = cfg.get("offset", 0) if cfg else 0
+        offset_btn = discord.ui.Button(label=f"⏱️ 오프셋: {current_offset}s", style=discord.ButtonStyle.primary, row=3)
+        offset_btn.callback = self._offset_modal_callback
+        self.add_item(offset_btn)
+
+        comp_btn = discord.ui.Button(label=f"⚙️ 보정: {SIBO_LATENCY_COMP}s", style=discord.ButtonStyle.secondary, row=3)
+        comp_btn.callback = self._comp_callback
+        self.add_item(comp_btn)
+
+        vc_btn = discord.ui.Button(label="🔗 현재 VC 연결", style=discord.ButtonStyle.success, row=3)
+        vc_btn.callback = self._vc_callback
+        self.add_item(vc_btn)
+
+        if cfg:
+            off_btn = discord.ui.Button(label="❌ 비활성화", style=discord.ButtonStyle.danger, row=3)
+            off_btn.callback = self._off_callback
+            self.add_item(off_btn)
+
+        sb_btn = discord.ui.Button(label="🔊 사운드보드", style=discord.ButtonStyle.secondary, row=4)
+        sb_btn.callback = self._show_soundboard_callback
+        self.add_item(sb_btn)
+
+    async def _show_sibo_callback(self, interaction: discord.Interaction):
+        self.mode = "sibo"
+        self.show_log = False
+        self._rebuild_sound_keys()
         self._update_components()
+        await interaction.response.edit_message(embed=self._make_embed(), view=self)
 
-    async def _folder_callback(self, interaction: discord.Interaction):
+    async def _show_soundboard_callback(self, interaction: discord.Interaction):
+        self.mode = "soundboard"
+        self._refresh_keys()
+        self._update_components()
+        await interaction.response.edit_message(embed=self._make_embed(), view=self)
+
+    async def _soundboard_folder_callback(self, interaction: discord.Interaction):
         folder = interaction.data["values"][0]
         self.search = ""
-        if folder == "_all":
-            self.all_keys = sorted(bot.sound_files.keys())
-            self.folder = ""
-        else:
-            self.all_keys = sorted(k for k in bot.sound_files.keys() if k.startswith(folder + "/"))
-            self.folder = folder
-        self._apply_filter()
+        self.folder = "" if folder == "_all" else folder
+        self.page = 0
+        self._refresh_keys()
+        self._update_components()
         await interaction.response.edit_message(embed=self._make_embed(), view=self)
 
     async def _play_callback(self, interaction: discord.Interaction):
@@ -3216,7 +3459,7 @@ class SoundboardView(discord.ui.View):
             await temp_reply(interaction, "음성 채널에 먼저 접속해주세요.")
             return
         try:
-            success, msg = await play_sound_in_vc(interaction.guild, member, sound_key, bot)
+            success, _ = await play_sound_in_vc(interaction.guild, member, sound_key, bot)
             if success:
                 SB_PLAY_LOG.append({
                     "user": interaction.user.display_name,
@@ -3263,198 +3506,9 @@ class SoundboardView(discord.ui.View):
         modal = VolumeModal(self)
         await interaction.response.send_modal(modal)
 
-    async def on_timeout(self):
-        self.clear_items()
-
-
-class VolumeModal(discord.ui.Modal, title="사운드보드 볼륨 설정"):
-    def __init__(self, soundboard_view: SoundboardView):
-        super().__init__()
-        self.soundboard_view = soundboard_view
-        self.value = discord.ui.TextInput(
-            label="볼륨 (1~100%)",
-            placeholder=str(int(bot.sound_volume * 100)),
-            max_length=3,
-        )
-        self.add_item(self.value)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            percent = max(1, min(100, int(self.value.value)))
-        except ValueError:
-            await temp_reply(interaction, "숫자를 입력해주세요.")
-            return
-        bot.set_sound_volume(percent / 100.0)
-        self.soundboard_view._refresh_keys()
-        self.soundboard_view._update_components()
-        await interaction.response.edit_message(embed=self.soundboard_view._make_embed(), view=self.soundboard_view)
-
-
-@bot.tree.command(name="sb", description="사운드보드 (이름 입력시 재생, 빈 입력시 현재 채널에 시보 패널 생성)")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.describe(name="재생할 사운드 이름 (비우면 현재 채널을 패널 채널로 설정)")
-async def soundboard(interaction: discord.Interaction, name: str = None):
-    if not interaction.guild:
-        await temp_reply(interaction, "서버에서만 사용 가능합니다.")
-        return
-
-    # 인자 없으면 현재 채널을 패널 채널로 설정하고 시보 패널만 준비
-    if not name:
-        await interaction.response.defer()
-        try:
-            panel_status = await ensure_sibo_panel(interaction.guild, interaction.channel, save_target=True)
-            await temp_followup(
-                interaction,
-                f"{interaction.channel.mention}에 시보 패널을 {'갱신' if panel_status == 'updated' else '생성'}했습니다.",
-            )
-        except Exception as e:
-            await temp_followup(interaction, f"[ERROR] 시보 패널 생성 실패: {e}")
-        return
-
-    # 인자 있으면 바로 재생
-    name = unicodedata.normalize("NFC", name.replace("📁 ", "").strip())
-
-    member = interaction.guild.get_member(interaction.user.id)
-    if not member or not member.voice:
-        await temp_reply(interaction, "음성 채널에 먼저 접속해주세요.")
-        return
-
-    await interaction.response.defer()
-    try:
-        success, msg = await play_sound_in_vc(interaction.guild, member, name, bot)
-        if success:
-            SB_PLAY_LOG.append({
-                "user": interaction.user.display_name,
-                "sound": name,
-                "time": datetime.now(KST).strftime("%H:%M:%S")
-            })
-            if len(SB_PLAY_LOG) > SB_LOG_MAX:
-                SB_PLAY_LOG.pop(0)
-        await temp_followup(interaction, msg)
-    except Exception as e:
-        await temp_followup(interaction, f"[ERROR] {e}")
-
-@soundboard.autocomplete('name')
-async def sb_autocomplete(interaction: discord.Interaction, current: str):
-    current = unicodedata.normalize("NFC", current.lower())
-    all_keys = sorted(bot.sound_files.keys())
-    choices = []
-    for key in all_keys:
-        if current and current not in key:
-            continue
-        display = key if len(key) <= 100 else "..." + key[-97:]
-        choices.append(app_commands.Choice(name=display, value=key))
-    return choices[:25]
-
-# ================= 시보 커맨드 (임베드 UI) =================
-
-class SiboView(discord.ui.View):
-    def __init__(self, guild_id):
-        super().__init__(timeout=None)
-        self.guild_id = str(guild_id)
-        self.folder = ""
-        self.sound_page = 0
-        self._rebuild_sound_keys()
-        self._update_components()
-
-    def _get_cfg(self):
-        return bot.get_sibo(self.guild_id)
-
-    def _rebuild_sound_keys(self):
-        all_keys = sorted(bot.sound_files.keys())
-        if self.folder:
-            self.sound_keys = [k for k in all_keys if k.startswith(self.folder + "/")]
-        else:
-            self.sound_keys = all_keys
-        self.sound_total_pages = max(1, (len(self.sound_keys) + 24) // 25)
-        self.sound_page = min(self.sound_page, self.sound_total_pages - 1)
-
-    def _page_sound_keys(self):
-        start = self.sound_page * 25
-        return self.sound_keys[start:start + 25]
-
-    def _make_embed(self):
-        cfg = self._get_cfg()
-        embed = discord.Embed(title="⏰ 시보 설정", color=0xF1C40F)
-        if cfg:
-            sound = cfg.get("sound", "없음")
-            offset = cfg.get("offset", 0)
-            vc_id = cfg.get("vc_channel")
-            vc_text = f"<#{vc_id}>" if vc_id else "미설정"
-            embed.add_field(name="음원", value=f"`{sound}`", inline=True)
-            embed.add_field(name="오프셋", value=f"정각 {offset}초 전", inline=True)
-            embed.add_field(name="VC 채널", value=vc_text, inline=True)
-            embed.add_field(name="딜레이 보정", value=f"{SIBO_LATENCY_COMP}초", inline=True)
-            embed.add_field(name="상태", value="✅ 활성", inline=True)
-        else:
-            embed.description = "시보가 설정되어 있지 않습니다."
-            embed.add_field(name="딜레이 보정", value=f"{SIBO_LATENCY_COMP}초", inline=True)
-        folder_label = self.folder or "전체"
-        embed.set_footer(text=f"음원 폴더: {folder_label} | {len(self.sound_keys)}개 | 페이지 {self.sound_page + 1}/{self.sound_total_pages}")
-        return embed
-
-    def _update_components(self):
-        self.clear_items()
-        cfg = self._get_cfg()
-
-        # 폴더 선택 드롭다운 (row 0)
-        folders = sorted(set(k.split("/")[0] for k in bot.sound_files.keys() if "/" in k))
-        if folders:
-            folder_options = [discord.SelectOption(label="📂 전체", value="_all", default=self.folder == "")]
-            for f in folders[:24]:
-                folder_options.append(discord.SelectOption(label=f"📁 {f}", value=f, default=self.folder == f))
-            folder_select = discord.ui.Select(placeholder="📁 폴더 필터", options=folder_options, row=0)
-            folder_select.callback = self._folder_callback
-            self.add_item(folder_select)
-
-        # 음원 선택 드롭다운 (row 1)
-        page_keys = self._page_sound_keys()
-        if page_keys:
-            current_sound = cfg.get("sound") if cfg else None
-            options = []
-            for k in page_keys:
-                display = k if len(k) <= 100 else "..." + k[-97:]
-                desc = k[:100] if "/" in k else None
-                short = k.split("/")[-1] if "/" in k else k
-                options.append(discord.SelectOption(label=short[:100], value=k, description=desc, default=k == current_sound))
-            sound_select = discord.ui.Select(placeholder="🔊 시보 음원 선택", options=options, row=1)
-            sound_select.callback = self._sound_callback
-            self.add_item(sound_select)
-
-        # 음원 페이지 버튼 + 설정 버튼 (row 2)
-        if self.sound_total_pages > 1:
-            prev_btn = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=self.sound_page == 0, row=2)
-            prev_btn.callback = self._sound_prev
-            self.add_item(prev_btn)
-            page_btn = discord.ui.Button(label=f"{self.sound_page + 1}/{self.sound_total_pages}", style=discord.ButtonStyle.primary, disabled=True, row=2)
-            self.add_item(page_btn)
-            next_btn = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=self.sound_page >= self.sound_total_pages - 1, row=2)
-            next_btn.callback = self._sound_next
-            self.add_item(next_btn)
-
-        # 오프셋 + comp + VC + off 버튼 (row 3)
-        current_offset = cfg.get("offset", 0) if cfg else 0
-        offset_btn = discord.ui.Button(label=f"⏱️ 오프셋: {current_offset}s", style=discord.ButtonStyle.primary, row=3)
-        offset_btn.callback = self._offset_modal_callback
-        self.add_item(offset_btn)
-
-        comp_btn = discord.ui.Button(label=f"⚙️ 보정: {SIBO_LATENCY_COMP}s", style=discord.ButtonStyle.secondary, row=3)
-        comp_btn.callback = self._comp_callback
-        self.add_item(comp_btn)
-
-        vc_btn = discord.ui.Button(label="🔗 현재 VC 연결", style=discord.ButtonStyle.success, row=3)
-        vc_btn.callback = self._vc_callback
-        self.add_item(vc_btn)
-
-        if cfg:
-            off_btn = discord.ui.Button(label="❌ 비활성화", style=discord.ButtonStyle.danger, row=3)
-            off_btn.callback = self._off_callback
-            self.add_item(off_btn)
-
-    async def _folder_callback(self, interaction: discord.Interaction):
+    async def _sibo_folder_callback(self, interaction: discord.Interaction):
         folder = interaction.data["values"][0]
-        self.folder = "" if folder == "_all" else folder
+        self.sibo_folder = "" if folder == "_all" else folder
         self.sound_page = 0
         self._rebuild_sound_keys()
         self._update_components()
@@ -3472,16 +3526,14 @@ class SiboView(discord.ui.View):
 
     async def _sound_callback(self, interaction: discord.Interaction):
         sound_key = interaction.data["values"][0]
-        gid = self.guild_id
-        cfg = bot.get_sibo(gid) or {}
+        cfg = bot.get_sibo(self.guild_id) or {}
         vc_channel = cfg.get("vc_channel")
         offset = cfg.get("offset", 0.0)
-        # VC 채널 자동 감지
         if not vc_channel:
             member = interaction.guild.get_member(interaction.user.id)
             if member and member.voice:
                 vc_channel = member.voice.channel.id
-        bot.set_sibo(gid, {"sound": sound_key, "offset": offset, "vc_channel": vc_channel})
+        bot.set_sibo(self.guild_id, {"sound": sound_key, "offset": offset, "vc_channel": vc_channel})
         restart_sibo()
         self._update_components()
         await interaction.response.edit_message(embed=self._make_embed(), view=self)
@@ -3495,8 +3547,7 @@ class SiboView(discord.ui.View):
         await interaction.response.send_modal(modal)
 
     async def _vc_callback(self, interaction: discord.Interaction):
-        gid = self.guild_id
-        cfg = bot.get_sibo(gid)
+        cfg = bot.get_sibo(self.guild_id)
         if not cfg:
             await temp_reply(interaction, "먼저 음원을 선택해주세요.")
             return
@@ -3519,50 +3570,6 @@ class SiboView(discord.ui.View):
     async def on_timeout(self):
         self.clear_items()
 
-class OffsetModal(discord.ui.Modal, title="오프셋 설정"):
-    def __init__(self, sibo_view: SiboView):
-        super().__init__()
-        self.sibo_view = sibo_view
-        cfg = sibo_view._get_cfg()
-        current = str(cfg.get("offset", 0.0)) if cfg else "0"
-        self.value = discord.ui.TextInput(label="정각 몇 초 전에 재생 (소수점 가능, 0~30)", placeholder=current, max_length=10)
-        self.add_item(self.value)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            offset = max(0.0, min(30.0, float(self.value.value)))
-            gid = self.sibo_view.guild_id
-            cfg = bot.get_sibo(gid)
-            if not cfg or not cfg.get("sound"):
-                await temp_reply(interaction, "먼저 음원을 선택해주세요.")
-                return
-            cfg["offset"] = offset
-            bot.save_config()
-            restart_sibo()
-            self.sibo_view._update_components()
-            await interaction.response.edit_message(embed=self.sibo_view._make_embed(), view=self.sibo_view)
-        except ValueError:
-            await temp_reply(interaction, "숫자를 입력해주세요.")
-
-class CompModal(discord.ui.Modal, title="딜레이 보정값 설정"):
-    def __init__(self, sibo_view: SiboView):
-        super().__init__()
-        self.sibo_view = sibo_view
-        self.value = discord.ui.TextInput(label="보정 초 (소수점 가능, 음수도 가능)", placeholder=str(SIBO_LATENCY_COMP), max_length=10)
-        self.add_item(self.value)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        global SIBO_LATENCY_COMP
-        try:
-            SIBO_LATENCY_COMP = float(self.value.value)
-            g = bot.server_configs.setdefault("_global", {})
-            g["sibo_comp"] = SIBO_LATENCY_COMP
-            bot.save_config()
-            # comp는 다음 사이클에서 자연 반영, restart 불필요
-            self.sibo_view._update_components()
-            await interaction.response.edit_message(embed=self.sibo_view._make_embed(), view=self.sibo_view)
-        except ValueError:
-            await temp_reply(interaction, "숫자를 입력해주세요.")
 
 # ================= 모델 전환 =================
 
