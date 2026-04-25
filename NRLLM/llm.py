@@ -10,6 +10,7 @@ import base64
 import copy
 import io
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -70,11 +71,12 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
 DEFAULT_ROUTE_MODEL = os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
-DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "1"))
+DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "0"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
 CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "12000"))
+TIMING_DEBUG_LOGS = is_enabled(os.environ.get("LLM_TIMING_DEBUG", "1"))
 
 IMAGE_ACTION_NOUN_RE = re.compile(
     r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
@@ -1347,6 +1349,20 @@ async def on_message(message):
     async with lock:
         async with message.channel.typing():
             try:
+                timing_start = time.perf_counter()
+                timing_last = timing_start
+
+                def timing_mark(label):
+                    nonlocal timing_last
+                    if not TIMING_DEBUG_LOGS:
+                        return
+                    now = time.perf_counter()
+                    print(
+                        f"[TIMING] msg={message.id} {label} "
+                        f"+{(now - timing_last) * 1000:.0f}ms total={(now - timing_start) * 1000:.0f}ms"
+                    )
+                    timing_last = now
+
                 base_model = config["model"]
                 base_model_info = await bot.or_client.resolve_model_info(base_model)
                 base_caps = bot.or_client.analyze_model_capabilities(base_model, model_info=base_model_info)
@@ -1361,6 +1377,7 @@ async def on_message(message):
                 has_chat_image_support = action_router_enabled and bool(image_command_model)
                 current_display_name = get_server_display_name(message.guild, message.author)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
+                timing_mark("caps")
 
                 sys_prompt = SYSTEM_PROMPT
                 capability_hints = []
@@ -1488,6 +1505,7 @@ async def on_message(message):
                         break
 
                 messages.extend(history_buffer)
+                timing_mark(f"history count={len(history_buffer)}")
 
                 current_content = []
                 current_image_inputs = []
@@ -1568,6 +1586,7 @@ async def on_message(message):
                                 user_text += f"\n(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024 * 1024)}MB)"
                             elif ct.startswith("image"):
                                 user_text += f"\n(User attached an image: {att.filename})"
+                timing_mark(f"attachments current_images={len(current_image_inputs)}")
 
                 recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
                 should_route_action = action_router_enabled and should_call_action_router(
@@ -1599,6 +1618,9 @@ async def on_message(message):
                         channel_id=message.channel.id,
                         has_current_images=bool(current_image_inputs),
                     )
+                timing_mark(
+                    f"route enabled={action_router_enabled} prefilter={should_route_action} action={route.get('action')}"
+                )
 
                 if route.get("action") == "generate_image":
                     reference_inputs = list(current_image_inputs)
@@ -1649,6 +1671,10 @@ async def on_message(message):
                     strict=bool(chat_tools or config.get("search")),
                 )
                 cache_control = build_prompt_cache_control(current_model, messages)
+                timing_mark(
+                    f"pre_chat chars={estimate_message_text_chars(messages)} "
+                    f"plugins={'compression' if should_use_context_compression(messages) else 'none'}"
+                )
 
                 try:
                     response, usage, images, full_data = await bot.or_client.chat_completion(
@@ -1661,7 +1687,11 @@ async def on_message(message):
                         require_parameter_support=bool(chat_tools or config.get("search")),
                         cache_control=cache_control,
                     )
+                    provider_name = full_data.get("provider") if isinstance(full_data, dict) else None
+                    routed_model = full_data.get("model") if isinstance(full_data, dict) else None
+                    timing_mark(f"chat provider={provider_name or '?'} model={routed_model or current_model}")
                 except Exception as e:
+                    timing_mark("chat_error")
                     err_msg = str(e).lower()
                     if "no endpoints found for" in err_msg:
                         print(f"⚠️ [Routing Error] {current_model}: endpoint 없음, 모델 목록 재동기화")
