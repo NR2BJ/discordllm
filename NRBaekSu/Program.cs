@@ -37,6 +37,11 @@ Task? reconcileTask = null;
 
 client.Log += log =>
 {
+    if (ShouldSuppressClientLog(log))
+    {
+        return Task.CompletedTask;
+    }
+
     Console.WriteLine($"[BAEKSU] {log}");
     if (ShouldRecoverFromAudioLog(log))
     {
@@ -319,22 +324,10 @@ async Task RecoverAudioConnectionAsync(ulong guildId, ulong channelId, string re
     var guild = client.GetGuild(guildId);
     if (guild?.CurrentUser?.VoiceChannel?.Id == channelId)
     {
-        var refreshed = await EnsureConnectedAsync(
-            guildId,
-            channelId,
-            $"{reason}:soft-refresh",
-            bypassCooldown: true,
-            refreshCurrentConnection: true
-        );
-        if (refreshed)
-        {
-            return;
-        }
-
         if (!hardAudioRecovery)
         {
             Console.WriteLine(
-                $"[BAEKSU] guild={guildId} audio soft refresh failed; keeping visible voice state reason={reason}"
+                $"[BAEKSU] guild={guildId} audio disconnected but voice state is still in target; waiting for voice-state/reconcile reason={reason}"
             );
             return;
         }
@@ -347,6 +340,18 @@ async Task RecoverAudioConnectionAsync(ulong guildId, ulong channelId, string re
         bypassCooldown: true,
         forceReconnect: hardAudioRecovery
     );
+}
+
+static bool ShouldSuppressClientLog(LogMessage log)
+{
+    if (!log.Source.StartsWith("Dave", StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    var message = log.Message ?? "";
+    return message.Contains("Failed to decrypt audio packet", StringComparison.OrdinalIgnoreCase)
+        || message.Contains("Unexpected transition id", StringComparison.OrdinalIgnoreCase);
 }
 
 static bool ShouldRecoverFromAudioLog(LogMessage log)
@@ -393,8 +398,7 @@ async Task<bool> EnsureConnectedAsync(
     ulong channelId,
     string reason,
     bool bypassCooldown = false,
-    bool forceReconnect = false,
-    bool refreshCurrentConnection = false
+    bool forceReconnect = false
 )
 {
     var gate = reconnectLocks.GetOrAdd(guildId, _ => new SemaphoreSlim(1, 1));
@@ -432,7 +436,7 @@ async Task<bool> EnsureConnectedAsync(
         }
 
         var currentChannel = guild.CurrentUser?.VoiceChannel;
-        if (currentChannel?.Id == channelId && !forceReconnect && !refreshCurrentConnection)
+        if (currentChannel?.Id == channelId && !forceReconnect)
         {
             failedConnectCooldowns.TryRemove(guildId, out _);
             return true;
@@ -456,10 +460,8 @@ async Task<bool> EnsureConnectedAsync(
 
         try
         {
-            var isSoftRefresh = refreshCurrentConnection && currentChannel?.Id == channelId && !forceReconnect;
-            var action = isSoftRefresh ? "refreshing audio connection" : "joining";
-            Console.WriteLine($"[BAEKSU] guild={guildId} {action} channel={channelId} ({channel.Name}) reason={reason}");
-            await channel.ConnectAsync(selfDeaf: true, selfMute: false, external: false, disconnect: !isSoftRefresh);
+            Console.WriteLine($"[BAEKSU] guild={guildId} joining channel={channelId} ({channel.Name}) reason={reason}");
+            await channel.ConnectAsync(selfDeaf: true, selfMute: false, external: false, disconnect: true);
             state.SetTargetChannelId(guildId, channelId);
             failedConnectCooldowns.TryRemove(guildId, out _);
             return true;

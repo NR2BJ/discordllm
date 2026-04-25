@@ -203,14 +203,16 @@ class RecentImageStore:
         self.index[gid] = entries
         self._save()
 
-    def list_recent(self, guild_id):
+    def list_recent(self, guild_id, *, channel_id=None):
         gid = str(guild_id)
         entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
         self.index[gid] = entries
+        if channel_id is not None:
+            entries = [entry for entry in entries if str(entry.get("channel_id")) == str(channel_id)]
         return entries[-self.limit:]
 
-    def describe_recent(self, guild_id):
-        entries = self.list_recent(guild_id)
+    def describe_recent(self, guild_id, *, channel_id=None):
+        entries = self.list_recent(guild_id, channel_id=channel_id)
         if not entries:
             return "No recent images are stored."
         return "\n".join(
@@ -852,16 +854,53 @@ def guess_image_mime(filename):
     }.get(ext, "image/png")
 
 
-def build_recent_image_hint(guild_id):
-    return (
-        "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
-        f"{bot.recent_image_store.describe_recent(guild_id)}"
+def has_explicit_recent_image_reference(text):
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return False
+
+    image_terms = (
+        "사진", "이미지", "그림", "캡처", "스크린샷", "짤", "첨부",
+        "image", "photo", "picture", "screenshot", "attachment",
+    )
+    visual_reference_phrases = (
+        "그 사진", "저 사진", "이전 사진", "전에 사진", "아까 사진", "방금 사진",
+        "그 이미지", "저 이미지", "이전 이미지", "전에 이미지", "아까 이미지", "방금 이미지",
+        "보여준", "올린", "보낸", "첨부한", "첨부했던",
+        "previous image", "previous photo", "earlier image", "earlier photo",
+        "last image", "last photo", "that image", "that photo", "uploaded image", "attached image",
+    )
+    reference_terms = (
+        "그", "저", "이전", "전에", "아까", "방금", "지난", "저번", "과거", "위", "아래",
+        "다시", "보여", "올린", "보낸", "첨부",
+        "previous", "earlier", "last", "that", "uploaded", "attached", "again",
+    )
+    negative_phrases = (
+        "사진은 올린적도 없", "사진은 올린 적도 없", "사진 올린적도 없", "사진 올린 적도 없",
+        "이미지는 올린적도 없", "이미지는 올린 적도 없", "이미지 올린적도 없", "이미지 올린 적도 없",
+        "사진 안 올", "이미지 안 올", "사진 없", "이미지 없",
+        "이미지 얘기", "사진 얘기", "과거 이미지래", "과거 사진이래",
+        "no image", "no photo", "didn't upload", "did not upload", "never uploaded",
+    )
+
+    if any(phrase in lowered for phrase in negative_phrases):
+        return False
+    return any(phrase in lowered for phrase in visual_reference_phrases) or (
+        any(term in lowered for term in image_terms)
+        and any(term in lowered for term in reference_terms)
     )
 
 
-async def load_recent_image_inputs(guild_id, *, limit=RECENT_IMAGE_LIMIT):
+def build_recent_image_hint(guild_id, *, channel_id=None):
+    return (
+        "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
+        f"{bot.recent_image_store.describe_recent(guild_id, channel_id=channel_id)}"
+    )
+
+
+async def load_recent_image_inputs(guild_id, *, channel_id=None, limit=RECENT_IMAGE_LIMIT):
     inputs = []
-    for entry in reversed(bot.recent_image_store.list_recent(guild_id)[-limit:]):
+    for entry in reversed(bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)[-limit:]):
         try:
             with open(entry["path"], "rb") as f:
                 raw = f.read()
@@ -1039,8 +1078,9 @@ def build_prompt_cache_control(model_id, messages):
     return {"type": "ephemeral"}
 
 
-async def decide_message_action(config, history_messages, current_user_text, guild_id, *, has_current_images=False):
+async def decide_message_action(config, history_messages, current_user_text, guild_id, *, channel_id=None, has_current_images=False):
     excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
+    recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
     route_prompt = (
         "You are a routing planner for a Discord AI bot.\n"
         "Decide the next action for the assistant.\n\n"
@@ -1050,11 +1090,13 @@ async def decide_message_action(config, history_messages, current_user_text, gui
         "- generate_image: the app should send a refined English prompt to the image generation model.\n\n"
         "Rules:\n"
         "- Do not choose inspect_recent_images if the current message already includes image attachments.\n"
+        "- Do not choose inspect_recent_images unless the current user explicitly mentions an image/photo/screenshot/attachment or a previously shown/uploaded visual.\n"
+        "- Do not infer that product names, drinks, people, or objects refer to stored images by themselves.\n"
         "- Do not choose generate_image unless the user clearly wants image creation or a visual edit/transformation.\n"
         "- If the user is asking about something visible in a previous image, choose inspect_recent_images.\n"
         "- `use_recent_images` should be true only when the app should attach the stored recent images as references.\n\n"
         f"Current message has image attachments: {has_current_images}\n\n"
-        f"{build_recent_image_hint(guild_id)}\n\n"
+        f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n\n"
         f"Recent conversation excerpt:\n{excerpt or '(empty)'}\n\n"
         f"Current user message:\n{current_user_text}"
     )
@@ -1087,6 +1129,13 @@ async def decide_message_action(config, history_messages, current_user_text, gui
     action = payload.get("action", "respond_text")
     if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
         action = "respond_text"
+    if action == "inspect_recent_images" and (
+        has_current_images
+        or not recent_images
+        or not has_explicit_recent_image_reference(current_user_text)
+    ):
+        action = "respond_text"
+        payload["use_recent_images"] = False
     return {
         "action": action,
         "refined_prompt": (payload.get("refined_prompt") or "").strip(),
@@ -1462,13 +1511,14 @@ async def on_message(message):
                     history_buffer,
                     user_text,
                     message.guild.id,
+                    channel_id=message.channel.id,
                     has_current_images=bool(current_image_inputs),
                 )
 
                 if route.get("action") == "generate_image":
                     reference_inputs = list(current_image_inputs)
                     if not reference_inputs and route.get("use_recent_images"):
-                        reference_inputs = await load_recent_image_inputs(message.guild.id)
+                        reference_inputs = await load_recent_image_inputs(message.guild.id, channel_id=message.channel.id)
                     handled = await handle_natural_image_request(
                         message,
                         config,
@@ -1485,7 +1535,7 @@ async def on_message(message):
                             f"❌ `{current_model}` 모델은 과거 이미지를 다시 분석할 수 없습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
                         )
                         return
-                    current_content = (await load_recent_image_inputs(message.guild.id)) + current_content
+                    current_content = (await load_recent_image_inputs(message.guild.id, channel_id=message.channel.id)) + current_content
 
                 current_content.append({"type": "text", "text": user_text})
                 messages.append({"role": "user", "content": current_content})
