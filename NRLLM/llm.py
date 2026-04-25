@@ -73,12 +73,11 @@ DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
 DEFAULT_ROUTE_MODEL = os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "0"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
-DEFAULT_PROVIDER_POLICY = "balanced"
+DEFAULT_PROVIDER_PRIVACY = os.environ.get("LLM_PROVIDER_PRIVACY", "allow")
 MEMORY_UPDATE_WINDOW = 8
 CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "12000"))
 TIMING_DEBUG_LOGS = is_enabled(os.environ.get("LLM_TIMING_DEBUG", "1"))
-PROVIDER_POLICIES = ("balanced", "cheap", "fast", "private")
-PROVIDER_POLICY_ALIASES = {"stable": "private"}
+PROVIDER_PRIVACY_MODES = ("allow", "deny")
 
 IMAGE_ACTION_NOUN_RE = re.compile(
     r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
@@ -142,7 +141,6 @@ DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname
 RECENT_IMAGE_DIR = os.environ.get("LLM_RECENT_IMAGE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_recent_images"))
 RECENT_IMAGE_INDEX_FILE = os.path.join(RECENT_IMAGE_DIR, "index.json")
 RECENT_IMAGE_LIMIT = 2
-HISTORY_DEBUG_LOGS = False
 
 IMAGE_ROUTE_SCHEMA = {
     "name": "image_route_decision",
@@ -371,11 +369,6 @@ class DocumentCache:
                 title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
                 blocks.append(f"[{title}: {doc_id} | {label}]")
         return blocks
-
-
-def log_history_debug(message):
-    if HISTORY_DEBUG_LOGS:
-        print(message)
 
 
 def trim_document_text(text, limit=MAX_DOC_CHARS):
@@ -837,18 +830,20 @@ class OpenRouterBot(commands.Bot):
                 "fallback_model": DEFAULT_IMAGE_MODEL,
                 "reset_time": None,
                 "search": False,
-                "provider_policy": DEFAULT_PROVIDER_POLICY,
+                "provider_privacy": DEFAULT_PROVIDER_PRIVACY,
                 "provider_order": [],
                 "history_limit": HISTORY_LIMIT,
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
                 "route_model": DEFAULT_ROUTE_MODEL,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
-        self.server_configs[gid].setdefault("provider_policy", DEFAULT_PROVIDER_POLICY)
+        self.server_configs[gid].setdefault("provider_privacy", DEFAULT_PROVIDER_PRIVACY)
         self.server_configs[gid].setdefault("provider_order", [])
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
         self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
         self.server_configs[gid].setdefault("route_model", DEFAULT_ROUTE_MODEL)
+        self.server_configs[gid].pop("provider_policy", None)
+        self.server_configs[gid].pop("provider_allow_fallbacks", None)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -1070,52 +1065,23 @@ def normalize_provider_order(value):
     return [str(item).strip().lower() for item in raw if str(item).strip()]
 
 
-def normalize_provider_policy(value):
-    policy = (value or DEFAULT_PROVIDER_POLICY).strip().lower()
-    return PROVIDER_POLICY_ALIASES.get(policy, policy)
+def normalize_provider_privacy(value):
+    privacy = str(value or DEFAULT_PROVIDER_PRIVACY).strip().lower()
+    return privacy if privacy in PROVIDER_PRIVACY_MODES else "allow"
 
 
-def build_provider_preferences(config_or_policy, *, strict=False):
-    if isinstance(config_or_policy, dict):
-        config = config_or_policy
-        policy = normalize_provider_policy(config.get("provider_policy"))
-        provider_order = normalize_provider_order(config.get("provider_order"))
-    else:
-        config = {}
-        policy = normalize_provider_policy(config_or_policy)
-        provider_order = []
-
+def build_provider_preferences(config, *, strict=False):
+    provider_order = normalize_provider_order(config.get("provider_order"))
+    privacy = normalize_provider_privacy(config.get("provider_privacy"))
+    provider = {}
     if provider_order:
-        provider = {
-            "order": provider_order,
-            "allow_fallbacks": False,
-        }
-        if strict:
-            provider["require_parameters"] = True
-        return provider
-
-    if policy == "cheap":
-        provider = {
-            "sort": "price",
-            "allow_fallbacks": True,
-        }
-    elif policy == "fast":
-        provider = {
-            "sort": "latency",
-            "allow_fallbacks": True,
-        }
-    elif policy == "private":
-        provider = {
-            "allow_fallbacks": True,
-            "data_collection": "deny",
-        }
-    else:
-        provider = {
-            "allow_fallbacks": True,
-        }
+        provider["order"] = provider_order
+        provider["allow_fallbacks"] = False
+    if privacy == "deny":
+        provider["data_collection"] = "deny"
     if strict:
         provider["require_parameters"] = True
-    return provider
+    return provider or None
 
 
 def endpoint_tag(endpoint):
@@ -1266,10 +1232,11 @@ def format_endpoint_price(endpoint):
 
 def format_provider_mode(config):
     order = normalize_provider_order(config.get("provider_order"))
-    policy = normalize_provider_policy(config.get("provider_policy"))
+    privacy = normalize_provider_privacy(config.get("provider_privacy"))
+    privacy_label = "data_collection deny" if privacy == "deny" else "data_collection allow"
     if order:
-        return f"direct `{', '.join(order)}` | fallback OFF"
-    return f"policy `{policy}`"
+        return f"direct `{', '.join(order)}` | fallback OFF | {privacy_label}"
+    return f"OpenRouter auto | {privacy_label}"
 
 
 def format_endpoint_lines(endpoints, *, selected_tags=None, limit=10):
@@ -1927,8 +1894,8 @@ async def on_message(message):
                         await bot.or_client.fetch_models_metadata()
                         await message.channel.send(
                             f"❌ `{current_model}` 모델은 현재 OpenRouter에서 실제 endpoint를 찾지 못했습니다.\n"
-                            f"목록과 실제 라우팅 상태가 어긋났거나 provider 정책(`{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`)으로 endpoint가 걸러졌을 수 있습니다.\n"
-                            f"`/model refresh` 후 `/model set`으로 다시 선택하거나 `/model provider balanced`로 완화해보세요."
+                            f"목록과 실제 라우팅 상태가 어긋났거나 provider privacy/direct 설정(`{format_provider_mode(config)}`)으로 endpoint가 걸러졌을 수 있습니다.\n"
+                            f"`/model refresh` 후 `/model set`으로 다시 선택하거나 `/model provider provider:auto privacy:allow`로 완화해보세요."
                         )
                         return
 
@@ -2045,13 +2012,11 @@ async def route_model_autocomplete(interaction: discord.Interaction, current: st
     return (choices + model_choices)[:25]
 
 
-async def provider_policy_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+async def provider_privacy_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     current_lower = (current or "").lower()
     labels = {
-        "balanced": "balanced - OpenRouter 기본 라우팅",
-        "cheap": "cheap - 최저가 우선",
-        "fast": "fast - 낮은 latency 우선",
-        "private": "private - data_collection deny",
+        "allow": "allow - 학습/저장 가능 provider도 허용",
+        "deny": "deny - data_collection 없는 provider만 허용",
     }
     return [
         app_commands.Choice(name=label, value=value)
@@ -2212,32 +2177,31 @@ async def reset_history(interaction: discord.Interaction):
     await interaction.response.send_message("🧹 히스토리 초기화")
 
 
-@model_group.command(name="provider", description="프로바이더 정책 확인/직접 선택")
-@app_commands.autocomplete(policy=provider_policy_autocomplete, provider=provider_autocomplete)
+@model_group.command(name="provider", description="프로바이더 자동/직접 라우팅 확인 및 설정")
+@app_commands.autocomplete(provider=provider_autocomplete, privacy=provider_privacy_autocomplete)
 @app_commands.describe(
-    policy="balanced/cheap/fast/private. 지정하면 직접 provider 선택을 해제하고 정책 모드로 전환",
     provider="직접 사용할 provider tag. auto/off/clear는 직접 선택 해제",
+    privacy="allow=OpenRouter 기본 허용, deny=data_collection 없는 provider만 허용",
 )
-async def set_provider_policy(
+async def set_provider_routing(
     interaction: discord.Interaction,
-    policy: str | None = None,
     provider: str | None = None,
+    privacy: str | None = None,
 ):
     await interaction.response.defer()
     config = bot.get_config(interaction.guild_id)
     actor_name = get_server_display_name(interaction.guild, interaction.user)
     changed = []
 
-    if policy:
-        clean_policy = normalize_provider_policy(policy)
-        if clean_policy not in PROVIDER_POLICIES:
+    if privacy:
+        clean_privacy = normalize_provider_privacy(privacy)
+        if privacy.strip().lower() not in PROVIDER_PRIVACY_MODES:
             await interaction.followup.send(
-                f"❌ policy는 `{', '.join(PROVIDER_POLICIES)}` 중 하나여야 합니다."
+                f"❌ privacy는 `{', '.join(PROVIDER_PRIVACY_MODES)}` 중 하나여야 합니다."
             )
             return
-        config["provider_policy"] = clean_policy
-        config["provider_order"] = []
-        changed.append(f"정책 `{clean_policy}`")
+        config["provider_privacy"] = clean_privacy
+        changed.append(f"privacy `{clean_privacy}`")
 
     if provider:
         clean_provider = provider.strip().lower()
@@ -2268,7 +2232,7 @@ async def set_provider_policy(
         value=format_endpoint_lines(endpoints, selected_tags=selected_tags, limit=12)[:1024],
         inline=False,
     )
-    footer = "변경 없음. provider 또는 policy 옵션을 넣으면 설정됩니다."
+    footer = "변경 없음. provider 또는 privacy 옵션을 넣으면 설정됩니다."
     if changed:
         footer = f"{actor_name}: " + ", ".join(changed)
     embed.set_footer(text=footer)
