@@ -1142,43 +1142,6 @@ async def load_recent_image_parts(guild_id, *, channel_id=None, limit=RECENT_IMA
     return parts
 
 
-def has_explicit_recent_image_reference(text):
-    lowered = (text or "").lower()
-    if not lowered.strip():
-        return False
-
-    image_terms = (
-        "사진", "이미지", "그림", "캡처", "스크린샷", "짤", "첨부",
-        "image", "photo", "picture", "screenshot", "attachment",
-    )
-    visual_reference_phrases = (
-        "그 사진", "저 사진", "이전 사진", "전에 사진", "아까 사진", "방금 사진",
-        "그 이미지", "저 이미지", "이전 이미지", "전에 이미지", "아까 이미지", "방금 이미지",
-        "보여준", "올린", "보낸", "첨부한", "첨부했던",
-        "previous image", "previous photo", "earlier image", "earlier photo",
-        "last image", "last photo", "that image", "that photo", "uploaded image", "attached image",
-    )
-    reference_terms = (
-        "그", "저", "이전", "전에", "아까", "방금", "지난", "저번", "과거", "위", "아래",
-        "다시", "보여", "올린", "보낸", "첨부",
-        "previous", "earlier", "last", "that", "uploaded", "attached", "again",
-    )
-    negative_phrases = (
-        "사진은 올린적도 없", "사진은 올린 적도 없", "사진 올린적도 없", "사진 올린 적도 없",
-        "이미지는 올린적도 없", "이미지는 올린 적도 없", "이미지 올린적도 없", "이미지 올린 적도 없",
-        "사진 안 올", "이미지 안 올", "사진 없", "이미지 없",
-        "이미지 얘기", "사진 얘기", "과거 이미지래", "과거 사진이래",
-        "no image", "no photo", "didn't upload", "did not upload", "never uploaded",
-    )
-
-    if any(phrase in lowered for phrase in negative_phrases):
-        return False
-    return any(phrase in lowered for phrase in visual_reference_phrases) or (
-        any(term in lowered for term in image_terms)
-        and any(term in lowered for term in reference_terms)
-    )
-
-
 def build_recent_image_hint(guild_id, *, channel_id=None):
     recent_desc = bot.recent_image_store.describe_recent(guild_id, channel_id=channel_id)
     return (
@@ -1578,6 +1541,16 @@ async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_
         text_model = TEXT_MODEL
     text_model = get_structured_helper_model(text_model)
     recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
+    inspect_action_text = ""
+    inspect_rule_text = ""
+    recent_image_hint = ""
+    if recent_images:
+        inspect_action_text = "- inspect_recent_images: the app should reattach the stored recent images before answering."
+        inspect_rule_text = (
+            "- Choose inspect_recent_images only when the user is asking about something visible in a previous image.\n"
+            "- `use_recent_images` should be true only when the app should attach the stored recent images as references."
+        )
+        recent_image_hint = f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n"
 
     prompt = f"""
 You are a routing planner for a Discord AI bot.
@@ -1585,20 +1558,18 @@ Decide the next action for the assistant.
 
 Available actions:
 - respond_text: normal text reply.
-- inspect_recent_images: the user is asking about a previously seen image and the app should reattach the recent stored images before answering.
+{inspect_action_text}
 - generate_image: the user wants a new image or wants to edit/transform an image. In this case, write a refined English prompt for the image model.
 
 Rules:
 - Do not choose inspect_recent_images if the current message already includes image attachments.
-- Do not choose inspect_recent_images unless the current user explicitly mentions an image/photo/screenshot/attachment or a previously shown/uploaded visual.
 - Do not infer that product names, drinks, people, or objects refer to stored images by themselves.
 - Do not choose generate_image unless the user clearly wants image creation or visual transformation/editing.
-- If the user is asking a factual question about a past image, choose inspect_recent_images instead of generate_image.
-- `use_recent_images` should be true only when the app should attach the stored recent images as references.
+{inspect_rule_text}
 
 Current message has image attachments: {has_current_images}
 
-{build_recent_image_hint(guild_id, channel_id=channel_id)}
+{recent_image_hint}
 
 User message:
 {last_user_msg}
@@ -1616,11 +1587,7 @@ User message:
         action = payload.get("action", "respond_text")
         if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
             action = "respond_text"
-        if action == "inspect_recent_images" and (
-            has_current_images
-            or not recent_images
-            or not has_explicit_recent_image_reference(last_user_msg)
-        ):
+        if action == "inspect_recent_images" and (has_current_images or not recent_images):
             action = "respond_text"
             payload["use_recent_images"] = False
         return {

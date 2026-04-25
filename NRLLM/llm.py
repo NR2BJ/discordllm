@@ -854,43 +854,6 @@ def guess_image_mime(filename):
     }.get(ext, "image/png")
 
 
-def has_explicit_recent_image_reference(text):
-    lowered = (text or "").lower()
-    if not lowered.strip():
-        return False
-
-    image_terms = (
-        "사진", "이미지", "그림", "캡처", "스크린샷", "짤", "첨부",
-        "image", "photo", "picture", "screenshot", "attachment",
-    )
-    visual_reference_phrases = (
-        "그 사진", "저 사진", "이전 사진", "전에 사진", "아까 사진", "방금 사진",
-        "그 이미지", "저 이미지", "이전 이미지", "전에 이미지", "아까 이미지", "방금 이미지",
-        "보여준", "올린", "보낸", "첨부한", "첨부했던",
-        "previous image", "previous photo", "earlier image", "earlier photo",
-        "last image", "last photo", "that image", "that photo", "uploaded image", "attached image",
-    )
-    reference_terms = (
-        "그", "저", "이전", "전에", "아까", "방금", "지난", "저번", "과거", "위", "아래",
-        "다시", "보여", "올린", "보낸", "첨부",
-        "previous", "earlier", "last", "that", "uploaded", "attached", "again",
-    )
-    negative_phrases = (
-        "사진은 올린적도 없", "사진은 올린 적도 없", "사진 올린적도 없", "사진 올린 적도 없",
-        "이미지는 올린적도 없", "이미지는 올린 적도 없", "이미지 올린적도 없", "이미지 올린 적도 없",
-        "사진 안 올", "이미지 안 올", "사진 없", "이미지 없",
-        "이미지 얘기", "사진 얘기", "과거 이미지래", "과거 사진이래",
-        "no image", "no photo", "didn't upload", "did not upload", "never uploaded",
-    )
-
-    if any(phrase in lowered for phrase in negative_phrases):
-        return False
-    return any(phrase in lowered for phrase in visual_reference_phrases) or (
-        any(term in lowered for term in image_terms)
-        and any(term in lowered for term in reference_terms)
-    )
-
-
 def build_recent_image_hint(guild_id, *, channel_id=None):
     return (
         "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
@@ -1081,22 +1044,30 @@ def build_prompt_cache_control(model_id, messages):
 async def decide_message_action(config, history_messages, current_user_text, guild_id, *, channel_id=None, has_current_images=False):
     excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
     recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
+    inspect_action_text = ""
+    inspect_rule_text = ""
+    recent_image_hint = ""
+    if recent_images:
+        inspect_action_text = "- inspect_recent_images: the app should reattach the stored recent images before answering.\n"
+        inspect_rule_text = (
+            "- Choose inspect_recent_images only when the user is asking about something visible in a previous image.\n"
+            "- `use_recent_images` should be true only when the app should attach the stored recent images as references.\n"
+        )
+        recent_image_hint = f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n\n"
     route_prompt = (
         "You are a routing planner for a Discord AI bot.\n"
         "Decide the next action for the assistant.\n\n"
         "Available actions:\n"
         "- respond_text: normal text reply.\n"
-        "- inspect_recent_images: the app should reattach the stored recent images before answering.\n"
+        f"{inspect_action_text}"
         "- generate_image: the app should send a refined English prompt to the image generation model.\n\n"
         "Rules:\n"
         "- Do not choose inspect_recent_images if the current message already includes image attachments.\n"
-        "- Do not choose inspect_recent_images unless the current user explicitly mentions an image/photo/screenshot/attachment or a previously shown/uploaded visual.\n"
         "- Do not infer that product names, drinks, people, or objects refer to stored images by themselves.\n"
         "- Do not choose generate_image unless the user clearly wants image creation or a visual edit/transformation.\n"
-        "- If the user is asking about something visible in a previous image, choose inspect_recent_images.\n"
-        "- `use_recent_images` should be true only when the app should attach the stored recent images as references.\n\n"
+        f"{inspect_rule_text}\n"
         f"Current message has image attachments: {has_current_images}\n\n"
-        f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n\n"
+        f"{recent_image_hint}"
         f"Recent conversation excerpt:\n{excerpt or '(empty)'}\n\n"
         f"Current user message:\n{current_user_text}"
     )
@@ -1129,11 +1100,7 @@ async def decide_message_action(config, history_messages, current_user_text, gui
     action = payload.get("action", "respond_text")
     if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
         action = "respond_text"
-    if action == "inspect_recent_images" and (
-        has_current_images
-        or not recent_images
-        or not has_explicit_recent_image_reference(current_user_text)
-    ):
+    if action == "inspect_recent_images" and (has_current_images or not recent_images):
         action = "respond_text"
         payload["use_recent_images"] = False
     return {
