@@ -45,6 +45,12 @@ else:
 DISCORD_TOKEN = os.environ["LLM_DISCORD_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
+
+def is_enabled(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
 # 🔢 [수치 조절 구역]
 HISTORY_LIMIT = 20
 MIN_HISTORY_LIMIT = 1
@@ -64,6 +70,7 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
 DEFAULT_ROUTE_MODEL = os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
+DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "0"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
@@ -802,10 +809,12 @@ class OpenRouterBot(commands.Bot):
                 "search": False,
                 "provider_policy": DEFAULT_PROVIDER_POLICY,
                 "history_limit": HISTORY_LIMIT,
+                "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
         self.server_configs[gid].setdefault("provider_policy", DEFAULT_PROVIDER_POLICY)
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
+        self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -1277,8 +1286,9 @@ async def on_message(message):
                 can_see_video = "video" in caps["input"]
                 can_see_audio = "audio" in caps["input"]
                 can_gen_image = "image" in caps["output"]
+                action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
                 image_command_model, _ = get_active_generation_model(config, base_caps)
-                has_chat_image_support = bool(image_command_model)
+                has_chat_image_support = action_router_enabled and bool(image_command_model)
                 current_display_name = get_server_display_name(message.guild, message.author)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
 
@@ -1489,14 +1499,27 @@ async def on_message(message):
                             elif ct.startswith("image"):
                                 user_text += f"\n(User attached an image: {att.filename})"
 
-                route = await decide_message_action(
-                    config,
-                    history_buffer,
-                    user_text,
-                    message.guild.id,
-                    channel_id=message.channel.id,
-                    has_current_images=bool(current_image_inputs),
-                )
+                if current_image_inputs and not can_see_image:
+                    await message.channel.send(
+                        f"❌ `{current_model}` 모델은 이미지 분석을 지원하지 않습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
+                    )
+                    return
+
+                route = {
+                    "action": "respond_text",
+                    "refined_prompt": "",
+                    "use_recent_images": False,
+                    "reason": "action_router_disabled",
+                }
+                if action_router_enabled:
+                    route = await decide_message_action(
+                        config,
+                        history_buffer,
+                        user_text,
+                        message.guild.id,
+                        channel_id=message.channel.id,
+                        has_current_images=bool(current_image_inputs),
+                    )
 
                 if route.get("action") == "generate_image":
                     reference_inputs = list(current_image_inputs)
@@ -1818,8 +1841,11 @@ async def dashboard(interaction: discord.Interaction):
     if endpoints is not None:
         embed.add_field(name="🛰️ Routing", value=f"• **Available Endpoints:** {len(endpoints)}", inline=True)
 
+    action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
     image_command_model, image_command_source = get_active_generation_model(config, caps)
-    if not image_command_model:
+    if not action_router_enabled:
+        image_command_status = "Natural chat routing OFF"
+    elif not image_command_model:
         image_command_status = "Unavailable"
     elif image_command_source == "current-model":
         image_command_status = "Uses current model"
@@ -1828,6 +1854,7 @@ async def dashboard(interaction: discord.Interaction):
 
     helpers = [
         f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
+        f"• **Action Router:** {'ON' if action_router_enabled else 'OFF'}",
         f"• **Chat Image:** {image_command_status}",
         f"• **Image Models:** {count_image_generation_models()} discovered",
         f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
