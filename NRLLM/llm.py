@@ -82,7 +82,7 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message is prefixed with [사용자:display_name|ID:numeric_id].
+- Each user message starts with separate metadata lines: [사용자:display_name] and [ID:numeric_id].
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
@@ -494,7 +494,7 @@ def get_server_display_name(guild, user):
 
 
 def format_user_identity(guild, user):
-    return f"[사용자:{get_server_display_name(guild, user)}|ID:{getattr(user, 'id', 'unknown')}]"
+    return f"[사용자:{get_server_display_name(guild, user)}]\n[ID:{getattr(user, 'id', 'unknown')}]"
 
 
 def normalize_model_id(model_id):
@@ -1355,7 +1355,7 @@ async def on_message(message):
                             elif ct.startswith("video"):
                                 text_content += "\n(Bot generated a video here)"
                     else:
-                        text_content = f"{format_user_identity(message.guild, msg.author)}: {msg.content}"
+                        text_content = f"{format_user_identity(message.guild, msg.author)}\n{msg.content}"
                         for att in msg.attachments:
                             ct = att.content_type or ""
                             file_size = att.size or 0
@@ -1410,7 +1410,7 @@ async def on_message(message):
 
                 current_content = []
                 current_image_inputs = []
-                user_text = f"{format_user_identity(message.guild, message.author)}: {message.content}"
+                user_text = f"{format_user_identity(message.guild, message.author)}\n{message.content}"
                 unresolved_urls = []
 
                 urls = re.findall(r"(https?://\S+)", message.content)

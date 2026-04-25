@@ -134,7 +134,7 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message is prefixed with [사용자:display_name|ID:numeric_id].
+- Each user message starts with separate metadata lines: [사용자:display_name] and [ID:numeric_id].
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
@@ -1168,7 +1168,7 @@ def get_server_display_name(guild, user):
 
 
 def format_user_identity(guild, user):
-    return f"[사용자:{get_server_display_name(guild, user)}|ID:{getattr(user, 'id', 'unknown')}]"
+    return f"[사용자:{get_server_display_name(guild, user)}]\n[ID:{getattr(user, 'id', 'unknown')}]"
 
 
 def coerce_json_object(text):
@@ -2645,7 +2645,7 @@ async def on_message(message):
                         if not content.strip():
                             continue  # 텍스트 없는 이미지 전용 메시지는 히스토리 제외
                     else:
-                        content = f"{format_user_identity(message.guild, msg.author)}: {msg.content}"
+                        content = f"{format_user_identity(message.guild, msg.author)}\n{msg.content}"
                         if msg.attachments:
                             for att in msg.attachments:
                                 if att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
@@ -2670,7 +2670,7 @@ async def on_message(message):
                         break
 
                 current_display_name = get_server_display_name(message.guild, message.author)
-                current_parts = [types.Part(text=f"{format_user_identity(message.guild, message.author)}: {message.content}")]
+                current_parts = [types.Part(text=f"{format_user_identity(message.guild, message.author)}\n{message.content}")]
                 current_ref_images = []
                 has_current_images = False
 
