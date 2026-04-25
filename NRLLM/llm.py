@@ -1128,12 +1128,14 @@ def format_latency(endpoint):
         endpoint.get("latency")
         or endpoint.get("latency_ms")
         or endpoint.get("latency_last_5m")
+        or endpoint_metric(endpoint, "latency_last_30m", "p50")
+        or endpoint_metric(endpoint, "latency_last_30m", "median")
         or endpoint_metric(endpoint, "latency", "p50")
         or endpoint_metric(endpoint, "performance", "latency")
         or endpoint_metric(endpoint, "performance", "latency_p50")
     )
     if latency is None:
-        return "N/A"
+        return None
     try:
         numeric = float(latency)
         if numeric > 100:
@@ -1148,12 +1150,14 @@ def format_throughput(endpoint):
         endpoint.get("throughput")
         or endpoint.get("throughput_tps")
         or endpoint.get("throughput_last_5m")
+        or endpoint_metric(endpoint, "throughput_last_30m", "p50")
+        or endpoint_metric(endpoint, "throughput_last_30m", "median")
         or endpoint_metric(endpoint, "throughput", "p50")
         or endpoint_metric(endpoint, "performance", "throughput")
         or endpoint_metric(endpoint, "performance", "throughput_p50")
     )
     if throughput is None:
-        return "N/A"
+        return None
     try:
         return f"{float(throughput):.0f}tps"
     except (TypeError, ValueError):
@@ -1203,7 +1207,7 @@ def format_endpoint_data_policy(endpoint):
     )
     if value is True:
         return "zdr"
-    if value is False or value is None:
+    if value is False or value is None or str(value).lower() in ("unknown", "n/a"):
         return None
     return str(value)
 
@@ -1265,13 +1269,18 @@ def format_endpoint_lines(endpoints, *, selected_tags=None, limit=10):
             format_endpoint_data_policy(endpoint),
         ]
         extras = [item for item in extras if item]
-        lines.append(
-            f"{marker}`{tag}` | {endpoint_display_name(endpoint)} | "
-            f"up {format_uptime(endpoint.get('uptime_last_30m'))} | "
-            f"lat {format_latency(endpoint)} | {format_throughput(endpoint)} | "
-            f"status {format_endpoint_status(endpoint)} | {format_endpoint_price(endpoint)}"
-            + (f" | {' | '.join(extras)}" if extras else "")
-        )
+        latency = format_latency(endpoint)
+        throughput = format_throughput(endpoint)
+        metrics = [
+            f"up {format_uptime(endpoint.get('uptime_last_30m'))}",
+            f"lat {latency}" if latency else None,
+            throughput,
+            f"status {format_endpoint_status(endpoint)}",
+            format_endpoint_price(endpoint),
+            *extras,
+        ]
+        metrics = [item for item in metrics if item]
+        lines.append(f"{marker}`{tag}` | {endpoint_display_name(endpoint)} | " + " | ".join(metrics))
     if len(endpoints) > limit:
         lines.append(f"... 외 {len(endpoints) - limit}개")
     return "\n".join(lines)
@@ -2037,11 +2046,18 @@ async def provider_autocomplete(interaction: discord.Interaction, current: str) 
         tag = endpoint_tag(endpoint)
         if not tag:
             continue
+        latency = format_latency(endpoint)
+        throughput = format_throughput(endpoint)
+        metrics = [
+            f"up {format_uptime(endpoint.get('uptime_last_30m'))}",
+            f"lat {latency}" if latency else None,
+            throughput,
+            format_endpoint_price(endpoint),
+        ]
+        metrics = [item for item in metrics if item]
         label = (
             f"{tag} | {endpoint_display_name(endpoint)} | "
-            f"up {format_uptime(endpoint.get('uptime_last_30m'))} | "
-            f"lat {format_latency(endpoint)} | {format_throughput(endpoint)} | "
-            f"{format_endpoint_price(endpoint)}"
+            + " | ".join(metrics)
         )
         if current_lower and current_lower not in label.lower() and current_lower not in tag.lower():
             continue
