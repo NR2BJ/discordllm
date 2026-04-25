@@ -77,6 +77,7 @@ DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
 CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "12000"))
 TIMING_DEBUG_LOGS = is_enabled(os.environ.get("LLM_TIMING_DEBUG", "1"))
+PROVIDER_POLICIES = ("cheap", "balanced", "stable")
 
 IMAGE_ACTION_NOUN_RE = re.compile(
     r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
@@ -836,12 +837,16 @@ class OpenRouterBot(commands.Bot):
                 "reset_time": None,
                 "search": False,
                 "provider_policy": DEFAULT_PROVIDER_POLICY,
+                "provider_order": [],
+                "provider_allow_fallbacks": True,
                 "history_limit": HISTORY_LIMIT,
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
                 "route_model": DEFAULT_ROUTE_MODEL,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
         self.server_configs[gid].setdefault("provider_policy", DEFAULT_PROVIDER_POLICY)
+        self.server_configs[gid].setdefault("provider_order", [])
+        self.server_configs[gid].setdefault("provider_allow_fallbacks", True)
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
         self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
         self.server_configs[gid].setdefault("route_model", DEFAULT_ROUTE_MODEL)
@@ -1056,26 +1061,178 @@ def get_active_generation_model(config, base_caps):
     return None, None
 
 
-def build_provider_preferences(policy, *, strict=False):
-    policy = (policy or DEFAULT_PROVIDER_POLICY).lower()
+def normalize_provider_order(value):
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, list):
+        raw = value
+    else:
+        raw = []
+    return [str(item).strip().lower() for item in raw if str(item).strip()]
+
+
+def build_provider_preferences(config_or_policy, *, strict=False):
+    if isinstance(config_or_policy, dict):
+        config = config_or_policy
+        policy = (config.get("provider_policy") or DEFAULT_PROVIDER_POLICY).lower()
+        provider_order = normalize_provider_order(config.get("provider_order"))
+        allow_fallbacks = bool(config.get("provider_allow_fallbacks", True))
+    else:
+        config = {}
+        policy = (config_or_policy or DEFAULT_PROVIDER_POLICY).lower()
+        provider_order = []
+        allow_fallbacks = True
+
+    if provider_order:
+        provider = {
+            "order": provider_order,
+            "allow_fallbacks": allow_fallbacks,
+        }
+        if policy == "stable":
+            provider["data_collection"] = "deny"
+        if strict:
+            provider["require_parameters"] = True
+        return provider
+
     if policy == "cheap":
         provider = {
             "sort": "price",
-            "allow_fallbacks": True,
+            "allow_fallbacks": allow_fallbacks,
         }
     elif policy == "stable":
         provider = {
             "sort": "latency",
-            "allow_fallbacks": True,
+            "allow_fallbacks": allow_fallbacks,
             "data_collection": "deny",
         }
     else:
         provider = {
-            "allow_fallbacks": True,
+            "allow_fallbacks": allow_fallbacks,
         }
     if strict:
         provider["require_parameters"] = True
     return provider
+
+
+def endpoint_tag(endpoint):
+    tag = endpoint.get("tag") or endpoint.get("provider_slug") or endpoint.get("slug")
+    if tag:
+        return str(tag).strip().lower()
+    name = endpoint.get("provider_name") or endpoint.get("name") or ""
+    if ":" in name:
+        name = name.split(":", 1)[0]
+    return re.sub(r"[^a-z0-9/._-]+", "-", name.strip().lower()).strip("-")
+
+
+def endpoint_display_name(endpoint):
+    return endpoint.get("provider_name") or endpoint.get("name") or endpoint_tag(endpoint) or "unknown"
+
+
+def format_endpoint_status(endpoint):
+    status = endpoint.get("status")
+    if status in (0, "0", "operational", "online", "ok"):
+        return "OK"
+    if status is None:
+        return "N/A"
+    return str(status)
+
+
+def format_uptime(value):
+    try:
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def endpoint_metric(endpoint, *keys):
+    current = endpoint
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def format_latency(endpoint):
+    latency = (
+        endpoint.get("latency")
+        or endpoint.get("latency_ms")
+        or endpoint.get("latency_last_5m")
+        or endpoint_metric(endpoint, "latency", "p50")
+        or endpoint_metric(endpoint, "performance", "latency")
+        or endpoint_metric(endpoint, "performance", "latency_p50")
+    )
+    if latency is None:
+        return "N/A"
+    try:
+        numeric = float(latency)
+        if numeric > 100:
+            return f"{numeric:.0f}ms"
+        return f"{numeric:.2f}s"
+    except (TypeError, ValueError):
+        return str(latency)
+
+
+def format_endpoint_price(endpoint):
+    pricing = endpoint.get("pricing") or {}
+    try:
+        in_p = float(pricing.get("prompt", 0)) * 1_000_000
+        out_p = float(pricing.get("completion", 0)) * 1_000_000
+    except (TypeError, ValueError):
+        return "N/A"
+
+    def _fmt(v):
+        if v == 0:
+            return "Free"
+        if v < 0.001:
+            return f"${v:.6f}"
+        if v < 0.01:
+            return f"${v:.4f}"
+        if v < 1:
+            return f"${v:.3f}"
+        return f"${v:.2f}"
+
+    return f"{_fmt(in_p)}/{_fmt(out_p)}"
+
+
+def format_provider_mode(config):
+    order = normalize_provider_order(config.get("provider_order"))
+    policy = config.get("provider_policy", DEFAULT_PROVIDER_POLICY)
+    fallbacks = bool(config.get("provider_allow_fallbacks", True))
+    if order:
+        return f"direct `{', '.join(order)}` | fallbacks={'ON' if fallbacks else 'OFF'} | policy=`{policy}`"
+    return f"policy `{policy}` | fallbacks={'ON' if fallbacks else 'OFF'}"
+
+
+def format_endpoint_lines(endpoints, *, selected_tags=None, limit=10):
+    selected_tags = set(selected_tags or [])
+    if endpoints is None:
+        return "endpoint 정보를 가져오지 못했습니다."
+    if not endpoints:
+        return "사용 가능한 endpoint가 없습니다."
+
+    def _sort_key(endpoint):
+        uptime = endpoint.get("uptime_last_30m")
+        try:
+            uptime_value = float(uptime)
+        except (TypeError, ValueError):
+            uptime_value = -1.0
+        selected = endpoint_tag(endpoint) in selected_tags
+        return (selected, uptime_value)
+
+    lines = []
+    for endpoint in sorted(endpoints, key=_sort_key, reverse=True)[:limit]:
+        tag = endpoint_tag(endpoint) or "unknown"
+        marker = "★ " if tag in selected_tags else ""
+        lines.append(
+            f"{marker}`{tag}` | {endpoint_display_name(endpoint)} | "
+            f"up {format_uptime(endpoint.get('uptime_last_30m'))} | "
+            f"lat {format_latency(endpoint)} | status {format_endpoint_status(endpoint)} | "
+            f"{format_endpoint_price(endpoint)}"
+        )
+    if len(endpoints) > limit:
+        lines.append(f"... 외 {len(endpoints) - limit}개")
+    return "\n".join(lines)
 
 
 def build_prompt_cache_control(model_id, messages):
@@ -1178,7 +1335,7 @@ async def decide_message_action(config, history_messages, current_user_text, gui
                 {"role": "system", "content": "Return valid JSON only."},
                 {"role": "user", "content": route_prompt},
             ],
-            provider=build_provider_preferences(config.get("provider_policy")),
+            provider=build_provider_preferences(config),
             cache_control=build_prompt_cache_control(route_model, [
                 {"content": route_prompt},
             ]),
@@ -1288,7 +1445,7 @@ async def handle_natural_image_request(message, config, history_messages, curren
             {"role": "user", "content": content},
         ],
         capabilities=caps,
-        provider=build_provider_preferences(config.get("provider_policy")),
+        provider=build_provider_preferences(config),
         cache_control=build_prompt_cache_control(model_info["id"], [
             {"content": prompt_text},
         ]),
@@ -1666,10 +1823,7 @@ async def on_message(message):
                         }
                     )
 
-                provider_prefs = build_provider_preferences(
-                    config.get("provider_policy"),
-                    strict=bool(chat_tools or config.get("search")),
-                )
+                provider_prefs = build_provider_preferences(config, strict=bool(chat_tools or config.get("search")))
                 cache_control = build_prompt_cache_control(current_model, messages)
                 timing_mark(
                     f"pre_chat chars={estimate_message_text_chars(messages)} "
@@ -1815,6 +1969,44 @@ async def route_model_autocomplete(interaction: discord.Interaction, current: st
     )
     return (choices + model_choices)[:25]
 
+
+async def provider_policy_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    current_lower = (current or "").lower()
+    labels = {
+        "cheap": "cheap - 저가순",
+        "balanced": "balanced - OpenRouter 기본 라우팅",
+        "stable": "stable - 지연순 + data_collection deny",
+    }
+    return [
+        app_commands.Choice(name=label, value=value)
+        for value, label in labels.items()
+        if not current_lower or current_lower in value or current_lower in label.lower()
+    ][:25]
+
+
+async def provider_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    current_lower = (current or "").lower()
+    choices = [
+        app_commands.Choice(name="auto - 직접 provider 선택 해제", value="auto"),
+        app_commands.Choice(name="off - 직접 provider 선택 해제", value="off"),
+    ]
+    config = bot.get_config(interaction.guild_id)
+    endpoints = await bot.or_client.fetch_model_endpoints(config.get("model", DEFAULT_MODEL)) or []
+    for endpoint in endpoints:
+        tag = endpoint_tag(endpoint)
+        if not tag:
+            continue
+        label = (
+            f"{tag} | {endpoint_display_name(endpoint)} | "
+            f"up {format_uptime(endpoint.get('uptime_last_30m'))} | {format_endpoint_price(endpoint)}"
+        )
+        if current_lower and current_lower not in label.lower() and current_lower not in tag.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=tag[:100]))
+        if len(choices) >= 25:
+            break
+    return choices[:25]
+
 model_group = app_commands.Group(name="model", description="모델 관련 설정")
 
 
@@ -1833,6 +2025,7 @@ async def set_model(interaction: discord.Interaction, model_id: str):
 
     config = bot.get_config(interaction.guild_id)
     config["model"] = model_info['id']
+    config["provider_order"] = []
     bot.save_config()
     
     type_str = bot.or_client.get_type_string(model_info['id'], model_info=model_info)
@@ -1941,22 +2134,79 @@ async def reset_history(interaction: discord.Interaction):
     await interaction.response.send_message("🧹 히스토리 초기화")
 
 
-@model_group.command(name="provider", description="기본 프로바이더 라우팅 정책 설정")
-@app_commands.choices(
-    policy=[
-        app_commands.Choice(name="cheap", value="cheap"),
-        app_commands.Choice(name="balanced", value="balanced"),
-        app_commands.Choice(name="stable", value="stable"),
-    ]
+@model_group.command(name="provider", description="프로바이더 정책 확인/직접 선택")
+@app_commands.autocomplete(policy=provider_policy_autocomplete, provider=provider_autocomplete)
+@app_commands.describe(
+    policy="cheap/balanced/stable. 지정하면 직접 provider 선택을 해제하고 정책 모드로 전환",
+    provider="직접 사용할 provider tag. auto/off/clear는 직접 선택 해제",
+    fallbacks="직접 provider 실패 시 다른 provider 허용 여부",
 )
-async def set_provider_policy(interaction: discord.Interaction, policy: app_commands.Choice[str]):
+async def set_provider_policy(
+    interaction: discord.Interaction,
+    policy: str | None = None,
+    provider: str | None = None,
+    fallbacks: bool | None = None,
+):
+    await interaction.response.defer()
     config = bot.get_config(interaction.guild_id)
-    config["provider_policy"] = policy.value
-    bot.save_config()
     actor_name = get_server_display_name(interaction.guild, interaction.user)
-    await interaction.response.send_message(
-        f"✅ {actor_name}님이 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
+    changed = []
+
+    if policy:
+        clean_policy = policy.strip().lower()
+        if clean_policy not in PROVIDER_POLICIES:
+            await interaction.followup.send(
+                f"❌ policy는 `{', '.join(PROVIDER_POLICIES)}` 중 하나여야 합니다."
+            )
+            return
+        config["provider_policy"] = clean_policy
+        config["provider_order"] = []
+        if fallbacks is None:
+            config["provider_allow_fallbacks"] = True
+        changed.append(f"정책 `{clean_policy}`")
+
+    if provider:
+        clean_provider = provider.strip().lower()
+        if clean_provider in ("auto", "clear", "none", "off", "disable", "disabled"):
+            config["provider_order"] = []
+            if fallbacks is None:
+                config["provider_allow_fallbacks"] = True
+            changed.append("직접 provider 해제")
+        else:
+            endpoints = await bot.or_client.fetch_model_endpoints(config.get("model", DEFAULT_MODEL))
+            available_tags = {endpoint_tag(endpoint) for endpoint in endpoints or [] if endpoint_tag(endpoint)}
+            if available_tags and clean_provider not in available_tags:
+                await interaction.followup.send(
+                    f"❌ `{clean_provider}` provider는 현재 모델 endpoint 목록에 없습니다.\n"
+                    f"`/model provider`로 가능한 tag를 확인해보세요."
+                )
+                return
+            config["provider_order"] = [clean_provider]
+            if fallbacks is None:
+                config["provider_allow_fallbacks"] = False
+            changed.append(f"직접 provider `{clean_provider}`")
+
+    if fallbacks is not None:
+        config["provider_allow_fallbacks"] = bool(fallbacks)
+        changed.append(f"fallbacks {'ON' if fallbacks else 'OFF'}")
+
+    if changed:
+        bot.save_config()
+
+    endpoints = await bot.or_client.fetch_model_endpoints(config.get("model", DEFAULT_MODEL))
+    selected_tags = normalize_provider_order(config.get("provider_order"))
+    embed = discord.Embed(title="🛰️ Provider Routing", color=0x4caf50)
+    embed.add_field(name="Current", value=format_provider_mode(config), inline=False)
+    embed.add_field(
+        name=f"Endpoints for `{config.get('model', DEFAULT_MODEL)}`",
+        value=format_endpoint_lines(endpoints, selected_tags=selected_tags, limit=12)[:1024],
+        inline=False,
     )
+    footer = "변경 없음. provider/policy/fallbacks 옵션을 넣으면 설정됩니다."
+    if changed:
+        footer = f"{actor_name}: " + ", ".join(changed)
+    embed.set_footer(text=footer)
+    await interaction.followup.send(embed=embed)
 
 
 @model_group.command(name="history", description="대화 원문 히스토리 참조 개수 설정")
@@ -2043,10 +2293,17 @@ async def dashboard(interaction: discord.Interaction):
         f"• **Router Model:** `{route_model_status}`",
         f"• **Chat Image:** {image_command_status}",
         f"• **Image Models:** {count_image_generation_models()} discovered",
-        f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
+        f"• **Provider:** {format_provider_mode(config)}",
         f"• **History:** {get_history_limit(config)} messages",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
+    if endpoints is not None:
+        endpoint_lines = format_endpoint_lines(
+            endpoints,
+            selected_tags=normalize_provider_order(config.get("provider_order")),
+            limit=8,
+        )
+        embed.add_field(name="🛰️ Provider Endpoints", value=endpoint_lines[:1024], inline=False)
 
     desc = model_meta.get('description', '설명 없음')
     if len(desc) > 300: desc = desc[:297] + "..."
