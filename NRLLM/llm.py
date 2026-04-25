@@ -74,6 +74,7 @@ DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROU
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
+CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "12000"))
 
 IMAGE_ACTION_NOUN_RE = re.compile(
     r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
@@ -761,7 +762,6 @@ class OpenRouterClient:
         payload = {
             "model": model,
             "messages": messages,
-            "plugins": [{"id": "context-compression"}],
         }
 
         tool_list = []
@@ -773,7 +773,9 @@ class OpenRouterClient:
             payload["tools"] = tool_list
             payload["tool_choice"] = "auto"
 
-        plugin_list = payload["plugins"]
+        plugin_list = []
+        if should_use_context_compression(messages):
+            plugin_list.append({"id": "context-compression"})
         if plugins:
             plugin_list.extend(copy.deepcopy(plugins))
         if plugin_list:
@@ -1078,18 +1080,27 @@ def build_prompt_cache_control(model_id, messages):
     clean_id = normalize_model_id(model_id)
     if not clean_id.startswith("anthropic/"):
         return None
+    total_text = estimate_message_text_chars(messages)
+    if total_text < 2048:
+        return None
+    return {"type": "ephemeral"}
+
+
+def estimate_message_text_chars(messages):
     total_text = 0
-    for message in messages:
-        content = message.get("content")
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, str):
             total_text += len(content)
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     total_text += len(part.get("text", ""))
-    if total_text < 2048:
-        return None
-    return {"type": "ephemeral"}
+    return total_text
+
+
+def should_use_context_compression(messages):
+    return CONTEXT_COMPRESSION_MIN_CHARS > 0 and estimate_message_text_chars(messages) >= CONTEXT_COMPRESSION_MIN_CHARS
 
 
 def has_image_generation_signal(text, *, has_current_images=False):
