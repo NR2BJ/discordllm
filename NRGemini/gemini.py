@@ -105,7 +105,7 @@ DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research"]["text"],
     AVAILABLE_MODELS["deep-research-max"]["text"],
 }
-ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3-flash"]["text"])
+ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3.1-flash-lite"]["text"])
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
