@@ -43,6 +43,13 @@ except Exception:
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.genai._api_client")
 
+
+def is_enabled(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 ENABLE_UVLOOP = os.environ.get("GEMINI_ENABLE_UVLOOP", "0") == "1"
 if ENABLE_UVLOOP:
     try:
@@ -99,6 +106,7 @@ DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research-max"]["text"],
 }
 ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3-flash"]["text"])
+DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
 DEFAULT_HISTORY_LIMIT = 20
@@ -119,6 +127,30 @@ MODEL_HISTORY_LIMITS = {
     AVAILABLE_MODELS["deep-research"]["text"]: 20,
     AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
 }
+
+IMAGE_ACTION_NOUN_RE = re.compile(
+    r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
+    r"\bimage\b|\bpicture\b|\bphoto\b|\billustration\b|\bdrawing\b|\blogo\b|\bicon\b|\bthumbnail\b|\bmeme\b|\bavatar\b|\bwallpaper\b)",
+    re.IGNORECASE,
+)
+IMAGE_ACTION_VERB_RE = re.compile(
+    r"(그려|그림으로|이미지로|사진처럼|짤로|생성|만들|제작|렌더|편집|수정|변환|합성|지워|넣어|추가|바꿔|"
+    r"\bgenerate\b|\bdraw\b|\bcreate\b|\bmake\b|\brender\b|\bedit\b|\bmodify\b|\btransform\b|\bremove\b|\badd\b)",
+    re.IGNORECASE,
+)
+IMAGE_DRAW_REQUEST_RE = re.compile(r"(그려\s*(줘|봐|라)?|\bdraw\b|\bsketch\b)", re.IGNORECASE)
+CURRENT_IMAGE_EDIT_RE = re.compile(
+    r"(이거|이것|저거|저것|첨부|사진|이미지|그림|짤|reference|attached|this|that).{0,40}"
+    r"(편집|수정|변환|합성|지워|넣어|추가|바꿔|스타일|풍으로|배경|edit|modify|transform|remove|add|style|background)",
+    re.IGNORECASE,
+)
+RECENT_IMAGE_REFERENCE_RE = re.compile(
+    r"((아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last).{0,40}"
+    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot)|"
+    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot).{0,40}"
+    r"(아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last))",
+    re.IGNORECASE,
+)
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -1217,7 +1249,42 @@ def is_deep_research_model(text_model):
 
 
 def get_structured_helper_model(text_model=None):
-    return ROUTING_MODEL if is_deep_research_model(text_model) else (text_model or ROUTING_MODEL)
+    return ROUTING_MODEL
+
+
+def has_image_generation_signal(text, *, has_current_images=False):
+    text = (text or "").strip()
+    if not text:
+        return False
+    if IMAGE_DRAW_REQUEST_RE.search(text):
+        return True
+    if IMAGE_ACTION_NOUN_RE.search(text) and IMAGE_ACTION_VERB_RE.search(text):
+        return True
+    if has_current_images and CURRENT_IMAGE_EDIT_RE.search(text):
+        return True
+    return False
+
+
+def has_recent_image_reference_signal(text):
+    text = (text or "").strip()
+    if not text:
+        return False
+    return bool(RECENT_IMAGE_REFERENCE_RE.search(text))
+
+
+def should_call_action_router(
+    text,
+    *,
+    has_current_images=False,
+    has_recent_images=False,
+    allow_image_generation=True,
+    allow_recent_images=True,
+):
+    if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
+        return True
+    if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
+        return True
+    return False
 
 
 def build_gemini_system_prompt():
@@ -1836,8 +1903,14 @@ class GeminiBot(commands.Bot):
     def get_config(self, guild_id):
         gid = str(guild_id)
         if gid not in self.server_configs:
-            self.server_configs[gid] = {"channel_id": None, "reset_time": None, "history_limit": DEFAULT_HISTORY_LIMIT}
+            self.server_configs[gid] = {
+                "channel_id": None,
+                "reset_time": None,
+                "history_limit": DEFAULT_HISTORY_LIMIT,
+                "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
+            }
         self.server_configs[gid].setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
+        self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
         return self.server_configs[gid]
 
     def get_sibo(self, guild_id):
@@ -2724,13 +2797,28 @@ async def on_message(message):
                                 print(f"[CACHE] {file_kind or 'text'} file 저장: {doc_id} ({att.filename})")
                                 current_parts.append(types.Part(text=f"\n\n[Attached File Content: {att.filename}]\n```\n{file_content}\n```"))
 
-                route = await route_message_action(
+                route = {
+                    "action": "respond_text",
+                    "refined_prompt": "",
+                    "use_recent_images": False,
+                    "reason": "action_router_skipped",
+                }
+                action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
+                recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
+                if action_router_enabled and should_call_action_router(
                     message.content,
-                    guild_id=message.guild.id,
-                    channel_id=message.channel.id,
                     has_current_images=has_current_images,
-                    text_model=server_text_model,
-                )
+                    has_recent_images=recent_images_available,
+                    allow_image_generation=bool(server_image_model),
+                    allow_recent_images=True,
+                ):
+                    route = await route_message_action(
+                        message.content,
+                        guild_id=message.guild.id,
+                        channel_id=message.channel.id,
+                        has_current_images=has_current_images,
+                        text_model=server_text_model,
+                    )
 
                 if route.get("action") == "generate_image":
                     prompt = route.get("refined_prompt") or message.content

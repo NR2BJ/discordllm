@@ -70,10 +70,34 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
 DEFAULT_ROUTE_MODEL = os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
-DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "0"))
+DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "1"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
+
+IMAGE_ACTION_NOUN_RE = re.compile(
+    r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
+    r"\bimage\b|\bpicture\b|\bphoto\b|\billustration\b|\bdrawing\b|\blogo\b|\bicon\b|\bthumbnail\b|\bmeme\b|\bavatar\b|\bwallpaper\b)",
+    re.IGNORECASE,
+)
+IMAGE_ACTION_VERB_RE = re.compile(
+    r"(그려|그림으로|이미지로|사진처럼|짤로|생성|만들|제작|렌더|편집|수정|변환|합성|지워|넣어|추가|바꿔|"
+    r"\bgenerate\b|\bdraw\b|\bcreate\b|\bmake\b|\brender\b|\bedit\b|\bmodify\b|\btransform\b|\bremove\b|\badd\b)",
+    re.IGNORECASE,
+)
+IMAGE_DRAW_REQUEST_RE = re.compile(r"(그려\s*(줘|봐|라)?|\bdraw\b|\bsketch\b)", re.IGNORECASE)
+CURRENT_IMAGE_EDIT_RE = re.compile(
+    r"(이거|이것|저거|저것|첨부|사진|이미지|그림|짤|reference|attached|this|that).{0,40}"
+    r"(편집|수정|변환|합성|지워|넣어|추가|바꿔|스타일|풍으로|배경|edit|modify|transform|remove|add|style|background)",
+    re.IGNORECASE,
+)
+RECENT_IMAGE_REFERENCE_RE = re.compile(
+    r"((아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last).{0,40}"
+    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot)|"
+    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot).{0,40}"
+    r"(아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last))",
+    re.IGNORECASE,
+)
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -1068,6 +1092,41 @@ def build_prompt_cache_control(model_id, messages):
     return {"type": "ephemeral"}
 
 
+def has_image_generation_signal(text, *, has_current_images=False):
+    text = (text or "").strip()
+    if not text:
+        return False
+    if IMAGE_DRAW_REQUEST_RE.search(text):
+        return True
+    if IMAGE_ACTION_NOUN_RE.search(text) and IMAGE_ACTION_VERB_RE.search(text):
+        return True
+    if has_current_images and CURRENT_IMAGE_EDIT_RE.search(text):
+        return True
+    return False
+
+
+def has_recent_image_reference_signal(text):
+    text = (text or "").strip()
+    if not text:
+        return False
+    return bool(RECENT_IMAGE_REFERENCE_RE.search(text))
+
+
+def should_call_action_router(
+    text,
+    *,
+    has_current_images=False,
+    has_recent_images=False,
+    allow_image_generation=True,
+    allow_recent_images=True,
+):
+    if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
+        return True
+    if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
+        return True
+    return False
+
+
 async def decide_message_action(config, history_messages, current_user_text, guild_id, *, channel_id=None, has_current_images=False):
     route_model = normalize_model_id((config or {}).get("route_model") or DEFAULT_ROUTE_MODEL or (config or {}).get("model") or DEFAULT_MODEL)
     excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
@@ -1499,7 +1558,16 @@ async def on_message(message):
                             elif ct.startswith("image"):
                                 user_text += f"\n(User attached an image: {att.filename})"
 
-                if current_image_inputs and not can_see_image:
+                recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
+                should_route_action = action_router_enabled and should_call_action_router(
+                    message.content,
+                    has_current_images=bool(current_image_inputs),
+                    has_recent_images=recent_images_available,
+                    allow_image_generation=has_chat_image_support,
+                    allow_recent_images=can_see_image,
+                )
+
+                if current_image_inputs and not can_see_image and not should_route_action:
                     await message.channel.send(
                         f"❌ `{current_model}` 모델은 이미지 분석을 지원하지 않습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
                     )
@@ -1509,9 +1577,9 @@ async def on_message(message):
                     "action": "respond_text",
                     "refined_prompt": "",
                     "use_recent_images": False,
-                    "reason": "action_router_disabled",
+                    "reason": "action_router_skipped",
                 }
-                if action_router_enabled:
+                if should_route_action:
                     route = await decide_message_action(
                         config,
                         history_buffer,
@@ -1534,6 +1602,12 @@ async def on_message(message):
                     )
                     if handled:
                         return
+
+                if current_image_inputs and not can_see_image:
+                    await message.channel.send(
+                        f"❌ `{current_model}` 모델은 이미지 분석을 지원하지 않습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
+                    )
+                    return
 
                 if route.get("action") == "inspect_recent_images" and not current_image_inputs and route.get("use_recent_images"):
                     if not can_see_image:
