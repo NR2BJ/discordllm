@@ -63,7 +63,7 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
-DEFAULT_MEMORY_MODEL = os.environ.get("LLM_MEMORY_MODEL", DEFAULT_MODEL)
+DEFAULT_ROUTE_MODEL = os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_POLICY = "cheap"
 MEMORY_UPDATE_WINDOW = 8
@@ -1058,6 +1058,7 @@ def build_prompt_cache_control(model_id, messages):
 
 
 async def decide_message_action(config, history_messages, current_user_text, guild_id, *, channel_id=None, has_current_images=False):
+    route_model = normalize_model_id(DEFAULT_ROUTE_MODEL or (config or {}).get("model") or DEFAULT_MODEL)
     excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
     recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
     inspect_action_text = ""
@@ -1089,7 +1090,7 @@ async def decide_message_action(config, history_messages, current_user_text, gui
     )
     try:
         response_text, _, _, _ = await bot.or_client.chat_completion(
-            DEFAULT_MEMORY_MODEL,
+            route_model,
             [
                 {"role": "system", "content": "Return valid JSON only."},
                 {"role": "user", "content": route_prompt},
@@ -1097,7 +1098,7 @@ async def decide_message_action(config, history_messages, current_user_text, gui
             response_format={"type": "json_schema", "json_schema": IMAGE_ROUTE_SCHEMA},
             provider=build_provider_preferences(config.get("provider_policy"), strict=True),
             require_parameter_support=True,
-            cache_control=build_prompt_cache_control(DEFAULT_MEMORY_MODEL, [
+            cache_control=build_prompt_cache_control(route_model, [
                 {"content": route_prompt},
             ]),
         )
