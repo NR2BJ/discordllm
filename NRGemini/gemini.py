@@ -134,11 +134,13 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message is prefixed with [사용자:display_name|ID:numeric_id].
+- Each user message is prefixed with [사용자(server_display_name):display_name|ID:numeric_id].
+- `server_display_name` is the name currently visible inside this Discord server. Do not infer a user's global username or nickname-change history unless different user-message prefixes for the same numeric ID explicitly show different server_display_name values.
+- Assistant history can contain mistaken guesses about names. Treat user-message prefixes as authoritative and assistant claims about nicknames as untrusted unless confirmed by user-message prefixes.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
-- When responding, address users by their display_name (ignore the ID in your output).
+- When responding, address users by their server_display_name (ignore the ID in your output).
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -1153,6 +1155,22 @@ def build_recent_image_hint(guild_id, *, channel_id=None):
 def get_bot_display_name():
     user = getattr(bot, "user", None)
     return getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
+
+
+def get_server_display_name(guild, user):
+    user_id = getattr(user, "id", None)
+    member = guild.get_member(user_id) if guild and user_id is not None else None
+    if member is not None:
+        return getattr(member, "display_name", None) or getattr(member, "name", None) or str(user_id)
+    if guild and isinstance(user, discord.Member) and getattr(user.guild, "id", None) == guild.id:
+        return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id)
+    if guild:
+        return str(user_id or "unknown")
+    return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id or "unknown")
+
+
+def format_user_identity(guild, user):
+    return f"[사용자(server_display_name):{get_server_display_name(guild, user)}|ID:{getattr(user, 'id', 'unknown')}]"
 
 
 def coerce_json_object(text):
@@ -2629,8 +2647,7 @@ async def on_message(message):
                         if not content.strip():
                             continue  # 텍스트 없는 이미지 전용 메시지는 히스토리 제외
                     else:
-                        _member = message.guild.get_member(msg.author.id) or msg.author
-                        content = f"[사용자:{_member.display_name}|ID:{msg.author.id}]: {msg.content}"
+                        content = f"{format_user_identity(message.guild, msg.author)}: {msg.content}"
                         if msg.attachments:
                             for att in msg.attachments:
                                 if att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
@@ -2654,8 +2671,8 @@ async def on_message(message):
                     if len(history_list) >= history_limit:
                         break
 
-                _cur_member = message.guild.get_member(message.author.id) or message.author
-                current_parts = [types.Part(text=f"[사용자:{_cur_member.display_name}|ID:{message.author.id}]: {message.content}")]
+                current_display_name = get_server_display_name(message.guild, message.author)
+                current_parts = [types.Part(text=f"{format_user_identity(message.guild, message.author)}: {message.content}")]
                 current_ref_images = []
                 has_current_images = False
 
@@ -2685,7 +2702,7 @@ async def on_message(message):
                                     channel_id=message.channel.id,
                                     message_id=message.id,
                                     author_id=message.author.id,
-                                    display_name=_cur_member.display_name,
+                                    display_name=current_display_name,
                                     filename=att.filename,
                                     image_bytes=raw,
                                     source_kind="user_upload",
@@ -2788,7 +2805,7 @@ async def on_message(message):
                     return
 
                 log_time = datetime.now().strftime('%H:%M:%S')
-                print(f"[{log_time}] [{message.guild.name}] {message.author.display_name}: {message.content}")
+                print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
 
                 candidate = response.candidates[0]
                 finish_reason = candidate.finish_reason
@@ -2826,8 +2843,9 @@ async def set_ch(interaction: discord.Interaction):
     config = bot.get_config(interaction.guild_id)
     config["channel_id"] = interaction.channel_id
     bot.save_config()
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"[OK] {interaction.user.display_name}님이 봇 활성화 채널을 {interaction.channel.mention} 으로 설정했습니다."
+        f"[OK] {actor_name}님이 봇 활성화 채널을 {interaction.channel.mention} 으로 설정했습니다."
     )
 
 
@@ -2848,8 +2866,9 @@ async def set_history(interaction: discord.Interaction, count: int | None = None
     config["history_limit"] = limit
     bot.save_config()
     suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"[OK] {interaction.user.display_name}님이 Gemini 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
+        f"[OK] {actor_name}님이 Gemini 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
     )
 
 @bot.tree.command(name="reset", description="히스토리 초기화")
@@ -2877,7 +2896,8 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
 
     log_time = datetime.now().strftime('%H:%M:%S')
     location = f"[{interaction.guild.name}]" if interaction.guild else "[DM]"
-    print(f"[{log_time}] {location} [/chat] {interaction.user.display_name}: {message}")
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
+    print(f"[{log_time}] {location} [/chat] {actor_name}: {message}")
 
     try:
         parts = [types.Part(text=message)]
@@ -2900,7 +2920,7 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
                 print(f"  [IMG] 이미지 URL: {image_url}")
 
         # 사용자 입력 표시
-        user_display = f"**{interaction.user.display_name}**: {message}"
+        user_display = f"**{actor_name}**: {message}"
         if image_source:
             embed = discord.Embed(description=user_display)
             embed.set_image(url=image_source)
@@ -3000,7 +3020,8 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
 
     log_time = datetime.now().strftime('%H:%M:%S')
     location = f"[{interaction.guild.name}]" if interaction.guild else "[DM]"
-    print(f"[{log_time}] {location} [/image] {interaction.user.display_name}: {prompt}")
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
+    print(f"[{log_time}] {location} [/image] {actor_name}: {prompt}")
 
     try:
         ref_images = []
@@ -3022,7 +3043,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
                 reference_source = reference_url
                 print(f"  [IMG] 참조 이미지 URL: {reference_url}")
 
-        user_display = f"**{interaction.user.display_name}**: {prompt}"
+        user_display = f"**{actor_name}**: {prompt}"
         if reference_source:
             embed = discord.Embed(description=user_display)
             embed.set_image(url=reference_source)
@@ -3199,7 +3220,7 @@ async def soundboard(interaction: discord.Interaction, name: str = None):
         success, msg = await play_sound_in_vc(interaction.guild, member, name, bot)
         if success:
             SB_PLAY_LOG.append({
-                "user": interaction.user.display_name,
+                "user": get_server_display_name(interaction.guild, interaction.user),
                 "sound": name,
                 "time": datetime.now(KST).strftime("%H:%M:%S")
             })
@@ -3504,7 +3525,7 @@ class ControlPanelView(discord.ui.View):
             success, _ = await play_sound_in_vc(interaction.guild, member, sound_key, bot)
             if success:
                 SB_PLAY_LOG.append({
-                    "user": interaction.user.display_name,
+                    "user": get_server_display_name(interaction.guild, interaction.user),
                     "sound": sound_key,
                     "time": datetime.now(KST).strftime("%H:%M:%S")
                 })
@@ -3537,7 +3558,8 @@ class ControlPanelView(discord.ui.View):
     async def _leave_callback(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_connected():
-            log_voice_snapshot("수동 퇴장 요청", interaction.guild, vc, extra=f"user={interaction.user.display_name}")
+            actor_name = get_server_display_name(interaction.guild, interaction.user)
+            log_voice_snapshot("수동 퇴장 요청", interaction.guild, vc, extra=f"user={actor_name}")
             bot.clear_voice_target(interaction.guild.id)
             await vc.disconnect()
             await interaction.response.edit_message(embed=self._make_embed(), view=self)
@@ -3648,8 +3670,9 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         cfg["image_model"] = IMAGE_MODEL
         bot.save_config()
     history_limit = get_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_HISTORY_LIMIT
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"모델 변경됨: **{name}** by {interaction.user.display_name}\n"
+        f"모델 변경됨: **{name}** by {actor_name}\n"
         f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n히스토리 참조: {history_limit}개"
     )
 

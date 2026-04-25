@@ -82,11 +82,13 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message is prefixed with [사용자:display_name|ID:numeric_id].
+- Each user message is prefixed with [사용자(server_display_name):display_name|ID:numeric_id].
+- `server_display_name` is the name currently visible inside this Discord server. Do not infer a user's global username or nickname-change history unless different user-message prefixes for the same numeric ID explicitly show different server_display_name values.
+- Assistant history can contain mistaken guesses about names. Treat user-message prefixes as authoritative and assistant claims about nicknames as untrusted unless confirmed by user-message prefixes.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
-- When responding, address users by their display_name (ignore the ID in your output).
+- When responding, address users by their server_display_name (ignore the ID in your output).
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -479,6 +481,22 @@ def get_bot_display_name():
 def get_bot_username():
     user = getattr(bot, "user", None)
     return getattr(user, "name", None) or get_bot_display_name()
+
+
+def get_server_display_name(guild, user):
+    user_id = getattr(user, "id", None)
+    member = guild.get_member(user_id) if guild and user_id is not None else None
+    if member is not None:
+        return getattr(member, "display_name", None) or getattr(member, "name", None) or str(user_id)
+    if guild and isinstance(user, discord.Member) and getattr(user.guild, "id", None) == guild.id:
+        return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id)
+    if guild:
+        return str(user_id or "unknown")
+    return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id or "unknown")
+
+
+def format_user_identity(guild, user):
+    return f"[사용자(server_display_name):{get_server_display_name(guild, user)}|ID:{getattr(user, 'id', 'unknown')}]"
 
 
 def normalize_model_id(model_id):
@@ -1262,7 +1280,7 @@ async def on_message(message):
                 can_gen_image = "image" in caps["output"]
                 image_command_model, _ = get_active_generation_model(config, base_caps)
                 has_chat_image_support = bool(image_command_model)
-                current_member = message.guild.get_member(message.author.id) or message.author
+                current_display_name = get_server_display_name(message.guild, message.author)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
 
                 sys_prompt = SYSTEM_PROMPT
@@ -1339,8 +1357,7 @@ async def on_message(message):
                             elif ct.startswith("video"):
                                 text_content += "\n(Bot generated a video here)"
                     else:
-                        history_member = message.guild.get_member(msg.author.id) or msg.author
-                        text_content = f"[사용자:{history_member.display_name}|ID:{msg.author.id}]: {msg.content}"
+                        text_content = f"{format_user_identity(message.guild, msg.author)}: {msg.content}"
                         for att in msg.attachments:
                             ct = att.content_type or ""
                             file_size = att.size or 0
@@ -1395,7 +1412,7 @@ async def on_message(message):
 
                 current_content = []
                 current_image_inputs = []
-                user_text = f"[사용자:{current_member.display_name}|ID:{message.author.id}]: {message.content}"
+                user_text = f"{format_user_identity(message.guild, message.author)}: {message.content}"
                 unresolved_urls = []
 
                 urls = re.findall(r"(https?://\S+)", message.content)
@@ -1437,7 +1454,7 @@ async def on_message(message):
                                     channel_id=message.channel.id,
                                     message_id=message.id,
                                     author_id=message.author.id,
-                                    display_name=current_member.display_name,
+                                    display_name=current_display_name,
                                     filename=att.filename,
                                     image_bytes=raw,
                                     source_kind="user_upload",
@@ -1606,7 +1623,7 @@ async def on_message(message):
                 cached_tokens = prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
                 log_time = datetime.now().strftime("%H:%M:%S")
 
-                print(f"[{log_time}] [{message.guild.name}] {message.author.display_name}: {message.content}")
+                print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
                 print(f"봇({current_model}): {response} (Tokens: {total_tokens}, Cached: {cached_tokens})")
                 if images:
                     print(f"  [이미지 생성]: {len(images)}장")
@@ -1668,9 +1685,10 @@ async def set_model(interaction: discord.Interaction, model_id: str):
     type_str = bot.or_client.get_type_string(model_info['id'], model_info=model_info)
     created = format_date(model_info.get('created'))
     endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
 
     await interaction.followup.send(
-        f"✅ {interaction.user.display_name}님이 기본 모델을 변경했습니다.\n"
+        f"✅ {actor_name}님이 기본 모델을 변경했습니다.\n"
         f"**{model_info['name']}** (`{model_info['id']}`)\n"
         f"타입: **{type_str}** | 출시일: {created}{endpoint_suffix}",
     )
@@ -1686,7 +1704,8 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     if clean_id.lower() in ("clear", "none", "off"):
         config["fallback_model"] = None
         bot.save_config()
-        await interaction.followup.send(f"✅ {interaction.user.display_name}님이 이미지 폴백 모델 설정을 해제했습니다.")
+        actor_name = get_server_display_name(interaction.guild, interaction.user)
+        await interaction.followup.send(f"✅ {actor_name}님이 이미지 폴백 모델 설정을 해제했습니다.")
         return
 
     model_info, endpoints, _, error = await validate_model_for_use(
@@ -1701,8 +1720,9 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     config["fallback_model"] = model_info["id"]
     bot.save_config()
     endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.followup.send(
-        f"✅ {interaction.user.display_name}님이 이미지 폴백 모델을 설정했습니다.\n"
+        f"✅ {actor_name}님이 이미지 폴백 모델을 설정했습니다.\n"
         f"**{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
     )
 
@@ -1727,8 +1747,9 @@ async def set_provider_policy(interaction: discord.Interaction, policy: app_comm
     config = bot.get_config(interaction.guild_id)
     config["provider_policy"] = policy.value
     bot.save_config()
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"✅ {interaction.user.display_name}님이 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
+        f"✅ {actor_name}님이 프로바이더 정책을 `{policy.value}` 로 설정했습니다.",
     )
 
 
@@ -1746,8 +1767,9 @@ async def set_history_limit(interaction: discord.Interaction, count: int | None 
     config["history_limit"] = limit
     bot.save_config()
     suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"✅ {interaction.user.display_name}님이 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
+        f"✅ {actor_name}님이 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
     )
 
 @bot.tree.command(name="dashboard", description="현재 모델 스펙 확인")
