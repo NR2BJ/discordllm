@@ -810,11 +810,13 @@ class OpenRouterBot(commands.Bot):
                 "provider_policy": DEFAULT_PROVIDER_POLICY,
                 "history_limit": HISTORY_LIMIT,
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
+                "route_model": DEFAULT_ROUTE_MODEL,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
         self.server_configs[gid].setdefault("provider_policy", DEFAULT_PROVIDER_POLICY)
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
         self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
+        self.server_configs[gid].setdefault("route_model", DEFAULT_ROUTE_MODEL)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -1067,7 +1069,7 @@ def build_prompt_cache_control(model_id, messages):
 
 
 async def decide_message_action(config, history_messages, current_user_text, guild_id, *, channel_id=None, has_current_images=False):
-    route_model = normalize_model_id(DEFAULT_ROUTE_MODEL or (config or {}).get("model") or DEFAULT_MODEL)
+    route_model = normalize_model_id((config or {}).get("route_model") or DEFAULT_ROUTE_MODEL or (config or {}).get("model") or DEFAULT_MODEL)
     excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
     recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
     inspect_action_text = ""
@@ -1104,9 +1106,7 @@ async def decide_message_action(config, history_messages, current_user_text, gui
                 {"role": "system", "content": "Return valid JSON only."},
                 {"role": "user", "content": route_prompt},
             ],
-            response_format={"type": "json_schema", "json_schema": IMAGE_ROUTE_SCHEMA},
-            provider=build_provider_preferences(config.get("provider_policy"), strict=True),
-            require_parameter_support=True,
+            provider=build_provider_preferences(config.get("provider_policy")),
             cache_control=build_prompt_cache_control(route_model, [
                 {"content": route_prompt},
             ]),
@@ -1684,6 +1684,22 @@ async def image_generation_model_autocomplete(interaction: discord.Interaction, 
         predicate=lambda m: "image" in bot.or_client.analyze_model_capabilities(m["id"], model_info=m)["output"],
     )
 
+async def route_model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    current_lower = current.lower()
+    special_choices = [
+        app_commands.Choice(name="off - 보조 라우터 끄기", value="off"),
+        app_commands.Choice(name="current - 현재 채팅 모델 사용", value="current"),
+    ]
+    choices = [
+        choice for choice in special_choices
+        if current_lower in choice.name.lower() or current_lower in choice.value.lower()
+    ]
+    model_choices = await build_model_choices(
+        current,
+        predicate=lambda m: "text" in bot.or_client.analyze_model_capabilities(m["id"], model_info=m)["output"],
+    )
+    return (choices + model_choices)[:25]
+
 model_group = app_commands.Group(name="model", description="모델 관련 설정")
 
 
@@ -1746,6 +1762,59 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     await interaction.followup.send(
         f"✅ {actor_name}님이 이미지 폴백 모델을 설정했습니다.\n"
         f"**{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}",
+    )
+
+
+@model_group.command(name="router", description="자연어 이미지 라우터 보조 모델 설정")
+@app_commands.autocomplete(model_id=route_model_autocomplete)
+@app_commands.describe(model_id="보조 라우터 모델 ID, current, off/clear")
+async def set_route_model(interaction: discord.Interaction, model_id: str | None = None):
+    config = bot.get_config(interaction.guild_id)
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
+    current_route = config.get("route_model") or config.get("model") or DEFAULT_MODEL
+
+    if model_id is None:
+        state = "ON" if is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED)) else "OFF"
+        await interaction.response.send_message(
+            f"현재 보조 라우터: **{state}**\n"
+            f"모델: `{current_route}`"
+        )
+        return
+
+    await interaction.response.defer()
+    clean_id = normalize_model_id(model_id)
+    if clean_id.lower() in ("clear", "none", "off", "disable", "disabled"):
+        config["action_router"] = False
+        config["route_model"] = None
+        bot.save_config()
+        await interaction.followup.send(f"✅ {actor_name}님이 보조 라우터를 껐습니다.")
+        return
+
+    if clean_id.lower() in ("current", "auto", "default"):
+        config["action_router"] = True
+        config["route_model"] = None
+        bot.save_config()
+        await interaction.followup.send(
+            f"✅ {actor_name}님이 보조 라우터를 현재 채팅 모델 `{config['model']}` 기준으로 켰습니다."
+        )
+        return
+
+    model_info, endpoints, _, error = await validate_model_for_use(
+        clean_id,
+        require_output="text",
+        require_endpoint_check=True,
+    )
+    if error:
+        await interaction.followup.send(f"❌ {error}")
+        return
+
+    config["action_router"] = True
+    config["route_model"] = model_info["id"]
+    bot.save_config()
+    endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
+    await interaction.followup.send(
+        f"✅ {actor_name}님이 보조 라우터 모델을 설정했습니다.\n"
+        f"**{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}"
     )
 
 
@@ -1842,6 +1911,7 @@ async def dashboard(interaction: discord.Interaction):
         embed.add_field(name="🛰️ Routing", value=f"• **Available Endpoints:** {len(endpoints)}", inline=True)
 
     action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
+    route_model_status = config.get("route_model") or "current chat model"
     image_command_model, image_command_source = get_active_generation_model(config, caps)
     if not action_router_enabled:
         image_command_status = "Natural chat routing OFF"
@@ -1855,6 +1925,7 @@ async def dashboard(interaction: discord.Interaction):
     helpers = [
         f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
         f"• **Action Router:** {'ON' if action_router_enabled else 'OFF'}",
+        f"• **Router Model:** `{route_model_status}`",
         f"• **Chat Image:** {image_command_status}",
         f"• **Image Models:** {count_image_generation_models()} discovered",
         f"• **Provider Policy:** `{config.get('provider_policy', DEFAULT_PROVIDER_POLICY)}`",
