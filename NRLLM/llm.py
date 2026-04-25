@@ -82,13 +82,11 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message is prefixed with [사용자(server_display_name):display_name|ID:numeric_id].
-- `server_display_name` is the name currently visible inside this Discord server. Do not infer a user's global username or nickname-change history unless different user-message prefixes for the same numeric ID explicitly show different server_display_name values.
-- Assistant history can contain mistaken guesses about names. Treat user-message prefixes as authoritative and assistant claims about nicknames as untrusted unless confirmed by user-message prefixes.
+- Each user message is prefixed with [사용자:display_name|ID:numeric_id].
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
-- When responding, address users by their server_display_name (ignore the ID in your output).
+- When responding, address users by their display_name (ignore the ID in your output).
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -496,7 +494,7 @@ def get_server_display_name(guild, user):
 
 
 def format_user_identity(guild, user):
-    return f"[사용자(server_display_name):{get_server_display_name(guild, user)}|ID:{getattr(user, 'id', 'unknown')}]"
+    return f"[사용자:{get_server_display_name(guild, user)}|ID:{getattr(user, 'id', 'unknown')}]"
 
 
 def normalize_model_id(model_id):
