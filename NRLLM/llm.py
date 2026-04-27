@@ -530,6 +530,13 @@ def normalize_model_id(model_id):
     return (model_id or "").strip()
 
 # ================= 3. OpenRouter API 클라이언트 =================
+class CompletionContentError(Exception):
+    def __init__(self, message, *, reasoning_only=False, finish_reason="unknown"):
+        super().__init__(message)
+        self.reasoning_only = reasoning_only
+        self.finish_reason = finish_reason
+
+
 class OpenRouterClient:
     def __init__(self, api_key):
         self.api_key = api_key
@@ -741,16 +748,44 @@ class OpenRouterClient:
             finish_reason = choice.get("finish_reason") or data.get("finish_reason") or "unknown"
             has_reasoning = bool(message.get("reasoning") or message.get("reasoning_details"))
             if has_reasoning:
-                raise Exception(
+                raise CompletionContentError(
                     "모델이 최종 답변 없이 reasoning만 반환했습니다 "
-                    f"(finish_reason={finish_reason}). 다시 시도하거나 다른 provider/model을 선택해 주세요."
+                    f"(finish_reason={finish_reason}). 다시 시도하거나 다른 provider/model을 선택해 주세요.",
+                    reasoning_only=True,
+                    finish_reason=finish_reason,
                 )
-            raise Exception(
+            raise CompletionContentError(
                 "모델이 빈 응답을 반환했습니다 "
-                f"(finish_reason={finish_reason}). 다시 시도하거나 다른 provider/model을 선택해 주세요."
+                f"(finish_reason={finish_reason}). 다시 시도하거나 다른 provider/model을 선택해 주세요.",
+                finish_reason=finish_reason,
             )
 
         return final_content, usage, images, data
+
+    def _build_content_retry_payload(self, payload):
+        retry_payload = copy.deepcopy(payload)
+        retry_instruction = (
+            "The previous completion returned no visible final answer in message.content. "
+            "Retry and put the user-visible final answer in message.content. "
+            "Do not return only reasoning/thinking. "
+            "If a JSON response format is requested, return the required JSON as the visible final answer."
+        )
+        retry_messages = copy.deepcopy(payload.get("messages", []))
+        if retry_messages and retry_messages[0].get("role") == "system" and isinstance(retry_messages[0].get("content"), str):
+            retry_messages[0]["content"] += f"\n\n[Retry instruction]\n{retry_instruction}"
+        else:
+            retry_messages.insert(0, {"role": "system", "content": retry_instruction})
+        retry_payload["messages"] = retry_messages
+
+        # Compression occasionally interacts badly with reasoning/final-answer separation.
+        plugins = retry_payload.get("plugins")
+        if isinstance(plugins, list):
+            plugins = [p for p in plugins if not (isinstance(p, dict) and p.get("id") == "context-compression")]
+            if plugins:
+                retry_payload["plugins"] = plugins
+            else:
+                retry_payload.pop("plugins", None)
+        return retry_payload
 
     async def chat_completion(
         self,
@@ -807,13 +842,31 @@ class OpenRouterClient:
             payload["cache_control"] = cache_control
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    final_content, usage, images, full_data = self._parse_completion_output(data)
-                    return final_content, usage, images, full_data
-                error_text = await resp.text()
-                raise Exception(f"API Error ({resp.status}): {error_text}")
+            async def _post_completion(request_payload):
+                async with session.post(f"{self.base_url}/chat/completions", headers=self.headers, json=request_payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        final_content, usage, images, full_data = self._parse_completion_output(data)
+                        return final_content, usage, images, full_data
+                    error_text = await resp.text()
+                    raise Exception(f"API Error ({resp.status}): {error_text}")
+
+            try:
+                return await _post_completion(payload)
+            except CompletionContentError as first_error:
+                print(
+                    "[WARN] completion content empty; retrying once "
+                    f"(model={model}, reasoning_only={first_error.reasoning_only}, finish_reason={first_error.finish_reason})"
+                )
+                retry_payload = self._build_content_retry_payload(payload)
+                try:
+                    return await _post_completion(retry_payload)
+                except CompletionContentError as retry_error:
+                    raise CompletionContentError(
+                        str(retry_error).replace("다시 시도하거나 ", "자동 재시도 후에도 실패했습니다. "),
+                        reasoning_only=retry_error.reasoning_only,
+                        finish_reason=retry_error.finish_reason,
+                    ) from retry_error
 
 # ================= 4. 봇 클래스 =================
 class OpenRouterBot(commands.Bot):
