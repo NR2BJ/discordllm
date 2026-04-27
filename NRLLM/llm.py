@@ -661,12 +661,13 @@ class OpenRouterClient:
 
         choice = data['choices'][0]
         usage = data.get('usage', {})
-        raw_content = choice['message'].get('content', '')
-        msg_keys = list(choice['message'].keys())
+        message = choice.get('message', {})
+        raw_content = message.get('content', '')
+        msg_keys = list(message.keys())
         data_keys = [k for k in data.keys() if k not in ('id', 'object', 'created', 'model', 'choices', 'usage')]
         print(f"[DEBUG] message keys: {msg_keys}, content type: {type(raw_content).__name__}, extra data keys: {data_keys}")
         if raw_content is None:
-            print(f"[DEBUG] content is None, full message: {json.dumps({k: str(v)[:200] for k, v in choice['message'].items()}, ensure_ascii=False)}")
+            print(f"[DEBUG] content is None, full message: {json.dumps({k: str(v)[:200] for k, v in message.items()}, ensure_ascii=False)}")
         final_content = ""
         images = []
 
@@ -694,7 +695,7 @@ class OpenRouterClient:
                     found.append(extra_imgs)
             return found
 
-        images.extend(_extract_images(choice['message'], ['images', 'image']))
+        images.extend(_extract_images(message, ['images', 'image']))
         images.extend(_extract_images(data, ['data', 'images']))
 
         if isinstance(raw_content, list):
@@ -736,8 +737,18 @@ class OpenRouterClient:
         else:
             final_content = str(raw_content)
 
-        if not final_content and not images:
-            final_content = "..."
+        if not final_content.strip() and not images:
+            finish_reason = choice.get("finish_reason") or data.get("finish_reason") or "unknown"
+            has_reasoning = bool(message.get("reasoning") or message.get("reasoning_details"))
+            if has_reasoning:
+                raise Exception(
+                    "모델이 최종 답변 없이 reasoning만 반환했습니다 "
+                    f"(finish_reason={finish_reason}). 다시 시도하거나 다른 provider/model을 선택해 주세요."
+                )
+            raise Exception(
+                "모델이 빈 응답을 반환했습니다 "
+                f"(finish_reason={finish_reason}). 다시 시도하거나 다른 provider/model을 선택해 주세요."
+            )
 
         return final_content, usage, images, data
 
