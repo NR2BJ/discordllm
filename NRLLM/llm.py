@@ -75,8 +75,8 @@ DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROU
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_PRIVACY = os.environ.get("LLM_PROVIDER_PRIVACY", "allow")
 MEMORY_UPDATE_WINDOW = 8
-# Rough guardrail for very large prompts only. Set to 0 to disable compression entirely.
-CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "800000"))
+# Conservative token-ish guardrail for very large prompts only. Set to 0 to disable compression entirely.
+CONTEXT_COMPRESSION_MIN_TOKENS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_TOKENS", "200000"))
 TIMING_DEBUG_LOGS = is_enabled(os.environ.get("LLM_TIMING_DEBUG", "1"))
 PROVIDER_PRIVACY_MODES = ("allow", "deny")
 
@@ -1374,8 +1374,41 @@ def estimate_message_text_chars(messages):
     return total_text
 
 
+def estimate_text_tokens_conservative(text):
+    # No single tokenizer matches all OpenRouter models. This intentionally errs high:
+    # Korean/CJK/non-ASCII text is close to 1 char/token, while ASCII word runs average lower.
+    token_count = 0
+    ascii_run = 0
+    for char in text or "":
+        if char.isascii() and (char.isalnum() or char == "_"):
+            ascii_run += 1
+            continue
+        if ascii_run:
+            token_count += max(1, (ascii_run + 3) // 4)
+            ascii_run = 0
+        if char.isspace():
+            continue
+        token_count += 1
+    if ascii_run:
+        token_count += max(1, (ascii_run + 3) // 4)
+    return token_count
+
+
+def estimate_message_text_tokens(messages):
+    total_tokens = 0
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            total_tokens += estimate_text_tokens_conservative(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total_tokens += estimate_text_tokens_conservative(part.get("text", ""))
+    return total_tokens
+
+
 def should_use_context_compression(messages):
-    return CONTEXT_COMPRESSION_MIN_CHARS > 0 and estimate_message_text_chars(messages) >= CONTEXT_COMPRESSION_MIN_CHARS
+    return CONTEXT_COMPRESSION_MIN_TOKENS > 0 and estimate_message_text_tokens(messages) >= CONTEXT_COMPRESSION_MIN_TOKENS
 
 
 def has_image_generation_signal(text, *, has_current_images=False):
@@ -1943,6 +1976,7 @@ async def on_message(message):
                 cache_control = build_prompt_cache_control(current_model, messages)
                 timing_mark(
                     f"pre_chat chars={estimate_message_text_chars(messages)} "
+                    f"approx_tokens={estimate_message_text_tokens(messages)} "
                     f"plugins={'compression' if should_use_context_compression(messages) else 'none'}"
                 )
 
