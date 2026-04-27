@@ -75,7 +75,8 @@ DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROU
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_PRIVACY = os.environ.get("LLM_PROVIDER_PRIVACY", "allow")
 MEMORY_UPDATE_WINDOW = 8
-CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "12000"))
+# Rough guardrail for very large prompts only. Set to 0 to disable compression entirely.
+CONTEXT_COMPRESSION_MIN_CHARS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN_CHARS", "800000"))
 TIMING_DEBUG_LOGS = is_enabled(os.environ.get("LLM_TIMING_DEBUG", "1"))
 PROVIDER_PRIVACY_MODES = ("allow", "deny")
 
