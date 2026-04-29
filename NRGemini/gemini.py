@@ -166,11 +166,10 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message starts with separate metadata lines: [사용자:display_name] and [ID:numeric_id].
+- Each user message may include a trailing `discord_author={...}` metadata line after the actual message body.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
-- When responding, address users by their display_name (ignore the ID in your output).
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -1200,7 +1199,29 @@ def get_server_display_name(guild, user):
 
 
 def format_user_identity(guild, user):
-    return f"[사용자:{get_server_display_name(guild, user)}]\n[ID:{getattr(user, 'id', 'unknown')}]"
+    metadata = {
+        "display_name": get_server_display_name(guild, user),
+        "id": str(getattr(user, "id", "unknown")),
+    }
+    return "discord_author=" + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+
+def append_user_identity_footer(text, guild, user):
+    text = (text or "").rstrip()
+    footer = format_user_identity(guild, user)
+    if not text:
+        return footer
+    return f"{text}\n\n{footer}"
+
+
+def clean_assistant_response_text(text):
+    if not isinstance(text, str):
+        return text
+    text = re.sub(r"^\s*\[사용자:[^\]\n]+\]\s*(?:\n\s*\[ID:[^\]\n]+\]\s*)?", "", text)
+    text = re.sub(r"^\s*\[ID:[^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
+    text = re.sub(r"\s*discord_author=\{[^\n]*\}\s*$", "", text)
+    return text.lstrip()
 
 
 def coerce_json_object(text):
@@ -1681,6 +1702,13 @@ User message:
         }
     except Exception as e:
         print(f"[IMG] 라우팅 판정 실패: {e}")
+        if has_image_generation_signal(last_user_msg, has_current_images=has_current_images):
+            return {
+                "action": "generate_image",
+                "refined_prompt": "",
+                "use_recent_images": False,
+                "reason": "routing failure direct image signal",
+            }
         return {
             "action": "respond_text",
             "refined_prompt": "",
@@ -2718,7 +2746,7 @@ async def on_message(message):
                         if not content.strip():
                             continue  # 텍스트 없는 이미지 전용 메시지는 히스토리 제외
                     else:
-                        content = f"{format_user_identity(message.guild, msg.author)}\n{msg.content}"
+                        content = msg.content
                         if msg.attachments:
                             for att in msg.attachments:
                                 if att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
@@ -2736,6 +2764,8 @@ async def on_message(message):
                         content += "\n\n" + "\n\n".join(cached_doc_blocks)
 
                     role = "model" if msg.author == bot.user else "user"
+                    if role == "user":
+                        content = append_user_identity_footer(content, message.guild, msg.author)
                     history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
                     history_texts.insert(0, content)
                     history_position += 1
@@ -2743,7 +2773,7 @@ async def on_message(message):
                         break
 
                 current_display_name = get_server_display_name(message.guild, message.author)
-                current_parts = [types.Part(text=f"{format_user_identity(message.guild, message.author)}\n{message.content}")]
+                current_parts = [types.Part(text=message.content)] if message.content else []
                 current_ref_images = []
                 has_current_images = False
 
@@ -2865,6 +2895,7 @@ async def on_message(message):
                     if recent_parts:
                         current_parts = recent_parts + current_parts
 
+                current_parts.append(types.Part(text=format_user_identity(message.guild, message.author)))
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
 
                 if is_deep_research_model(server_text_model):
@@ -2883,6 +2914,7 @@ async def on_message(message):
                     return
 
                 if isinstance(response, str):
+                    response = clean_assistant_response_text(response)
                     await send_long_message(message.channel, response)
                     return
 
@@ -2908,6 +2940,7 @@ async def on_message(message):
                         text_reply += part.text
 
                 if text_reply.strip():
+                    text_reply = clean_assistant_response_text(text_reply)
                     print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Finish: {finish_reason})")
                     await send_long_message(message.channel, text_reply)
 
@@ -3201,6 +3234,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
 
         if text_reply.strip():
             clean_reply = re.sub(r'\{.*"prompt".*\}', '', text_reply, flags=re.DOTALL).strip()
+            clean_reply = clean_assistant_response_text(clean_reply)
             if clean_reply:
                 if len(clean_reply) > 1900:
                     clean_reply = clean_reply[:1900] + "..."

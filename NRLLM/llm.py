@@ -118,11 +118,10 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message starts with separate metadata lines: [사용자:display_name] and [ID:numeric_id].
+- Each user message may include a trailing `discord_author={...}` metadata line after the actual message body.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
-- When responding, address users by their display_name (ignore the ID in your output).
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -524,7 +523,29 @@ def get_server_display_name(guild, user):
 
 
 def format_user_identity(guild, user):
-    return f"[사용자:{get_server_display_name(guild, user)}]\n[ID:{getattr(user, 'id', 'unknown')}]"
+    metadata = {
+        "display_name": get_server_display_name(guild, user),
+        "id": str(getattr(user, "id", "unknown")),
+    }
+    return "discord_author=" + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+
+def append_user_identity_footer(text, guild, user):
+    text = (text or "").rstrip()
+    footer = format_user_identity(guild, user)
+    if not text:
+        return footer
+    return f"{text}\n\n{footer}"
+
+
+def clean_assistant_response_text(text):
+    if not isinstance(text, str):
+        return text
+    text = re.sub(r"^\s*\[사용자:[^\]\n]+\]\s*(?:\n\s*\[ID:[^\]\n]+\]\s*)?", "", text)
+    text = re.sub(r"^\s*\[ID:[^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
+    text = re.sub(r"\s*discord_author=\{[^\n]*\}\s*$", "", text)
+    return text.lstrip()
 
 
 def normalize_model_id(model_id):
@@ -1495,6 +1516,13 @@ async def decide_message_action(config, history_messages, current_user_text, gui
         payload = None
 
     if not payload:
+        if has_image_generation_signal(current_user_text, has_current_images=has_current_images):
+            return {
+                "action": "generate_image",
+                "refined_prompt": "",
+                "use_recent_images": False,
+                "reason": "route_failed_direct_image_signal",
+            }
         return {
             "action": "respond_text",
             "refined_prompt": "",
@@ -1600,6 +1628,7 @@ async def handle_natural_image_request(message, config, history_messages, curren
         ]),
     )
 
+    response = clean_assistant_response_text(response)
     if response and response != "...":
         await send_long_message(message.channel, response)
     else:
@@ -1759,7 +1788,7 @@ async def on_message(message):
                             elif ct.startswith("video"):
                                 text_content += "\n(Bot generated a video here)"
                     else:
-                        text_content = f"{format_user_identity(message.guild, msg.author)}\n{msg.content}"
+                        text_content = msg.content
                         for att in msg.attachments:
                             ct = att.content_type or ""
                             file_size = att.size or 0
@@ -1802,6 +1831,9 @@ async def on_message(message):
                     if cached_doc_blocks:
                         text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
 
+                    if not is_bot:
+                        text_content = append_user_identity_footer(text_content, message.guild, msg.author)
+
                     if is_bot and not text_content.strip() and len(content_list) == 0:
                         continue
                     content_list.append({"type": "text", "text": text_content})
@@ -1815,7 +1847,7 @@ async def on_message(message):
 
                 current_content = []
                 current_image_inputs = []
-                user_text = f"{format_user_identity(message.guild, message.author)}\n{message.content}"
+                user_text = message.content
                 unresolved_urls = []
 
                 urls = re.findall(r"(https?://\S+)", message.content)
@@ -1956,7 +1988,7 @@ async def on_message(message):
                         return
                     current_content = (await load_recent_image_inputs(message.guild.id, channel_id=message.channel.id)) + current_content
 
-                current_content.append({"type": "text", "text": user_text})
+                current_content.append({"type": "text", "text": append_user_identity_footer(user_text, message.guild, message.author)})
                 messages.append({"role": "user", "content": current_content})
 
                 chat_tools = []
@@ -2058,6 +2090,7 @@ async def on_message(message):
                 bot_display_name = get_bot_display_name()
                 if response.startswith(f"{bot_display_name}:"):
                     response = response.replace(f"{bot_display_name}:", "", 1).strip()
+                response = clean_assistant_response_text(response)
 
                 total_tokens = usage.get("total_tokens", "N/A")
                 prompt_details = usage.get("prompt_tokens_details", {}) if isinstance(usage, dict) else {}
