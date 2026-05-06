@@ -166,7 +166,9 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message may include a trailing `discord_author={...}` metadata line after the actual message body.
+- Each historical user message starts with `[from display_name (id:numeric_id)]`.
+- The CURRENT message you should respond to starts with `[CURRENT MESSAGE from display_name (id:numeric_id)]` — focus your reply on this user.
+- Past bot replies start with `[Bot replied to display_name (id:numeric_id)]`, indicating which user that reply addressed.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
@@ -1198,25 +1200,46 @@ def get_server_display_name(guild, user):
     return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id or "unknown")
 
 
-def format_user_identity(guild, user):
-    metadata = {
-        "display_name": get_server_display_name(guild, user),
-        "id": str(getattr(user, "id", "unknown")),
-    }
-    return "discord_author=" + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+def format_user_identity(guild, user, kind="history"):
+    """사용자 식별 마커 생성. kind: 'history' | 'current'"""
+    name = get_server_display_name(guild, user)
+    uid = str(getattr(user, "id", "unknown"))
+    if kind == "current":
+        return f"[CURRENT MESSAGE from {name} (id:{uid})]"
+    return f"[from {name} (id:{uid})]"
 
 
-def append_user_identity_footer(text, guild, user):
-    text = (text or "").rstrip()
-    footer = format_user_identity(guild, user)
-    if not text:
-        return footer
-    return f"{text}\n\n{footer}"
+def format_bot_target_marker(display_name, user_id):
+    """봇 응답이 어떤 사용자에게 답한 것인지 표시하는 prefix 마커."""
+    return f"[Bot replied to {display_name} (id:{user_id})]"
+
+
+def prepend_user_identity(text, guild, user, kind="history"):
+    """사용자 메시지 본문 앞에 식별 마커를 prefix로 붙임."""
+    body = (text or "").lstrip()
+    marker = format_user_identity(guild, user, kind=kind)
+    if not body:
+        return marker
+    return f"{marker}\n{body}"
+
+
+def prepend_bot_target(text, display_name, user_id):
+    """봇 응답 본문 앞에 응답 대상 사용자 마커를 prefix로 붙임."""
+    body = (text or "").lstrip()
+    marker = format_bot_target_marker(display_name, user_id)
+    if not body:
+        return marker
+    return f"{marker}\n{body}"
 
 
 def clean_assistant_response_text(text):
     if not isinstance(text, str):
         return text
+    # 신규 형식
+    text = re.sub(r"^\s*\[CURRENT MESSAGE from [^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*\[Bot replied to [^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*\[from [^\]\n]+\]\s*", "", text)
+    # 레거시 형식 호환
     text = re.sub(r"^\s*\[사용자:[^\]\n]+\]\s*(?:\n\s*\[ID:[^\]\n]+\]\s*)?", "", text)
     text = re.sub(r"^\s*\[ID:[^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
@@ -2718,6 +2741,7 @@ async def on_message(message):
 
                 history_list = []
                 history_texts = []
+                history_meta = []
                 history_position = 0
 
                 async for msg in message.channel.history(limit=history_limit + 10):
@@ -2765,15 +2789,37 @@ async def on_message(message):
 
                     role = "model" if msg.author == bot.user else "user"
                     if role == "user":
-                        content = append_user_identity_footer(content, message.guild, msg.author)
+                        content = prepend_user_identity(content, message.guild, msg.author, kind="history")
                     history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
                     history_texts.insert(0, content)
+                    # 후처리(봇 응답 대상 마커)용 메타 — history_list와 1:1
+                    user_info = (
+                        None if msg.author == bot.user
+                        else (get_server_display_name(message.guild, msg.author), str(msg.author.id))
+                    )
+                    history_meta.insert(0, {"is_bot": msg.author == bot.user, "user_info": user_info})
                     history_position += 1
                     if len(history_list) >= history_limit:
                         break
 
+                # 봇 응답에 [Bot replied to ...] prefix 추가 (직전 user 메시지 기준)
+                last_user_info = None
+                for idx, meta in enumerate(history_meta):
+                    if meta["is_bot"]:
+                        if last_user_info:
+                            cur = history_list[idx]
+                            if cur.parts and cur.parts[0].text:
+                                new_text = prepend_bot_target(cur.parts[0].text, *last_user_info)
+                                history_list[idx] = types.Content(role=cur.role, parts=[types.Part(text=new_text)])
+                                history_texts[idx] = new_text
+                    else:
+                        if meta["user_info"]:
+                            last_user_info = meta["user_info"]
+
                 current_display_name = get_server_display_name(message.guild, message.author)
-                current_parts = [types.Part(text=message.content)] if message.content else []
+                # 현재 메시지 본문에 [CURRENT MESSAGE from ...] prefix 적용
+                current_text_with_marker = prepend_user_identity(message.content, message.guild, message.author, kind="current")
+                current_parts = [types.Part(text=current_text_with_marker)] if current_text_with_marker else []
                 current_ref_images = []
                 has_current_images = False
 
@@ -2895,7 +2941,7 @@ async def on_message(message):
                     if recent_parts:
                         current_parts = recent_parts + current_parts
 
-                current_parts.append(types.Part(text=format_user_identity(message.guild, message.author)))
+                # 현재 메시지의 [CURRENT MESSAGE from ...] prefix는 이미 current_parts[0]에 포함됨
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
 
                 if is_deep_research_model(server_text_model):

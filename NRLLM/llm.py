@@ -118,7 +118,9 @@ SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
 ## User Identification
-- Each user message may include a trailing `discord_author={...}` metadata line after the actual message body.
+- Each historical user message starts with `[from display_name (id:numeric_id)]`.
+- The CURRENT message you should respond to starts with `[CURRENT MESSAGE from display_name (id:numeric_id)]` — focus your reply on this user.
+- Past bot replies start with `[Bot replied to display_name (id:numeric_id)]`, indicating which user that reply addressed.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
 - Track each user's statements separately. What User A said is not what User B said.
@@ -522,25 +524,46 @@ def get_server_display_name(guild, user):
     return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id or "unknown")
 
 
-def format_user_identity(guild, user):
-    metadata = {
-        "display_name": get_server_display_name(guild, user),
-        "id": str(getattr(user, "id", "unknown")),
-    }
-    return "discord_author=" + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+def format_user_identity(guild, user, kind="history"):
+    """사용자 식별 마커 생성. kind: 'history' | 'current'"""
+    name = get_server_display_name(guild, user)
+    uid = str(getattr(user, "id", "unknown"))
+    if kind == "current":
+        return f"[CURRENT MESSAGE from {name} (id:{uid})]"
+    return f"[from {name} (id:{uid})]"
 
 
-def append_user_identity_footer(text, guild, user):
-    text = (text or "").rstrip()
-    footer = format_user_identity(guild, user)
-    if not text:
-        return footer
-    return f"{text}\n\n{footer}"
+def format_bot_target_marker(display_name, user_id):
+    """봇 응답이 어떤 사용자에게 답한 것인지 표시하는 prefix 마커."""
+    return f"[Bot replied to {display_name} (id:{user_id})]"
+
+
+def prepend_user_identity(text, guild, user, kind="history"):
+    """사용자 메시지 본문 앞에 식별 마커를 prefix로 붙임."""
+    body = (text or "").lstrip()
+    marker = format_user_identity(guild, user, kind=kind)
+    if not body:
+        return marker
+    return f"{marker}\n{body}"
+
+
+def prepend_bot_target(text, display_name, user_id):
+    """봇 응답 본문 앞에 응답 대상 사용자 마커를 prefix로 붙임."""
+    body = (text or "").lstrip()
+    marker = format_bot_target_marker(display_name, user_id)
+    if not body:
+        return marker
+    return f"{marker}\n{body}"
 
 
 def clean_assistant_response_text(text):
     if not isinstance(text, str):
         return text
+    # 신규 형식: 모델이 마커를 모방해 응답 첫 줄에 붙인 경우 제거
+    text = re.sub(r"^\s*\[CURRENT MESSAGE from [^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*\[Bot replied to [^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*\[from [^\]\n]+\]\s*", "", text)
+    # 레거시 형식 호환
     text = re.sub(r"^\s*\[사용자:[^\]\n]+\]\s*(?:\n\s*\[ID:[^\]\n]+\]\s*)?", "", text)
     text = re.sub(r"^\s*\[ID:[^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
@@ -1832,15 +1855,38 @@ async def on_message(message):
                         text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
 
                     if not is_bot:
-                        text_content = append_user_identity_footer(text_content, message.guild, msg.author)
+                        text_content = prepend_user_identity(text_content, message.guild, msg.author, kind="history")
 
                     if is_bot and not text_content.strip() and len(content_list) == 0:
                         continue
                     content_list.append({"type": "text", "text": text_content})
-                    history_buffer.insert(0, {"role": role, "content": content_list})
+                    # author 메타: 봇 응답에 응답 대상 마커를 붙이기 위한 후처리용
+                    item_meta = {
+                        "is_bot": is_bot,
+                        "user_info": (None if is_bot else (get_server_display_name(message.guild, msg.author), str(msg.author.id))),
+                    }
+                    history_buffer.insert(0, {"role": role, "content": content_list, "_meta": item_meta})
                     history_position += 1
                     if len(history_buffer) >= history_limit:
                         break
+
+                # 봇 응답에 [Bot replied to ...] 마커 prefix 추가
+                # history_buffer는 시간순(oldest → newest). 직전(과거) user 메시지를 그 대상으로 추정
+                last_user_info = None
+                for item in history_buffer:
+                    meta = item.get("_meta", {})
+                    if meta.get("is_bot"):
+                        if last_user_info:
+                            for part in item["content"]:
+                                if part.get("type") == "text":
+                                    part["text"] = prepend_bot_target(part["text"], *last_user_info)
+                                    break
+                    else:
+                        if meta.get("user_info"):
+                            last_user_info = meta["user_info"]
+                # _meta는 OpenAI API에 보낼 필요 없으니 제거
+                for item in history_buffer:
+                    item.pop("_meta", None)
 
                 messages.extend(history_buffer)
                 timing_mark(f"history count={len(history_buffer)}")
@@ -1988,7 +2034,7 @@ async def on_message(message):
                         return
                     current_content = (await load_recent_image_inputs(message.guild.id, channel_id=message.channel.id)) + current_content
 
-                current_content.append({"type": "text", "text": append_user_identity_footer(user_text, message.guild, message.author)})
+                current_content.append({"type": "text", "text": prepend_user_identity(user_text, message.guild, message.author, kind="current")})
                 messages.append({"role": "user", "content": current_content})
 
                 chat_tools = []
