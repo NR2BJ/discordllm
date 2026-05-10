@@ -86,30 +86,25 @@ AVAILABLE_MODELS = {
         "text": "gemini-3-flash-preview",
         "image": "gemini-3.1-flash-image-preview",
     },
-    "3.1-flash-lite-off": {
+    "3.1-flash-lite-minimal": {
         "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
-        "thinking_budget": 0,
+        "thinking_level": "minimal",
     },
     "3.1-flash-lite-low": {
         "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
-        "thinking_budget": 2048,
+        "thinking_level": "low",
     },
     "3.1-flash-lite-medium": {
         "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
-        "thinking_budget": 8192,
+        "thinking_level": "medium",
     },
     "3.1-flash-lite-high": {
         "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
-        "thinking_budget": 24576,
-    },
-    "3.1-flash-lite-dyn": {
-        "text": "gemini-3.1-flash-lite",
-        "image": "gemini-3.1-flash-image-preview",
-        "thinking_budget": -1,
+        "thinking_level": "high",
     },
     "deep-research": {
         "text": "deep-research-preview-04-2026",
@@ -126,7 +121,7 @@ DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research"]["text"],
     AVAILABLE_MODELS["deep-research-max"]["text"],
 }
-ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3.1-flash-lite-dyn"]["text"])
+ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3.1-flash-lite-minimal"]["text"])
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
@@ -144,7 +139,7 @@ TEXT_ATTACHMENT_EXTENSIONS = (
 MODEL_HISTORY_LIMITS = {
     AVAILABLE_MODELS["3.1-pro"]["text"]: 20,
     AVAILABLE_MODELS["3-flash"]["text"]: 20,
-    AVAILABLE_MODELS["3.1-flash-lite-dyn"]["text"]: 20,
+    AVAILABLE_MODELS["3.1-flash-lite-minimal"]["text"]: 20,
     AVAILABLE_MODELS["deep-research"]["text"]: 20,
     AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
 }
@@ -1884,7 +1879,7 @@ async def check_media_intent(last_user_msg, text_model=None):
     except:
         return "NONE"
 
-async def call_gemini(history_contents, last_user_msg="", text_model=None, thinking_budget=None):
+async def call_gemini(history_contents, last_user_msg="", text_model=None, thinking_level=None):
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
@@ -1905,8 +1900,8 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None, think
         "temperature": 0.7,
         "safety_settings": safety_settings,
     }
-    if thinking_budget is not None:
-        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+    if thinking_level is not None:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
 
     try:
         response = await CLIENT.aio.models.generate_content(
@@ -1929,6 +1924,7 @@ class GeminiBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
+        self._migrate_thinking_budget_to_level()
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
@@ -1952,6 +1948,33 @@ class GeminiBot(commands.Bot):
         self.mafic_pool = mafic.NodePool(self) if LAVALINK_ENABLED else None
         self.mafic_node = None
         self.mafic_connect_lock = asyncio.Lock()
+
+    def _migrate_thinking_budget_to_level(self):
+        """레거시 thinking_budget 정수를 신규 thinking_level enum으로 일괄 변환.
+        Gemini 3 시리즈는 thinking_level 사용 권장(deprecated thinking_budget 정리)."""
+        budget_to_level = {
+            0: "minimal",
+            2048: "low",
+            8192: "medium",
+            24576: "high",
+            -1: "high",  # dynamic 역할 흡수
+        }
+        changed = False
+        for gid, cfg in self.server_configs.items():
+            if not isinstance(cfg, dict):
+                continue
+            if "thinking_budget" not in cfg:
+                continue
+            budget = cfg.pop("thinking_budget")
+            if "thinking_level" not in cfg:
+                level = budget_to_level.get(budget, "minimal")
+                cfg["thinking_level"] = level
+                print(f"[MIGRATE] guild {gid}: thinking_budget={budget} → thinking_level={level}")
+            else:
+                print(f"[MIGRATE] guild {gid}: drop legacy thinking_budget={budget} (thinking_level already set)")
+            changed = True
+        if changed:
+            DataManager.save_json(CONFIG_FILE, self.server_configs)
 
     def _get_sound_dir_mtime(self):
         """SOUND_DIR 전체의 최신 mtime 반환."""
@@ -2978,7 +3001,7 @@ async def on_message(message):
                     full_contents,
                     message.content,
                     text_model=server_text_model,
-                    thinking_budget=config.get("thinking_budget"),
+                    thinking_level=config.get("thinking_level"),
                 )
 
                 if isinstance(response, dict) and response.get("kind") == "deep_research_report":
@@ -3856,26 +3879,21 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         return
     TEXT_MODEL = AVAILABLE_MODELS[name]["text"]
     IMAGE_MODEL = AVAILABLE_MODELS[name]["image"]
-    thinking_budget = AVAILABLE_MODELS[name].get("thinking_budget")  # None이면 모델 default
+    thinking_level = AVAILABLE_MODELS[name].get("thinking_level")  # None이면 모델 default
     if interaction.guild:
         cfg = bot.get_config(interaction.guild_id)
         cfg["text_model"] = TEXT_MODEL
         cfg["image_model"] = IMAGE_MODEL
-        if thinking_budget is None:
-            cfg.pop("thinking_budget", None)
+        # 레거시 키 정리 (thinking_budget은 deprecated)
+        cfg.pop("thinking_budget", None)
+        if thinking_level is None:
+            cfg.pop("thinking_level", None)
         else:
-            cfg["thinking_budget"] = thinking_budget
+            cfg["thinking_level"] = thinking_level
         bot.save_config()
     history_limit = get_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_HISTORY_LIMIT
     actor_name = get_server_display_name(interaction.guild, interaction.user)
-    if thinking_budget is None:
-        thinking_label = "모델 기본값"
-    elif thinking_budget == 0:
-        thinking_label = "off (사고 비활성)"
-    elif thinking_budget == -1:
-        thinking_label = "dynamic (모델 자율)"
-    else:
-        thinking_label = f"{thinking_budget} 토큰 한도"
+    thinking_label = f"`{thinking_level}`" if thinking_level else "모델 기본값"
     await interaction.response.send_message(
         f"모델 변경됨: **{name}** by {actor_name}\n"
         f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n"
