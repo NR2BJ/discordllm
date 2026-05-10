@@ -87,7 +87,7 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image-preview",
     },
     "3.1-flash-lite": {
-        "text": "gemini-3.1-flash-lite-preview",
+        "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
     },
     "deep-research": {
