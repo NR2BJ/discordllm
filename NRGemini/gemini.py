@@ -86,9 +86,30 @@ AVAILABLE_MODELS = {
         "text": "gemini-3-flash-preview",
         "image": "gemini-3.1-flash-image-preview",
     },
-    "3.1-flash-lite": {
+    "3.1-flash-lite-off": {
         "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
+        "thinking_budget": 0,
+    },
+    "3.1-flash-lite-low": {
+        "text": "gemini-3.1-flash-lite",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_budget": 2048,
+    },
+    "3.1-flash-lite-medium": {
+        "text": "gemini-3.1-flash-lite",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_budget": 8192,
+    },
+    "3.1-flash-lite-high": {
+        "text": "gemini-3.1-flash-lite",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_budget": 24576,
+    },
+    "3.1-flash-lite-dyn": {
+        "text": "gemini-3.1-flash-lite",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_budget": -1,
     },
     "deep-research": {
         "text": "deep-research-preview-04-2026",
@@ -105,7 +126,7 @@ DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research"]["text"],
     AVAILABLE_MODELS["deep-research-max"]["text"],
 }
-ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3.1-flash-lite"]["text"])
+ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3.1-flash-lite-dyn"]["text"])
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
@@ -123,7 +144,7 @@ TEXT_ATTACHMENT_EXTENSIONS = (
 MODEL_HISTORY_LIMITS = {
     AVAILABLE_MODELS["3.1-pro"]["text"]: 20,
     AVAILABLE_MODELS["3-flash"]["text"]: 20,
-    AVAILABLE_MODELS["3.1-flash-lite"]["text"]: 20,
+    AVAILABLE_MODELS["3.1-flash-lite-dyn"]["text"]: 20,
     AVAILABLE_MODELS["deep-research"]["text"]: 20,
     AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
 }
@@ -1863,7 +1884,7 @@ async def check_media_intent(last_user_msg, text_model=None):
     except:
         return "NONE"
 
-async def call_gemini(history_contents, last_user_msg="", text_model=None):
+async def call_gemini(history_contents, last_user_msg="", text_model=None, thinking_budget=None):
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
@@ -1878,16 +1899,20 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None):
         types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
     ]
 
+    config_kwargs = {
+        "system_instruction": build_gemini_system_prompt(),
+        "tools": tools,
+        "temperature": 0.7,
+        "safety_settings": safety_settings,
+    }
+    if thinking_budget is not None:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+
     try:
         response = await CLIENT.aio.models.generate_content(
             model=text_model,
             contents=history_contents,
-            config=types.GenerateContentConfig(
-                system_instruction=build_gemini_system_prompt(),
-                tools=tools,
-                temperature=0.7,
-                safety_settings=safety_settings
-            )
+            config=types.GenerateContentConfig(**config_kwargs)
         )
 
         usage = 0
@@ -2953,6 +2978,7 @@ async def on_message(message):
                     full_contents,
                     message.content,
                     text_model=server_text_model,
+                    thinking_budget=config.get("thinking_budget"),
                 )
 
                 if isinstance(response, dict) and response.get("kind") == "deep_research_report":
@@ -3830,16 +3856,30 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         return
     TEXT_MODEL = AVAILABLE_MODELS[name]["text"]
     IMAGE_MODEL = AVAILABLE_MODELS[name]["image"]
+    thinking_budget = AVAILABLE_MODELS[name].get("thinking_budget")  # None이면 모델 default
     if interaction.guild:
         cfg = bot.get_config(interaction.guild_id)
         cfg["text_model"] = TEXT_MODEL
         cfg["image_model"] = IMAGE_MODEL
+        if thinking_budget is None:
+            cfg.pop("thinking_budget", None)
+        else:
+            cfg["thinking_budget"] = thinking_budget
         bot.save_config()
     history_limit = get_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_HISTORY_LIMIT
     actor_name = get_server_display_name(interaction.guild, interaction.user)
+    if thinking_budget is None:
+        thinking_label = "모델 기본값"
+    elif thinking_budget == 0:
+        thinking_label = "off (사고 비활성)"
+    elif thinking_budget == -1:
+        thinking_label = "dynamic (모델 자율)"
+    else:
+        thinking_label = f"{thinking_budget} 토큰 한도"
     await interaction.response.send_message(
         f"모델 변경됨: **{name}** by {actor_name}\n"
-        f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n히스토리 참조: {history_limit}개"
+        f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n"
+        f"사고 수준: {thinking_label}\n히스토리 참조: {history_limit}개"
     )
 
 @switch_model.autocomplete('name')
