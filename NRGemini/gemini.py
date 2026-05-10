@@ -78,14 +78,44 @@ except Exception as e:
     CLIENT = None
 
 AVAILABLE_MODELS = {
-    "3.1-pro": {
+    # Pro (3 levels: low / medium / high — minimal 미지원)
+    "3.1-pro-low": {
         "text": "gemini-3.1-pro-preview",
         "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "low",
     },
-    "3-flash": {
+    "3.1-pro-medium": {
+        "text": "gemini-3.1-pro-preview",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "medium",
+    },
+    "3.1-pro-high": {
+        "text": "gemini-3.1-pro-preview",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "high",
+    },
+    # Flash (4 levels)
+    "3-flash-minimal": {
         "text": "gemini-3-flash-preview",
         "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "minimal",
     },
+    "3-flash-low": {
+        "text": "gemini-3-flash-preview",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "low",
+    },
+    "3-flash-medium": {
+        "text": "gemini-3-flash-preview",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "medium",
+    },
+    "3-flash-high": {
+        "text": "gemini-3-flash-preview",
+        "image": "gemini-3.1-flash-image-preview",
+        "thinking_level": "high",
+    },
+    # Flash Lite (4 levels)
     "3.1-flash-lite-minimal": {
         "text": "gemini-3.1-flash-lite",
         "image": "gemini-3.1-flash-image-preview",
@@ -106,6 +136,7 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
     },
+    # Deep Research (자체 reasoning, thinking_level 미사용)
     "deep-research": {
         "text": "deep-research-preview-04-2026",
         "image": "gemini-3.1-flash-image-preview",
@@ -115,8 +146,8 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image-preview",
     },
 }
-TEXT_MODEL = AVAILABLE_MODELS["3.1-pro"]["text"]
-IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro"]["image"]
+TEXT_MODEL = AVAILABLE_MODELS["3.1-pro-high"]["text"]
+IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro-high"]["image"]
 DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research"]["text"],
     AVAILABLE_MODELS["deep-research-max"]["text"],
@@ -137,8 +168,8 @@ TEXT_ATTACHMENT_EXTENSIONS = (
     ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
 )
 MODEL_HISTORY_LIMITS = {
-    AVAILABLE_MODELS["3.1-pro"]["text"]: 20,
-    AVAILABLE_MODELS["3-flash"]["text"]: 20,
+    AVAILABLE_MODELS["3.1-pro-high"]["text"]: 20,
+    AVAILABLE_MODELS["3-flash-high"]["text"]: 20,
     AVAILABLE_MODELS["3.1-flash-lite-minimal"]["text"]: 20,
     AVAILABLE_MODELS["deep-research"]["text"]: 20,
     AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
@@ -3904,7 +3935,7 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
 async def model_autocomplete(interaction: discord.Interaction, current: str):
     return [
         app_commands.Choice(
-            name=info['text'],
+            name=key,
             value=key
         )
         for key, info in AVAILABLE_MODELS.items()
