@@ -181,14 +181,23 @@ IMAGE_ACTION_NOUN_RE = re.compile(
     re.IGNORECASE,
 )
 IMAGE_ACTION_VERB_RE = re.compile(
-    r"(그려|그림으로|이미지로|사진처럼|짤로|생성|만들|제작|렌더|편집|수정|변환|합성|지워|넣어|추가|바꿔|"
+    r"(그려|그리|그린|그림으로|이미지로|사진처럼|짤로|생성|만들|제작|렌더|편집|수정|변환|합성|지워|넣어|추가|바꿔|"
     r"\bgenerate\b|\bdraw\b|\bcreate\b|\bmake\b|\brender\b|\bedit\b|\bmodify\b|\btransform\b|\bremove\b|\badd\b)",
     re.IGNORECASE,
 )
-IMAGE_DRAW_REQUEST_RE = re.compile(r"(그려\s*(줘|봐|라)?|\bdraw\b|\bsketch\b)", re.IGNORECASE)
+IMAGE_DRAW_REQUEST_RE = re.compile(
+    r"(그려\s*(줘|봐|라|달라|달라고|주라|주세요)?|그리(라고|라|세요|시오|기)|그리(?=\s|$|[.!?,])|"
+    r"\bdraw\b|\bsketch\b)",
+    re.IGNORECASE,
+)
 CURRENT_IMAGE_EDIT_RE = re.compile(
     r"(이거|이것|저거|저것|첨부|사진|이미지|그림|짤|reference|attached|this|that).{0,40}"
     r"(편집|수정|변환|합성|지워|넣어|추가|바꿔|스타일|풍으로|배경|edit|modify|transform|remove|add|style|background)",
+    re.IGNORECASE,
+)
+FOLLOWUP_IMAGE_EDIT_RE = re.compile(
+    r"(이거|이것|이게|저거|저것|그거|그것|아까|방금|전에|위에|최근|this|that|previous|recent|above).{0,80}"
+    r"(만들|그려|그리|바꿔|변환|수정|편집|합성|처럼|같이|느낌|스타일|풍으로|make|draw|turn|change|edit|style)",
     re.IGNORECASE,
 )
 RECENT_IMAGE_REFERENCE_RE = re.compile(
@@ -207,6 +216,7 @@ _COMMON_RULES = """## General Rules
 - When a URL is in the message, the system fetches it and attaches `[Webpage Content]` — use that content directly.
 - Analyze attached files (images/video/audio) when supported.
 - Keep responses concise and Discord-appropriate.
+- Never output fake tool-call JSON or fake actions such as `dalle.text2im`. If a tool was not actually called by the app, do not pretend it was.
 - Use Google Grounding Search (Web Search) actively since your training cutoff may be outdated."""
 
 SYSTEM_PROMPT = f"""
@@ -1335,6 +1345,41 @@ def build_json_generation_config(schema):
         return {**base, "response_json_schema": schema}
 
 
+def build_recent_conversation_excerpt(history_texts, limit=MEMORY_EXCERPT_MAX_CHARS, window=8):
+    lines = []
+    for text in (history_texts or [])[-window:]:
+        cleaned = (text or "").strip()
+        if cleaned:
+            lines.append(cleaned)
+    excerpt = "\n\n".join(lines)
+    if len(excerpt) > limit:
+        excerpt = "...[earlier context omitted]...\n" + excerpt[-limit:].lstrip()
+    return excerpt
+
+
+def build_contextual_image_prompt(refined_prompt, current_request, history_texts):
+    recent_context = build_recent_conversation_excerpt(history_texts, limit=4000)
+    parts = [
+        "Create an image for the CURRENT Discord request.",
+        "Use recent conversation only to resolve references such as 'this', 'that', 'as above', mentioned characters, styles, or scenes.",
+        "Do not create a generic educational diagram unless the current request explicitly asks for one.",
+        "If the preferred visual prompt is generic or incomplete, make it specific using the current request and recent context.",
+    ]
+    if recent_context:
+        parts.append(f"[Recent Conversation Context]\n{recent_context}")
+    parts.append(f"[Current User Request]\n{(current_request or '').strip()}")
+    if refined_prompt:
+        parts.append(f"[Preferred Visual Prompt]\n{refined_prompt.strip()}")
+    return "\n\n".join(parts)
+
+
+def compact_prompt_for_status(prompt, limit=500):
+    prompt = (prompt or "").strip()
+    if len(prompt) <= limit:
+        return prompt
+    return prompt[:limit].rstrip() + "..."
+
+
 def is_deep_research_model(text_model):
     return text_model in DEEP_RESEARCH_AGENT_IDS
 
@@ -1372,6 +1417,8 @@ def should_call_action_router(
     allow_recent_images=True,
 ):
     if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
+        return True
+    if allow_recent_images and has_recent_images and FOLLOWUP_IMAGE_EDIT_RE.search(text or ""):
         return True
     if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
         return True
@@ -1703,7 +1750,7 @@ async def call_deep_research(history_contents, agent_id):
         return f"[ERROR] Deep Research 호출 실패: {e}"
 
 
-async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_current_images=False, text_model=None):
+async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_current_images=False, text_model=None, recent_context=None):
     if not CLIENT:
         return {
             "action": "respond_text",
@@ -1726,6 +1773,7 @@ async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_
         )
         recent_image_hint = f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n"
 
+    recent_context = (recent_context or "").strip()
     prompt = f"""
 You are a routing planner for a Discord AI bot.
 Decide the next action for the assistant.
@@ -1739,11 +1787,16 @@ Rules:
 - Do not choose inspect_recent_images if the current message already includes image attachments.
 - Do not infer that product names, drinks, people, or objects refer to stored images by themselves.
 - Do not choose generate_image unless the user clearly wants image creation or visual transformation/editing.
+- If the current message is only a complaint, acknowledgement, or confusion about a previous answer/image, choose respond_text.
+- If the current message is a follow-up image request or edit request, use the recent conversation excerpt to resolve the subject/style and write a specific refined prompt.
 {inspect_rule_text}
 
 Current message has image attachments: {has_current_images}
 
 {recent_image_hint}
+
+Recent conversation excerpt:
+{recent_context or '(empty)'}
 
 User message:
 {last_user_msg}
@@ -1764,6 +1817,14 @@ User message:
         if action == "inspect_recent_images" and (has_current_images or not recent_images):
             action = "respond_text"
             payload["use_recent_images"] = False
+        if (
+            action == "generate_image"
+            and not payload.get("use_recent_images")
+            and not has_current_images
+            and recent_images
+            and FOLLOWUP_IMAGE_EDIT_RE.search(last_user_msg or "")
+        ):
+            payload["use_recent_images"] = True
         return {
             "action": action,
             "refined_prompt": (payload.get("refined_prompt") or "").strip(),
@@ -1772,11 +1833,12 @@ User message:
         }
     except Exception as e:
         print(f"[IMG] 라우팅 판정 실패: {e}")
-        if has_image_generation_signal(last_user_msg, has_current_images=has_current_images):
+        is_followup_edit = bool(FOLLOWUP_IMAGE_EDIT_RE.search(last_user_msg or ""))
+        if has_image_generation_signal(last_user_msg, has_current_images=has_current_images) or is_followup_edit:
             return {
                 "action": "generate_image",
                 "refined_prompt": "",
-                "use_recent_images": False,
+                "use_recent_images": bool(is_followup_edit and recent_images and not has_current_images),
                 "reason": "routing failure direct image signal",
             }
         return {
@@ -2960,6 +3022,7 @@ async def on_message(message):
                 }
                 action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
                 recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
+                recent_context = build_recent_conversation_excerpt(history_texts)
                 if action_router_enabled and should_call_action_router(
                     message.content,
                     has_current_images=has_current_images,
@@ -2973,10 +3036,12 @@ async def on_message(message):
                         channel_id=message.channel.id,
                         has_current_images=has_current_images,
                         text_model=server_text_model,
+                        recent_context=recent_context,
                     )
 
                 if route.get("action") == "generate_image":
-                    prompt = route.get("refined_prompt") or message.content
+                    display_prompt = route.get("refined_prompt") or message.content
+                    generation_prompt = build_contextual_image_prompt(route.get("refined_prompt"), message.content, history_texts)
                     ref_images = []
                     if current_ref_images:
                         ref_images = current_ref_images[:MAX_REF_IMAGES]
@@ -2988,9 +3053,9 @@ async def on_message(message):
                             except Exception as e:
                                 print(f"[IMG] 최근 이미지 참조 로드 실패: {e}")
 
-                    print(f"[IMG] 라우팅 생성 요청: '{prompt}' (현재첨부={len(current_ref_images)} 최근참조={len(ref_images)})")
-                    status_msg = await message.channel.send(f"**Prompt:** `{prompt}`")
-                    req_content = ref_images + [prompt]
+                    print(f"[IMG] 라우팅 생성 요청: '{display_prompt}' (현재첨부={len(current_ref_images)} 최근참조={len(ref_images)} ctx={len(recent_context)})")
+                    status_msg = await message.channel.send(f"**Prompt:** `{compact_prompt_for_status(display_prompt)}`")
+                    req_content = ref_images + [generation_prompt]
                     try:
                         img_data = await call_nano_banana(req_content, image_model=server_image_model)
                         bot.recent_image_store.register_bytes(
@@ -3007,7 +3072,7 @@ async def on_message(message):
                             binary.seek(0)
                             fn = "edited.png" if ref_images else "generated.png"
                             await message.channel.send(file=discord.File(fp=binary, filename=fn))
-                        await status_msg.edit(content=f"[OK] **Generated Prompt:** `{prompt}`")
+                        await status_msg.edit(content=f"[OK] **Generated Prompt:** `{compact_prompt_for_status(display_prompt)}`")
                         print(f"[BOT]({server_image_model}): [이미지 생성 완료]")
                     except Exception as e:
                         err_msg = f"[ERROR] Image Generation Failed: {str(e)}"
