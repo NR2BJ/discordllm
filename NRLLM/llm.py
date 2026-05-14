@@ -96,6 +96,14 @@ CURRENT_IMAGE_EDIT_RE = re.compile(
     r"(편집|수정|변환|합성|지워|넣어|추가|바꿔|스타일|풍으로|배경|edit|modify|transform|remove|add|style|background)",
     re.IGNORECASE,
 )
+IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+RECENT_IMAGE_INSPECTION_RE = re.compile(
+    r"((이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title).{0,60}"
+    r"(봐|봐봐|보라|보라고|보여|볼\s*수|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird)|"
+    r"(봐|봐봐|보라|보라고|보여|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird).{0,60}"
+    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title))",
+    re.IGNORECASE,
+)
 RECENT_IMAGE_REFERENCE_RE = re.compile(
     r"((아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last).{0,40}"
     r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot)|"
@@ -1017,6 +1025,37 @@ def guess_image_mime(filename):
     }.get(ext, "image/png")
 
 
+def is_image_attachment(attachment):
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    filename = (getattr(attachment, "filename", None) or "").lower()
+    return content_type.startswith("image/") or filename.endswith(IMAGE_ATTACHMENT_EXTENSIONS)
+
+
+def is_audio_or_video_attachment(attachment):
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    return content_type.startswith("video/") or content_type.startswith("audio/")
+
+
+def attachment_media_type(attachment):
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    if "/" in content_type:
+        return content_type.split("/", 1)[0]
+    if is_image_attachment(attachment):
+        return "image"
+    return "file"
+
+
+def infer_attachment_mime(attachment, detected_mime=None):
+    if detected_mime:
+        return detected_mime.split(";", 1)[0].strip()
+    content_type = getattr(attachment, "content_type", None)
+    if content_type:
+        return content_type.split(";", 1)[0].strip()
+    if is_image_attachment(attachment):
+        return guess_image_mime(getattr(attachment, "filename", None))
+    return "application/octet-stream"
+
+
 def build_recent_image_hint(guild_id, *, channel_id=None):
     return (
         "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
@@ -1475,6 +1514,13 @@ def has_recent_image_reference_signal(text):
     return bool(RECENT_IMAGE_REFERENCE_RE.search(text))
 
 
+def has_recent_image_inspection_signal(text):
+    text = (text or "").strip()
+    if not text:
+        return False
+    return bool(RECENT_IMAGE_INSPECTION_RE.search(text))
+
+
 def should_call_action_router(
     text,
     *,
@@ -1485,6 +1531,8 @@ def should_call_action_router(
 ):
     if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
         return True
+    if allow_recent_images and has_recent_images and has_recent_image_inspection_signal(text):
+        return True
     if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
         return True
     return False
@@ -1494,6 +1542,14 @@ async def decide_message_action(config, history_messages, current_user_text, gui
     route_model = normalize_model_id((config or {}).get("route_model") or DEFAULT_ROUTE_MODEL or (config or {}).get("model") or DEFAULT_MODEL)
     excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
     recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
+    if recent_images and not has_current_images and has_recent_image_inspection_signal(current_user_text):
+        return {
+            "action": "inspect_recent_images",
+            "refined_prompt": "",
+            "use_recent_images": True,
+            "reason": "direct_recent_image_inspection_signal",
+        }
+
     inspect_action_text = ""
     inspect_rule_text = ""
     recent_image_hint = ""
@@ -1806,7 +1862,7 @@ async def on_message(message):
                         text_content = clean_content
                         for att in msg.attachments:
                             ct = att.content_type or ""
-                            if ct.startswith("image"):
+                            if is_image_attachment(att):
                                 text_content += f"\n(Bot sent an image: {att.filename})"
                             elif ct.startswith("video"):
                                 text_content += "\n(Bot generated a video here)"
@@ -1817,7 +1873,7 @@ async def on_message(message):
                             file_size = att.size or 0
                             too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
 
-                            if ct.startswith("image"):
+                            if is_image_attachment(att):
                                 text_content += f"\n(User attached an image: {att.filename})"
                             elif ct.startswith("video") and can_see_video and vid_count < VIDEO_HISTORY_LIMIT and not too_large:
                                 b64, mime = await encode_image(att.url)
@@ -1840,9 +1896,9 @@ async def on_message(message):
                                     bot.doc_cache.store_document("text_file", att.filename, extracted_text, msg.id, msg.channel.id)
                                     text_content += f"\n\n[Attached File Content: {att.filename}]\n```\n{extracted_text}\n```"
                                 elif too_large:
-                                    media_type = ct.split("/")[0] if "/" in ct else "file"
+                                    media_type = attachment_media_type(att)
                                     text_content += f"\n(User attached a {media_type} file: {att.filename}, but it was too large to inline.)"
-                                elif ct.startswith("image"):
+                                elif is_image_attachment(att):
                                     text_content += f"\n(User attached an image: {att.filename})"
                                 elif ct.startswith("video"):
                                     text_content += f"\n(User attached a video: {att.filename})"
@@ -1920,9 +1976,10 @@ async def on_message(message):
                         too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
                         print(f"[ATT] {att.filename} ct={ct} size={file_size} can_see_image={can_see_image} too_large={too_large}")
 
-                        if ct.startswith("image") and not too_large:
+                        if is_image_attachment(att) and not too_large:
                             raw, mime = await download_binary(att.url)
                             if raw:
+                                mime = infer_attachment_mime(att, mime)
                                 b64 = base64.b64encode(raw).decode("utf-8")
                                 image_part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
                                 current_image_inputs.append(image_part)
@@ -1966,13 +2023,24 @@ async def on_message(message):
                                 print(f"[CACHE] {doc_type or 'text'} file 저장: {doc_id} ({att.filename})")
                                 user_text += f"\n\n[Attached File Content: {att.filename}]\n```\n{extracted_text}\n```"
                             elif too_large:
-                                media_type = ct.split("/")[0] if "/" in ct else "file"
+                                media_type = attachment_media_type(att)
                                 user_text += f"\n(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024 * 1024)}MB)"
-                            elif ct.startswith("image"):
+                            elif is_image_attachment(att):
                                 user_text += f"\n(User attached an image: {att.filename})"
                 timing_mark(f"attachments current_images={len(current_image_inputs)}")
 
                 recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
+                direct_recent_image_inspection = (
+                    recent_images_available
+                    and not current_image_inputs
+                    and has_recent_image_inspection_signal(message.content)
+                )
+                if direct_recent_image_inspection and not can_see_image:
+                    await message.channel.send(
+                        f"❌ `{current_model}` 모델은 과거 이미지를 다시 분석할 수 없습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
+                    )
+                    return
+
                 should_route_action = action_router_enabled and should_call_action_router(
                     message.content,
                     has_current_images=bool(current_image_inputs),
@@ -1993,7 +2061,14 @@ async def on_message(message):
                     "use_recent_images": False,
                     "reason": "action_router_skipped",
                 }
-                if should_route_action:
+                if direct_recent_image_inspection:
+                    route = {
+                        "action": "inspect_recent_images",
+                        "refined_prompt": "",
+                        "use_recent_images": True,
+                        "reason": "direct_recent_image_inspection_signal",
+                    }
+                elif should_route_action:
                     route = await decide_message_action(
                         config,
                         history_buffer,
