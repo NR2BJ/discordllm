@@ -159,8 +159,10 @@ DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_
 DEFAULT_HISTORY_LIMIT = 20
 MIN_HISTORY_LIMIT = 1
 MAX_HISTORY_LIMIT = 100
+DEFAULT_IMAGE_HISTORY_LIMIT = int(os.environ.get("GEMINI_IMAGE_HISTORY_LIMIT", "10"))
+MIN_IMAGE_HISTORY_LIMIT = 0
+MAX_IMAGE_HISTORY_LIMIT = 50
 IMAGE_SEARCH_LIMIT = 2
-MAX_REF_IMAGES = 1
 MAX_DOC_CHARS = 12000
 MEMORY_EXCERPT_MAX_CHARS = 5000
 TEXT_ATTACHMENT_EXTENSIONS = (
@@ -440,6 +442,18 @@ def clamp_history_limit(value):
 
 def get_history_limit(config):
     return clamp_history_limit((config or {}).get("history_limit", DEFAULT_HISTORY_LIMIT))
+
+
+def clamp_image_history_limit(value):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = DEFAULT_IMAGE_HISTORY_LIMIT
+    return max(MIN_IMAGE_HISTORY_LIMIT, min(MAX_IMAGE_HISTORY_LIMIT, limit))
+
+
+def get_image_history_limit(config):
+    return clamp_image_history_limit((config or {}).get("image_history_limit", DEFAULT_IMAGE_HISTORY_LIMIT))
 
 
 def clamp_sound_volume(value):
@@ -1219,25 +1233,6 @@ async def extract_attachment_text(att):
         if decoded:
             return trim_document_text(decoded), "text"
     return None, None
-
-
-async def load_recent_image_parts(guild_id, *, channel_id=None, limit=RECENT_IMAGE_LIMIT):
-    parts = []
-    for entry in reversed(bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)[-limit:]):
-        try:
-            with open(entry["path"], "rb") as f:
-                raw = f.read()
-            ext = os.path.splitext(entry.get("filename", ""))[1].lower()
-            mime = {
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".gif": "image/gif",
-            }.get(ext, "image/png")
-            parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=raw)))
-        except Exception as e:
-            print(f"[IMG] 최근 이미지 로드 실패: {e}")
-    return parts
 
 
 def build_recent_image_hint(guild_id, *, channel_id=None):
@@ -2162,9 +2157,11 @@ class GeminiBot(commands.Bot):
                 "channel_id": None,
                 "reset_time": None,
                 "history_limit": DEFAULT_HISTORY_LIMIT,
+                "image_history_limit": DEFAULT_IMAGE_HISTORY_LIMIT,
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
             }
         self.server_configs[gid].setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
+        self.server_configs[gid].setdefault("image_history_limit", DEFAULT_IMAGE_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
         return self.server_configs[gid]
 
@@ -2940,6 +2937,8 @@ async def on_message(message):
                 server_text_model = config.get("text_model", TEXT_MODEL)
                 server_image_model = config.get("image_model", IMAGE_MODEL)
                 history_limit = get_history_limit(config)
+                image_history_limit = get_image_history_limit(config)
+                history_scan_limit = max(history_limit, image_history_limit)
                 reset_ts = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
@@ -2947,42 +2946,60 @@ async def on_message(message):
                 history_texts = []
                 history_meta = []
                 history_position = 0
+                history_inline_images = 0
+                history_ref_images = []
 
-                async for msg in message.channel.history(limit=history_limit + 10):
+                async for msg in message.channel.history(limit=history_scan_limit + 10):
                     if msg.id == message.id: continue
                     if msg.id > message.id and msg.author != bot.user: continue
                     if reset_ts and msg.created_at < reset_ts: break
                     if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
                         continue
 
+                    within_text_history = history_position < history_limit
+                    within_image_history = history_position < image_history_limit
+
                     cached_doc_blocks = []
-                    if msg.author != bot.user:
+                    if within_text_history and msg.author != bot.user:
                         replay_full_docs = (reply_target_id == msg.id) or (history_position < DOC_CACHE_AUTO_REPLAY_WINDOW)
                         cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=replay_full_docs)
 
+                    image_parts = []
                     if msg.author == bot.user:
-                        content = msg.content
-                        if '"action":' in content or '"prompt":' in content:
+                        content = msg.content if within_text_history else ""
+                        if within_text_history and ('"action":' in content or '"prompt":' in content):
                             content = "[System Log: Action Performed]"
-                        elif "Error" in content:
+                        elif within_text_history and "Error" in content:
                             content = "[System Error Log]"
                         if msg.attachments:
                             for att in msg.attachments:
-                                if att.content_type and att.content_type.startswith('video'):
+                                if is_image_attachment(att):
+                                    content += f"\n(Bot sent an image: {att.filename})"
+                                elif within_text_history and att.content_type and att.content_type.startswith('video'):
                                     content += f"\n(Bot generated a video here: {att.filename})"
-                                # 이미지는 마커 없이 스킵 (최근 이미지는 base64로 별도 포함)
-                        if not content.strip():
-                            continue  # 텍스트 없는 이미지 전용 메시지는 히스토리 제외
                     else:
-                        content = msg.content
+                        content = msg.content if (within_text_history or within_image_history) else ""
                         if msg.attachments:
                             for att in msg.attachments:
-                                if is_audio_or_video_attachment(att):
+                                if is_image_attachment(att):
+                                    content += f"\n(User attached an image: {att.filename})"
+                                    if within_image_history:
+                                        d, m = await download_media(att.url)
+                                        if d:
+                                            raw = d.getvalue()
+                                            m = infer_attachment_mime(att, m)
+                                            image_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=raw)))
+                                            history_inline_images += 1
+                                            try:
+                                                history_ref_images.append(Image.open(io.BytesIO(raw)).copy())
+                                            except Exception:
+                                                pass
+                                        else:
+                                            content += " (image download failed)"
+                                elif within_text_history and is_audio_or_video_attachment(att):
                                     media_type = attachment_media_type(att)
                                     content += f"\n(User attached a {media_type} file: {att.filename})"
-                                elif is_image_attachment(att):
-                                    content += f"\n(User attached an image: {att.filename})"
-                                else:
+                                elif within_text_history:
                                     file_text, file_kind = await extract_attachment_text(att)
                                     if file_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
                                         bot.doc_cache.store_document("text_file", att.filename, file_text, msg.id, msg.channel.id)
@@ -2996,7 +3013,16 @@ async def on_message(message):
                     role = "model" if msg.author == bot.user else "user"
                     if role == "user":
                         content = prepend_user_identity(content, message.guild, msg.author, kind="history")
-                    history_list.insert(0, types.Content(role=role, parts=[types.Part(text=content)]))
+                    parts = []
+                    if content.strip():
+                        parts.append(types.Part(text=content))
+                    parts.extend(image_parts)
+                    if not parts:
+                        history_position += 1
+                        if history_position >= history_scan_limit:
+                            break
+                        continue
+                    history_list.insert(0, types.Content(role=role, parts=parts))
                     history_texts.insert(0, content)
                     # 후처리(봇 응답 대상 마커)용 메타 — history_list와 1:1
                     user_info = (
@@ -3005,7 +3031,7 @@ async def on_message(message):
                     )
                     history_meta.insert(0, {"is_bot": msg.author == bot.user, "user_info": user_info})
                     history_position += 1
-                    if len(history_list) >= history_limit:
+                    if history_position >= history_scan_limit:
                         break
 
                 # 봇 응답에 [Bot replied to ...] prefix 추가 (직전 user 메시지 기준)
@@ -3021,6 +3047,11 @@ async def on_message(message):
                     else:
                         if meta["user_info"]:
                             last_user_info = meta["user_info"]
+
+                print(
+                    f"[HISTORY] count={len(history_list)} text_window={history_limit} "
+                    f"image_window={image_history_limit} inline_images={history_inline_images}"
+                )
 
                 current_display_name = get_server_display_name(message.guild, message.author)
                 # 현재 메시지 본문에 [CURRENT MESSAGE from ...] prefix 적용
@@ -3125,14 +3156,9 @@ async def on_message(message):
                     generation_prompt = build_contextual_image_prompt(route.get("refined_prompt"), message.content, history_texts)
                     ref_images = []
                     if current_ref_images:
-                        ref_images = current_ref_images[:MAX_REF_IMAGES]
+                        ref_images = current_ref_images
                     elif route.get("use_recent_images"):
-                        for entry in bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id)[-MAX_REF_IMAGES:]:
-                            try:
-                                with open(entry["path"], "rb") as f:
-                                    ref_images.append(Image.open(io.BytesIO(f.read())).copy())
-                            except Exception as e:
-                                print(f"[IMG] 최근 이미지 참조 로드 실패: {e}")
+                        ref_images = list(history_ref_images)
 
                     print(f"[IMG] 라우팅 생성 요청: '{display_prompt}' (현재첨부={len(current_ref_images)} 최근참조={len(ref_images)} ctx={len(recent_context)})")
                     status_msg = await message.channel.send(f"**Prompt:** `{compact_prompt_for_status(display_prompt)}`")
@@ -3162,12 +3188,10 @@ async def on_message(message):
                     return
 
                 if route.get("action") == "inspect_recent_images" and not has_current_images and route.get("use_recent_images"):
-                    recent_parts = await load_recent_image_parts(message.guild.id, channel_id=message.channel.id)
-                    if recent_parts:
-                        current_parts = recent_parts + current_parts
-                        print(f"[IMG] 최근 이미지 재첨부: {len(recent_parts)}개 reason={route.get('reason')}")
-                    else:
-                        print(f"[IMG] 최근 이미지 재첨부 요청이 있었지만 로드된 이미지가 없음 reason={route.get('reason')}")
+                    print(
+                        f"[IMG] 과거 이미지 요청: history_inline_images={history_inline_images} "
+                        f"image_history={image_history_limit} reason={route.get('reason')}"
+                    )
 
                 # 현재 메시지의 [CURRENT MESSAGE from ...] prefix는 이미 current_parts[0]에 포함됨
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
@@ -3243,26 +3267,43 @@ async def set_ch(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="history", description="Gemini 대화 원문 히스토리 참조 개수 설정")
-@app_commands.describe(count=f"참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)")
-async def set_history(interaction: discord.Interaction, count: int | None = None):
+@bot.tree.command(name="history", description="Gemini 대화/이미지 히스토리 참조 개수 설정")
+@app_commands.describe(
+    count=f"텍스트로 참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)",
+    image_count=f"이미지를 실제 재첨부할 최근 메시지 개수 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)",
+)
+async def set_history(
+    interaction: discord.Interaction,
+    count: int | None = None,
+    image_count: int | None = None,
+):
     if not interaction.guild:
         await temp_reply(interaction, "[ERROR] 서버에서만 사용 가능합니다.")
         return
     config = bot.get_config(interaction.guild_id)
-    if count is None:
+    if count is None and image_count is None:
         await interaction.response.send_message(
             f"현재 Gemini 원문 히스토리 참조: **{get_history_limit(config)}개** "
-            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)"
+            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)\n"
+            f"현재 Gemini 이미지 히스토리 재첨부: **{get_image_history_limit(config)}개** "
+            f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)"
         )
         return
-    limit = clamp_history_limit(count)
-    config["history_limit"] = limit
+    changed = []
+    if count is not None:
+        limit = clamp_history_limit(count)
+        config["history_limit"] = limit
+        suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
+        changed.append(f"원문 히스토리 **{limit}개**{suffix}")
+    if image_count is not None:
+        image_limit = clamp_image_history_limit(image_count)
+        config["image_history_limit"] = image_limit
+        suffix = "" if image_limit == image_count else f" (요청값 {image_count}에서 허용 범위로 보정)"
+        changed.append(f"이미지 히스토리 **{image_limit}개**{suffix}")
     bot.save_config()
-    suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
     actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"[OK] {actor_name}님이 Gemini 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
+        f"[OK] {actor_name}님이 Gemini " + ", ".join(changed) + "로 설정했습니다."
     )
 
 @bot.tree.command(name="reset", description="히스토리 초기화")
@@ -4045,8 +4086,9 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
             server_tm = cfg.get("text_model", TEXT_MODEL)
             server_im = cfg.get("image_model", IMAGE_MODEL)
             server_hist = get_history_limit(cfg)
+            server_image_hist = get_image_history_limit(cfg)
             await interaction.response.send_message(
-                f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개) / `{server_im}` (이미지)\n"
+                f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개, 이미지 {server_image_hist}개) / `{server_im}` (이미지)\n"
                 f"글로벌 기본값: `{TEXT_MODEL}` / `{IMAGE_MODEL}`"
             )
         else:
@@ -4073,12 +4115,13 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
             cfg["thinking_level"] = thinking_level
         bot.save_config()
     history_limit = get_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_HISTORY_LIMIT
+    image_history_limit = get_image_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_IMAGE_HISTORY_LIMIT
     actor_name = get_server_display_name(interaction.guild, interaction.user)
     thinking_label = f"`{thinking_level}`" if thinking_level else "모델 기본값"
     await interaction.response.send_message(
         f"모델 변경됨: **{name}** by {actor_name}\n"
         f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n"
-        f"사고 수준: {thinking_label}\n히스토리 참조: {history_limit}개"
+        f"사고 수준: {thinking_label}\n히스토리 참조: 텍스트 {history_limit}개 / 이미지 {image_history_limit}개"
     )
 
 @switch_model.autocomplete('name')

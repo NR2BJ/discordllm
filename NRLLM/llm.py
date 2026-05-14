@@ -56,7 +56,9 @@ def is_enabled(value):
 HISTORY_LIMIT = 20
 MIN_HISTORY_LIMIT = 1
 MAX_HISTORY_LIMIT = 100
-IMAGE_HISTORY_LIMIT = 2
+IMAGE_HISTORY_LIMIT = int(os.environ.get("LLM_IMAGE_HISTORY_LIMIT", "10"))
+MIN_IMAGE_HISTORY_LIMIT = 0
+MAX_IMAGE_HISTORY_LIMIT = 50
 VIDEO_HISTORY_LIMIT = 1
 AUDIO_HISTORY_LIMIT = 1
 MAX_MEDIA_BASE64_MB = 20
@@ -510,6 +512,18 @@ def get_history_limit(config):
     return clamp_history_limit((config or {}).get("history_limit", HISTORY_LIMIT))
 
 
+def clamp_image_history_limit(value):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = IMAGE_HISTORY_LIMIT
+    return max(MIN_IMAGE_HISTORY_LIMIT, min(MAX_IMAGE_HISTORY_LIMIT, limit))
+
+
+def get_image_history_limit(config):
+    return clamp_image_history_limit((config or {}).get("image_history_limit", IMAGE_HISTORY_LIMIT))
+
+
 def get_bot_display_name():
     user = getattr(bot, "user", None)
     return getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
@@ -950,6 +964,7 @@ class OpenRouterBot(commands.Bot):
                 "provider_privacy": DEFAULT_PROVIDER_PRIVACY,
                 "provider_order": [],
                 "history_limit": HISTORY_LIMIT,
+                "image_history_limit": IMAGE_HISTORY_LIMIT,
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
                 "route_model": DEFAULT_ROUTE_MODEL,
             }
@@ -957,6 +972,7 @@ class OpenRouterBot(commands.Bot):
         self.server_configs[gid].setdefault("provider_privacy", DEFAULT_PROVIDER_PRIVACY)
         self.server_configs[gid].setdefault("provider_order", [])
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
+        self.server_configs[gid].setdefault("image_history_limit", IMAGE_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
         self.server_configs[gid].setdefault("route_model", DEFAULT_ROUTE_MODEL)
         self.server_configs[gid].pop("provider_policy", None)
@@ -1062,19 +1078,6 @@ def build_recent_image_hint(guild_id, *, channel_id=None):
         f"{bot.recent_image_store.describe_recent(guild_id, channel_id=channel_id)}"
     )
 
-
-async def load_recent_image_inputs(guild_id, *, channel_id=None, limit=RECENT_IMAGE_LIMIT):
-    inputs = []
-    for entry in reversed(bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)[-limit:]):
-        try:
-            with open(entry["path"], "rb") as f:
-                raw = f.read()
-            mime = guess_image_mime(entry.get("filename", ""))
-            b64 = base64.b64encode(raw).decode("utf-8")
-            inputs.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        except Exception as e:
-            print(f"⚠️ 최근 이미지 로드 실패: {e}")
-    return inputs
 
 async def send_long_message(channel, content):
     if len(content) <= 2000:
@@ -1827,14 +1830,17 @@ async def on_message(message):
                 reset_dt = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
-                img_count = 0
                 vid_count = 0
                 aud_count = 0
                 history_buffer = []
                 history_position = 0
                 history_limit = get_history_limit(config)
+                image_history_limit = get_image_history_limit(config)
+                history_scan_limit = max(history_limit, image_history_limit)
+                history_inline_images = 0
+                history_reference_inputs = []
 
-                async for msg in message.channel.history(limit=history_limit + 10):
+                async for msg in message.channel.history(limit=history_scan_limit + 10):
                     if msg.id == message.id:
                         continue
                     if msg.id > message.id and msg.author != bot.user:
@@ -1847,15 +1853,18 @@ async def on_message(message):
                     is_bot = msg.author == bot.user
                     role = "assistant" if is_bot else "user"
                     content_list = []
+                    image_inputs = []
+                    within_text_history = history_position < history_limit
+                    within_image_history = history_position < image_history_limit
                     cached_doc_blocks = []
-                    if not is_bot:
+                    if within_text_history and not is_bot:
                         replay_full_docs = (reply_target_id == msg.id) or (history_position < DOC_CACHE_AUTO_REPLAY_WINDOW)
                         cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=replay_full_docs)
 
                     text_content = ""
                     if is_bot:
-                        clean_content = msg.content
-                        if ":" in clean_content[:20]:
+                        clean_content = msg.content if within_text_history else ""
+                        if within_text_history and ":" in clean_content[:20]:
                             parts = clean_content.split(": ", 1)
                             if len(parts) > 1 and parts[0] in [get_bot_display_name(), get_bot_username(), "Bot", "Model"]:
                                 clean_content = parts[1]
@@ -1864,10 +1873,10 @@ async def on_message(message):
                             ct = att.content_type or ""
                             if is_image_attachment(att):
                                 text_content += f"\n(Bot sent an image: {att.filename})"
-                            elif ct.startswith("video"):
+                            elif within_text_history and ct.startswith("video"):
                                 text_content += "\n(Bot generated a video here)"
                     else:
-                        text_content = msg.content
+                        text_content = msg.content if (within_text_history or within_image_history) else ""
                         for att in msg.attachments:
                             ct = att.content_type or ""
                             file_size = att.size or 0
@@ -1875,14 +1884,25 @@ async def on_message(message):
 
                             if is_image_attachment(att):
                                 text_content += f"\n(User attached an image: {att.filename})"
-                            elif ct.startswith("video") and can_see_video and vid_count < VIDEO_HISTORY_LIMIT and not too_large:
+                                if within_image_history and can_see_image and not too_large:
+                                    raw, mime = await download_binary(att.url)
+                                    if raw:
+                                        mime = infer_attachment_mime(att, mime)
+                                        b64 = base64.b64encode(raw).decode("utf-8")
+                                        image_part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                                        image_inputs.append(image_part)
+                                        history_reference_inputs.append(image_part)
+                                        history_inline_images += 1
+                                    else:
+                                        text_content += " (image download failed)"
+                            elif within_text_history and ct.startswith("video") and can_see_video and vid_count < VIDEO_HISTORY_LIMIT and not too_large:
                                 b64, mime = await encode_image(att.url)
                                 if b64:
                                     content_list.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
                                     vid_count += 1
                                 else:
                                     text_content += f"\n(User attached a video: {att.filename})"
-                            elif ct.startswith("audio") and can_see_audio and aud_count < AUDIO_HISTORY_LIMIT and not too_large:
+                            elif within_text_history and ct.startswith("audio") and can_see_audio and aud_count < AUDIO_HISTORY_LIMIT and not too_large:
                                 b64, _ = await encode_image(att.url)
                                 if b64:
                                     fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
@@ -1890,7 +1910,7 @@ async def on_message(message):
                                     aud_count += 1
                                 else:
                                     text_content += f"\n(User attached an audio file: {att.filename})"
-                            else:
+                            elif within_text_history:
                                 extracted_text, doc_type = await extract_attachment_text(att)
                                 if extracted_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
                                     bot.doc_cache.store_document("text_file", att.filename, extracted_text, msg.id, msg.channel.id)
@@ -1913,9 +1933,14 @@ async def on_message(message):
                     if not is_bot:
                         text_content = prepend_user_identity(text_content, message.guild, msg.author, kind="history")
 
-                    if is_bot and not text_content.strip() and len(content_list) == 0:
+                    content_list.extend(image_inputs)
+                    if text_content.strip():
+                        content_list.append({"type": "text", "text": text_content})
+                    if len(content_list) == 0:
+                        history_position += 1
+                        if history_position >= history_scan_limit:
+                            break
                         continue
-                    content_list.append({"type": "text", "text": text_content})
                     # author 메타: 봇 응답에 응답 대상 마커를 붙이기 위한 후처리용
                     item_meta = {
                         "is_bot": is_bot,
@@ -1923,7 +1948,7 @@ async def on_message(message):
                     }
                     history_buffer.insert(0, {"role": role, "content": content_list, "_meta": item_meta})
                     history_position += 1
-                    if len(history_buffer) >= history_limit:
+                    if history_position >= history_scan_limit:
                         break
 
                 # 봇 응답에 [Bot replied to ...] 마커 prefix 추가
@@ -1945,7 +1970,10 @@ async def on_message(message):
                     item.pop("_meta", None)
 
                 messages.extend(history_buffer)
-                timing_mark(f"history count={len(history_buffer)}")
+                timing_mark(
+                    f"history count={len(history_buffer)} image_window={image_history_limit} "
+                    f"inline_images={history_inline_images}"
+                )
 
                 current_content = []
                 current_image_inputs = []
@@ -2084,7 +2112,7 @@ async def on_message(message):
                 if route.get("action") == "generate_image":
                     reference_inputs = list(current_image_inputs)
                     if not reference_inputs and route.get("use_recent_images"):
-                        reference_inputs = await load_recent_image_inputs(message.guild.id, channel_id=message.channel.id)
+                        reference_inputs = list(history_reference_inputs)
                     handled = await handle_natural_image_request(
                         message,
                         config,
@@ -2107,7 +2135,10 @@ async def on_message(message):
                             f"❌ `{current_model}` 모델은 과거 이미지를 다시 분석할 수 없습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
                         )
                         return
-                    current_content = (await load_recent_image_inputs(message.guild.id, channel_id=message.channel.id)) + current_content
+                    print(
+                        f"[IMG] 과거 이미지 요청: history_inline_images={history_inline_images} "
+                        f"image_history={image_history_limit} reason={route.get('reason')}"
+                    )
 
                 current_content.append({"type": "text", "text": prepend_user_identity(user_text, message.guild, message.author, kind="current")})
                 messages.append({"role": "user", "content": current_content})
@@ -2508,23 +2539,40 @@ async def set_provider_routing(
     await interaction.followup.send(embed=embed)
 
 
-@model_group.command(name="history", description="대화 원문 히스토리 참조 개수 설정")
-@app_commands.describe(count=f"참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)")
-async def set_history_limit(interaction: discord.Interaction, count: int | None = None):
+@model_group.command(name="history", description="대화/이미지 히스토리 참조 개수 설정")
+@app_commands.describe(
+    count=f"텍스트로 참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)",
+    image_count=f"이미지를 실제 재첨부할 최근 메시지 개수 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)",
+)
+async def set_history_limit(
+    interaction: discord.Interaction,
+    count: int | None = None,
+    image_count: int | None = None,
+):
     config = bot.get_config(interaction.guild_id)
-    if count is None:
+    if count is None and image_count is None:
         await interaction.response.send_message(
             f"현재 원문 히스토리 참조: **{get_history_limit(config)}개** "
-            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)"
+            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)\n"
+            f"현재 이미지 히스토리 재첨부: **{get_image_history_limit(config)}개** "
+            f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)"
         )
         return
-    limit = clamp_history_limit(count)
-    config["history_limit"] = limit
+    changed = []
+    if count is not None:
+        limit = clamp_history_limit(count)
+        config["history_limit"] = limit
+        suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
+        changed.append(f"원문 히스토리 **{limit}개**{suffix}")
+    if image_count is not None:
+        image_limit = clamp_image_history_limit(image_count)
+        config["image_history_limit"] = image_limit
+        suffix = "" if image_limit == image_count else f" (요청값 {image_count}에서 허용 범위로 보정)"
+        changed.append(f"이미지 히스토리 **{image_limit}개**{suffix}")
     bot.save_config()
-    suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
     actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
-        f"✅ {actor_name}님이 원문 히스토리 참조를 **{limit}개**로 설정했습니다.{suffix}"
+        f"✅ {actor_name}님이 " + ", ".join(changed) + "로 설정했습니다."
     )
 
 @bot.tree.command(name="dashboard", description="현재 모델 스펙 확인")
@@ -2593,7 +2641,7 @@ async def dashboard(interaction: discord.Interaction):
         f"• **Chat Image:** {image_command_status}",
         f"• **Image Models:** {count_image_generation_models()} discovered",
         f"• **Provider:** {format_provider_mode(config)}",
-        f"• **History:** {get_history_limit(config)} messages",
+        f"• **History:** {get_history_limit(config)} text / {get_image_history_limit(config)} image messages",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
     if endpoints is not None:
