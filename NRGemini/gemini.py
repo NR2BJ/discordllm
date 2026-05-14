@@ -195,9 +195,17 @@ CURRENT_IMAGE_EDIT_RE = re.compile(
     r"(편집|수정|변환|합성|지워|넣어|추가|바꿔|스타일|풍으로|배경|edit|modify|transform|remove|add|style|background)",
     re.IGNORECASE,
 )
+IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 FOLLOWUP_IMAGE_EDIT_RE = re.compile(
     r"(이거|이것|이게|저거|저것|그거|그것|아까|방금|전에|위에|최근|this|that|previous|recent|above).{0,80}"
     r"(만들|그려|그리|바꿔|변환|수정|편집|합성|처럼|같이|느낌|스타일|풍으로|make|draw|turn|change|edit|style)",
+    re.IGNORECASE,
+)
+RECENT_IMAGE_INSPECTION_RE = re.compile(
+    r"((이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title).{0,60}"
+    r"(봐|봐봐|보라|보라고|보여|볼\s*수|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird)|"
+    r"(봐|봐봐|보라|보라고|보여|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird).{0,60}"
+    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title))",
     re.IGNORECASE,
 )
 RECENT_IMAGE_REFERENCE_RE = re.compile(
@@ -1380,6 +1388,44 @@ def compact_prompt_for_status(prompt, limit=500):
     return prompt[:limit].rstrip() + "..."
 
 
+def is_image_attachment(attachment):
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    filename = (getattr(attachment, "filename", None) or "").lower()
+    return content_type.startswith("image/") or filename.endswith(IMAGE_ATTACHMENT_EXTENSIONS)
+
+
+def is_audio_or_video_attachment(attachment):
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    return content_type.startswith("video/") or content_type.startswith("audio/")
+
+
+def attachment_media_type(attachment):
+    content_type = (getattr(attachment, "content_type", None) or "").lower()
+    if "/" in content_type:
+        return content_type.split("/", 1)[0]
+    if is_image_attachment(attachment):
+        return "image"
+    return "file"
+
+
+def infer_attachment_mime(attachment, detected_mime=None):
+    if detected_mime:
+        return detected_mime.split(";", 1)[0].strip()
+    content_type = getattr(attachment, "content_type", None)
+    if content_type:
+        return content_type.split(";", 1)[0].strip()
+    filename = (getattr(attachment, "filename", None) or "").lower()
+    if filename.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if filename.endswith(".webp"):
+        return "image/webp"
+    if filename.endswith(".gif"):
+        return "image/gif"
+    if filename.endswith(".png"):
+        return "image/png"
+    return "application/octet-stream"
+
+
 def is_deep_research_model(text_model):
     return text_model in DEEP_RESEARCH_AGENT_IDS
 
@@ -1408,6 +1454,13 @@ def has_recent_image_reference_signal(text):
     return bool(RECENT_IMAGE_REFERENCE_RE.search(text))
 
 
+def has_recent_image_inspection_signal(text):
+    text = (text or "").strip()
+    if not text:
+        return False
+    return bool(RECENT_IMAGE_INSPECTION_RE.search(text))
+
+
 def should_call_action_router(
     text,
     *,
@@ -1419,6 +1472,8 @@ def should_call_action_router(
     if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
         return True
     if allow_recent_images and has_recent_images and FOLLOWUP_IMAGE_EDIT_RE.search(text or ""):
+        return True
+    if allow_recent_images and has_recent_images and has_recent_image_inspection_signal(text):
         return True
     if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
         return True
@@ -1762,6 +1817,14 @@ async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_
         text_model = TEXT_MODEL
     text_model = get_structured_helper_model(text_model)
     recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
+    if recent_images and not has_current_images and has_recent_image_inspection_signal(last_user_msg):
+        return {
+            "action": "inspect_recent_images",
+            "refined_prompt": "",
+            "use_recent_images": True,
+            "reason": "direct_recent_image_inspection_signal",
+        }
+
     inspect_action_text = ""
     inspect_rule_text = ""
     recent_image_hint = ""
@@ -2914,9 +2977,11 @@ async def on_message(message):
                         content = msg.content
                         if msg.attachments:
                             for att in msg.attachments:
-                                if att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
-                                    media_type = att.content_type.split('/')[0]
+                                if is_audio_or_video_attachment(att):
+                                    media_type = attachment_media_type(att)
                                     content += f"\n(User attached a {media_type} file: {att.filename})"
+                                elif is_image_attachment(att):
+                                    content += f"\n(User attached an image: {att.filename})"
                                 else:
                                     file_text, file_kind = await extract_attachment_text(att)
                                     if file_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
@@ -2975,10 +3040,11 @@ async def on_message(message):
 
                 if message.attachments:
                     for att in message.attachments:
-                        if att.content_type and att.content_type.startswith('image'):
+                        if is_image_attachment(att):
                             d, m = await download_media(att.url)
                             if d:
                                 raw = d.getvalue()
+                                m = infer_attachment_mime(att, m)
                                 current_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=raw)))
                                 has_current_images = True
                                 try:
@@ -2995,11 +3061,14 @@ async def on_message(message):
                                     image_bytes=raw,
                                     source_kind="user_upload",
                                 )
-                        elif att.content_type and (att.content_type.startswith('video') or att.content_type.startswith('audio')):
+                            else:
+                                current_parts.append(types.Part(text=f"\n(User attached an image: {att.filename}, but it could not be downloaded.)"))
+                        elif is_audio_or_video_attachment(att):
                             d, m = await download_media(att.url)
                             if d:
                                 file_bytes = d.getvalue()
-                                media_type = att.content_type.split('/')[0]
+                                media_type = attachment_media_type(att)
+                                m = infer_attachment_mime(att, m)
                                 if len(file_bytes) < 15 * 1024 * 1024:
                                     current_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=file_bytes)))
                                 else:
@@ -3216,9 +3285,10 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
         mime_type = None
         image_source = None
 
-        if image and image.content_type and image.content_type.startswith('image'):
+        if image and is_image_attachment(image):
             img_data, mime_type = await download_media(image.url)
             if img_data:
+                mime_type = infer_attachment_mime(image, mime_type)
                 parts.append(types.Part(inline_data=types.Blob(mime_type=mime_type, data=img_data.getvalue())))
                 image_source = image.url
                 print(f"  [IMG] 이미지 첨부: {image.url}")
@@ -3338,7 +3408,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
         has_reference = False
         reference_source = None
 
-        if reference and reference.content_type and reference.content_type.startswith('image'):
+        if reference and is_image_attachment(reference):
             img_data, _ = await download_media(reference.url)
             if img_data:
                 ref_images.append(Image.open(img_data))
