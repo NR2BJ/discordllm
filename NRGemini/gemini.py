@@ -3092,7 +3092,19 @@ async def on_message(message):
                 action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
                 recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
                 recent_context = build_recent_conversation_excerpt(history_texts)
-                if action_router_enabled and should_call_action_router(
+                direct_recent_image_inspection = (
+                    recent_images_available
+                    and not has_current_images
+                    and has_recent_image_inspection_signal(message.content)
+                )
+                if direct_recent_image_inspection:
+                    route = {
+                        "action": "inspect_recent_images",
+                        "refined_prompt": "",
+                        "use_recent_images": True,
+                        "reason": "direct_recent_image_inspection_signal",
+                    }
+                elif action_router_enabled and should_call_action_router(
                     message.content,
                     has_current_images=has_current_images,
                     has_recent_images=recent_images_available,
@@ -3153,6 +3165,9 @@ async def on_message(message):
                     recent_parts = await load_recent_image_parts(message.guild.id, channel_id=message.channel.id)
                     if recent_parts:
                         current_parts = recent_parts + current_parts
+                        print(f"[IMG] 최근 이미지 재첨부: {len(recent_parts)}개 reason={route.get('reason')}")
+                    else:
+                        print(f"[IMG] 최근 이미지 재첨부 요청이 있었지만 로드된 이미지가 없음 reason={route.get('reason')}")
 
                 # 현재 메시지의 [CURRENT MESSAGE from ...] prefix는 이미 current_parts[0]에 포함됨
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
