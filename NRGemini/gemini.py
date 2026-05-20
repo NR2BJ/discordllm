@@ -80,59 +80,59 @@ except Exception as e:
 AVAILABLE_MODELS = {
     # Pro (3 levels: low / medium / high — minimal 미지원)
     "3.1-pro-low": {
-        "text": "gemini-3.1-pro-preview",
+        "text": "gemini-pro-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "low",
     },
     "3.1-pro-medium": {
-        "text": "gemini-3.1-pro-preview",
+        "text": "gemini-pro-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "medium",
     },
     "3.1-pro-high": {
-        "text": "gemini-3.1-pro-preview",
+        "text": "gemini-pro-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
     },
     # Flash (4 levels)
     "3-flash-minimal": {
-        "text": "gemini-3-flash-preview",
+        "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "minimal",
     },
     "3-flash-low": {
-        "text": "gemini-3-flash-preview",
+        "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "low",
     },
     "3-flash-medium": {
-        "text": "gemini-3-flash-preview",
+        "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "medium",
     },
     "3-flash-high": {
-        "text": "gemini-3-flash-preview",
+        "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
     },
     # Flash Lite (4 levels)
     "3.1-flash-lite-minimal": {
-        "text": "gemini-3.1-flash-lite",
+        "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "minimal",
     },
     "3.1-flash-lite-low": {
-        "text": "gemini-3.1-flash-lite",
+        "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "low",
     },
     "3.1-flash-lite-medium": {
-        "text": "gemini-3.1-flash-lite",
+        "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "medium",
     },
     "3.1-flash-lite-high": {
-        "text": "gemini-3.1-flash-lite",
+        "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
     },
