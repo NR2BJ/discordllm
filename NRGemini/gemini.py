@@ -79,59 +79,59 @@ except Exception as e:
 
 AVAILABLE_MODELS = {
     # Pro (3 levels: low / medium / high — minimal 미지원)
-    "3.1-pro-low": {
+    "pro-low": {
         "text": "gemini-pro-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "low",
     },
-    "3.1-pro-medium": {
+    "pro-medium": {
         "text": "gemini-pro-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "medium",
     },
-    "3.1-pro-high": {
+    "pro-high": {
         "text": "gemini-pro-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
     },
     # Flash (4 levels)
-    "3-flash-minimal": {
+    "flash-minimal": {
         "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "minimal",
     },
-    "3-flash-low": {
+    "flash-low": {
         "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "low",
     },
-    "3-flash-medium": {
+    "flash-medium": {
         "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "medium",
     },
-    "3-flash-high": {
+    "flash-high": {
         "text": "gemini-flash-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
     },
     # Flash Lite (4 levels)
-    "3.1-flash-lite-minimal": {
+    "flash-lite-minimal": {
         "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "minimal",
     },
-    "3.1-flash-lite-low": {
+    "flash-lite-low": {
         "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "low",
     },
-    "3.1-flash-lite-medium": {
+    "flash-lite-medium": {
         "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "medium",
     },
-    "3.1-flash-lite-high": {
+    "flash-lite-high": {
         "text": "gemini-flash-lite-latest",
         "image": "gemini-3.1-flash-image-preview",
         "thinking_level": "high",
@@ -146,13 +146,13 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image-preview",
     },
 }
-TEXT_MODEL = AVAILABLE_MODELS["3.1-pro-high"]["text"]
-IMAGE_MODEL = AVAILABLE_MODELS["3.1-pro-high"]["image"]
+TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
+IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
 DEEP_RESEARCH_AGENT_IDS = {
     AVAILABLE_MODELS["deep-research"]["text"],
     AVAILABLE_MODELS["deep-research-max"]["text"],
 }
-ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["3.1-flash-lite-minimal"]["text"])
+ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["flash-lite-minimal"]["text"])
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
@@ -170,9 +170,9 @@ TEXT_ATTACHMENT_EXTENSIONS = (
     ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
 )
 MODEL_HISTORY_LIMITS = {
-    AVAILABLE_MODELS["3.1-pro-high"]["text"]: 20,
-    AVAILABLE_MODELS["3-flash-high"]["text"]: 20,
-    AVAILABLE_MODELS["3.1-flash-lite-minimal"]["text"]: 20,
+    AVAILABLE_MODELS["pro-high"]["text"]: 20,
+    AVAILABLE_MODELS["flash-high"]["text"]: 20,
+    AVAILABLE_MODELS["flash-lite-minimal"]["text"]: 20,
     AVAILABLE_MODELS["deep-research"]["text"]: 20,
     AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
 }
