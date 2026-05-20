@@ -622,11 +622,14 @@ class OpenRouterClient:
         try:
             print("⏳ OpenRouter 모델 리스트 동기화 중...")
             async with aiohttp.ClientSession() as session:
+                # 전체 카탈로그(/models) 우선 — user-filtered는 privacy/guardrail 동의 안 한 모델을
+                # 누락시키므로 신규 이미지 모델(Grok Imagine, Recraft 등)이 자동완성에 안 뜸.
+                # 호출 단계에서 활성화 안 된 모델은 OpenRouter가 에러로 안내.
                 endpoints = [
-                    (f"{self.base_url}/models/user?output_modalities=all", "user-filtered-all"),
-                    (f"{self.base_url}/models/user", "user-filtered"),
-                    (f"{self.base_url}/models?output_modalities=all", "global-all-fallback"),
-                    (f"{self.base_url}/models", "global-fallback"),
+                    (f"{self.base_url}/models?output_modalities=all", "global-all"),
+                    (f"{self.base_url}/models", "global"),
+                    (f"{self.base_url}/models/user?output_modalities=all", "user-filtered-all-fallback"),
+                    (f"{self.base_url}/models/user", "user-filtered-fallback"),
                 ]
                 for url, source in endpoints:
                     async with session.get(url, headers=self.headers) as resp:
