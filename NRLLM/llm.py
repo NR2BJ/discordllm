@@ -2236,7 +2236,7 @@ async def on_message(message):
                         }
                     )
 
-                provider_prefs = build_provider_preferences(config, strict=bool(chat_tools or config.get("search")))
+                provider_prefs = build_provider_preferences(config, strict=bool(chat_tools))
                 cache_control = build_prompt_cache_control(current_model, messages)
                 timing_mark(
                     f"pre_chat chars={estimate_message_text_chars(messages)} "
@@ -2252,7 +2252,7 @@ async def on_message(message):
                         enable_web_search=config.get("search", False),
                         tools=chat_tools or None,
                         provider=provider_prefs,
-                        require_parameter_support=bool(chat_tools or config.get("search")),
+                        require_parameter_support=bool(chat_tools),
                         cache_control=cache_control,
                     )
                     provider_name = full_data.get("provider") if isinstance(full_data, dict) else None
@@ -2315,7 +2315,7 @@ async def on_message(message):
                         enable_web_search=config.get("search", False),
                         tools=chat_tools or None,
                         provider=provider_prefs,
-                        require_parameter_support=bool(chat_tools or config.get("search")),
+                        require_parameter_support=bool(chat_tools),
                         cache_control=cache_control,
                     )
 
