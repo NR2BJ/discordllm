@@ -604,6 +604,14 @@ class CompletionContentError(Exception):
         self.finish_reason = finish_reason
 
 
+class APIStatusError(Exception):
+    """HTTP non-200 응답. fallback 분기 위해 상태코드/본문을 별도 필드로 보존."""
+    def __init__(self, status, body):
+        super().__init__(f"API Error ({status}): {body}")
+        self.status = status
+        self.body = body or ""
+
+
 class OpenRouterClient:
     def __init__(self, api_key):
         self.api_key = api_key
@@ -919,10 +927,79 @@ class OpenRouterClient:
                         final_content, usage, images, full_data = self._parse_completion_output(data)
                         return final_content, usage, images, full_data
                     error_text = await resp.text()
-                    raise Exception(f"API Error ({resp.status}): {error_text}")
+                    raise APIStatusError(resp.status, error_text)
+
+            def _has_web_search_tool(p):
+                return any(
+                    isinstance(t, dict) and t.get("type") == "openrouter:web_search"
+                    for t in (p.get("tools") or [])
+                )
+
+            def _strip_web_search(p):
+                """payload에서 web_search tool만 제거하고, 다른 tool 없으면 tools 키 자체 제거.
+                또한 system 메시지에 검색 비활성 안내 한 줄 추가해 모델이 거짓으로 검색했다고 답하지 않게 함."""
+                stripped = copy.deepcopy(p)
+                remaining = [
+                    t for t in stripped.get("tools", [])
+                    if not (isinstance(t, dict) and t.get("type") == "openrouter:web_search")
+                ]
+                if remaining:
+                    stripped["tools"] = remaining
+                else:
+                    stripped.pop("tools", None)
+                    stripped.pop("tool_choice", None)
+                # provider.require_parameters도 web_search 때문에 켰을 수 있어 안전하게 해제
+                if isinstance(stripped.get("provider"), dict):
+                    stripped["provider"].pop("require_parameters", None)
+                # system 메시지에 검색 비활성 안내 주입
+                notice = (
+                    "\n\n[Notice] Web search is currently unavailable for this request. "
+                    "Answer using only your training knowledge. "
+                    "Do NOT claim or imply that you searched the web for this answer."
+                )
+                injected = False
+                for msg in stripped.get("messages", []):
+                    if msg.get("role") != "system":
+                        continue
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        msg["content"] = content + notice
+                        injected = True
+                        break
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                part["text"] = (part.get("text") or "") + notice
+                                injected = True
+                                break
+                        if injected:
+                            break
+                if not injected:
+                    # system 메시지가 아예 없으면 맨 앞에 추가
+                    stripped.setdefault("messages", []).insert(0, {"role": "system", "content": notice.strip()})
+                return stripped
 
             try:
                 return await _post_completion(payload)
+            except APIStatusError as api_err:
+                # web_search tool 포함이고 5xx면 tool 빼고 1회 재시도
+                if api_err.status >= 500 and _has_web_search_tool(payload):
+                    print(
+                        f"[WARN] web_search fallback: model={model} status={api_err.status} "
+                        f"reason=web_search_tool 호출 실패 → tool 제거 후 재시도. "
+                        f"(원본 에러 요약: {api_err.body[:200]}{'...' if len(api_err.body) > 200 else ''})"
+                    )
+                    fallback_payload = _strip_web_search(payload)
+                    try:
+                        result = await _post_completion(fallback_payload)
+                        print(f"[WARN] web_search fallback 성공: model={model} (검색 없이 답변 반환)")
+                        return result
+                    except APIStatusError as second_err:
+                        # fallback도 실패하면 원본 형식 에러로 raise (기존 동작 유지)
+                        print(f"[ERROR] web_search fallback 재시도도 실패: model={model} status={second_err.status}")
+                        raise Exception(f"API Error ({second_err.status}): {second_err.body}") from second_err
+                # web_search 무관 5xx 또는 일반 에러는 그대로 raise (기존 형식 유지)
+                raise Exception(f"API Error ({api_err.status}): {api_err.body}") from api_err
             except CompletionContentError as first_error:
                 print(
                     "[WARN] completion content empty; retrying once "
@@ -2325,7 +2402,6 @@ async def provider_autocomplete(interaction: discord.Interaction, current: str) 
     current_lower = (current or "").lower()
     choices = [
         app_commands.Choice(name="auto - 직접 provider 선택 해제", value="auto"),
-        app_commands.Choice(name="off - 직접 provider 선택 해제", value="off"),
     ]
     config = bot.get_config(interaction.guild_id)
     endpoints = await bot.or_client.fetch_model_endpoints(config.get("model", DEFAULT_MODEL)) or []
