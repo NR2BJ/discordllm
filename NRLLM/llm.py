@@ -605,11 +605,12 @@ class CompletionContentError(Exception):
 
 
 class APIStatusError(Exception):
-    """HTTP non-200 응답. fallback 분기 위해 상태코드/본문을 별도 필드로 보존."""
-    def __init__(self, status, body):
+    """HTTP non-200 응답. fallback 분기 위해 상태코드/본문/매칭된 provider를 보존."""
+    def __init__(self, status, body, provider=None):
         super().__init__(f"API Error ({status}): {body}")
         self.status = status
         self.body = body or ""
+        self.provider = provider  # OpenRouter 응답 헤더/본문에서 추출된 provider name (있을 때만)
 
 
 class OpenRouterClient:
@@ -625,6 +626,29 @@ class OpenRouterClient:
         }
         self.models_list = []
         self.models_source = "unknown"
+        # web_search server tool 호출이 실패한 provider를 일정 시간 차단하는 in-memory 캐시
+        # {provider_name_lower: expiry_unix_ts}. 봇 재시작 시 휘발 (의도된 동작)
+        self.web_search_blocked_providers = {}
+        self.web_search_block_seconds = 3600  # 1시간 후 자동 만료 → 재시도 가능
+
+    def _active_web_search_blocked_providers(self):
+        """만료 안 된 차단 provider name 리스트 반환 + 만료된 항목 정리."""
+        now = time.time()
+        expired = [k for k, exp in self.web_search_blocked_providers.items() if exp <= now]
+        for k in expired:
+            del self.web_search_blocked_providers[k]
+        return list(self.web_search_blocked_providers.keys())
+
+    def _block_provider_for_web_search(self, provider_name):
+        """provider를 web_search 호출에서 일정 시간 차단."""
+        if not provider_name:
+            return
+        key = provider_name.strip().lower()
+        if not key:
+            return
+        self.web_search_blocked_providers[key] = time.time() + self.web_search_block_seconds
+        minutes = self.web_search_block_seconds // 60
+        print(f"[WARN] provider '{provider_name}' web_search 차단 ({minutes}분) — 후속 web_search 호출에서 ignore")
 
     async def fetch_models_metadata(self):
         try:
@@ -919,15 +943,46 @@ class OpenRouterClient:
         if cache_control:
             payload["cache_control"] = cache_control
 
+        # web_search 켜졌고 차단 캐시에 provider 있으면 ignore 리스트로 주입
+        if enable_web_search:
+            blocked_now = self._active_web_search_blocked_providers()
+            if blocked_now:
+                prov = dict(payload.get("provider") or {})
+                existing = list(prov.get("ignore") or [])
+                existing_lower = {x.lower() for x in existing if isinstance(x, str)}
+                added = [b for b in blocked_now if b not in existing_lower]
+                if added:
+                    prov["ignore"] = existing + added
+                    payload["provider"] = prov
+                    print(f"[INFO] web_search 차단 캐시 적용: ignore={added}")
+
         async with aiohttp.ClientSession() as session:
             async def _post_completion(request_payload):
                 async with session.post(f"{self.base_url}/chat/completions", headers=self.headers, json=request_payload) as resp:
+                    # provider 추출: 헤더 우선, 200 body의 provider 필드, 5xx body의 provider 필드 순
+                    provider_used = (
+                        resp.headers.get("X-OpenRouter-Provider")
+                        or resp.headers.get("X-Provider")
+                        or resp.headers.get("X-Provider-Name")
+                    )
                     if resp.status == 200:
                         data = await resp.json()
+                        if not provider_used and isinstance(data, dict):
+                            provider_used = data.get("provider")
                         final_content, usage, images, full_data = self._parse_completion_output(data)
                         return final_content, usage, images, full_data
                     error_text = await resp.text()
-                    raise APIStatusError(resp.status, error_text)
+                    if not provider_used:
+                        try:
+                            err_json = json.loads(error_text)
+                            if isinstance(err_json, dict):
+                                provider_used = (
+                                    (err_json.get("error") or {}).get("provider")
+                                    if isinstance(err_json.get("error"), dict) else None
+                                ) or err_json.get("provider")
+                        except Exception:
+                            pass
+                    raise APIStatusError(resp.status, error_text, provider=provider_used)
 
             def _has_web_search_tool(p):
                 return any(
@@ -979,25 +1034,58 @@ class OpenRouterClient:
                     stripped.setdefault("messages", []).insert(0, {"role": "system", "content": notice.strip()})
                 return stripped
 
+            MAX_PROVIDER_RETRIES = 3  # web_search 5xx 시 provider 갈아끼우며 재시도 회수
             try:
                 return await _post_completion(payload)
             except APIStatusError as api_err:
-                # web_search tool 포함이고 5xx면 tool 빼고 1회 재시도
+                # web_search tool 포함이고 5xx면:
+                # 1) 실패한 provider 차단 캐시에 추가 + ignore 리스트로 재시도 (다른 provider 시도)
+                # 2) MAX_PROVIDER_RETRIES 회 모두 실패 → web_search tool 제거 후 최종 재시도
                 if api_err.status >= 500 and _has_web_search_tool(payload):
                     print(
-                        f"[WARN] web_search fallback: model={model} status={api_err.status} "
-                        f"reason=web_search_tool 호출 실패 → tool 제거 후 재시도. "
+                        f"[WARN] web_search 호출 실패: model={model} status={api_err.status} "
+                        f"provider={api_err.provider or '?'} "
                         f"(원본 에러 요약: {api_err.body[:200]}{'...' if len(api_err.body) > 200 else ''})"
                     )
+                    current_err = api_err
+                    retry_payload = payload
+                    for attempt in range(1, MAX_PROVIDER_RETRIES + 1):
+                        if not current_err.provider:
+                            print(f"[WARN] 응답에 provider 정보 없음 → provider 차단 재시도 중단")
+                            break
+                        self._block_provider_for_web_search(current_err.provider)
+                        # 갱신된 ignore list로 페이로드 재구성
+                        blocked_all = self._active_web_search_blocked_providers()
+                        retry_payload = copy.deepcopy(retry_payload)
+                        prov = dict(retry_payload.get("provider") or {})
+                        existing = list(prov.get("ignore") or [])
+                        existing_lower = {x.lower() for x in existing if isinstance(x, str)}
+                        for b in blocked_all:
+                            if b not in existing_lower:
+                                existing.append(b)
+                        prov["ignore"] = existing
+                        retry_payload["provider"] = prov
+                        print(f"[WARN] web_search 재시도 #{attempt}/{MAX_PROVIDER_RETRIES}: ignore={existing}")
+                        try:
+                            result = await _post_completion(retry_payload)
+                            print(f"[INFO] web_search 재시도 #{attempt} 성공 (다른 provider 매칭됨)")
+                            return result
+                        except APIStatusError as next_err:
+                            if next_err.status < 500:
+                                # 5xx 아닌 에러는 web_search 무관 가능성 → 일반 에러로 raise
+                                raise Exception(f"API Error ({next_err.status}): {next_err.body}") from next_err
+                            current_err = next_err
+                            continue
+                    # 모든 provider 재시도 실패 → web_search tool 제거 후 최종 재시도
+                    print(f"[WARN] provider 재시도 모두 소진 → web_search tool 제거 후 최종 fallback")
                     fallback_payload = _strip_web_search(payload)
                     try:
                         result = await _post_completion(fallback_payload)
-                        print(f"[WARN] web_search fallback 성공: model={model} (검색 없이 답변 반환)")
+                        print(f"[WARN] web_search 최종 fallback 성공: model={model} (검색 없이 답변 반환)")
                         return result
-                    except APIStatusError as second_err:
-                        # fallback도 실패하면 원본 형식 에러로 raise (기존 동작 유지)
-                        print(f"[ERROR] web_search fallback 재시도도 실패: model={model} status={second_err.status}")
-                        raise Exception(f"API Error ({second_err.status}): {second_err.body}") from second_err
+                    except APIStatusError as final_err:
+                        print(f"[ERROR] 최종 fallback도 실패: model={model} status={final_err.status}")
+                        raise Exception(f"API Error ({final_err.status}): {final_err.body}") from final_err
                 # web_search 무관 5xx 또는 일반 에러는 그대로 raise (기존 형식 유지)
                 raise Exception(f"API Error ({api_err.status}): {api_err.body}") from api_err
             except CompletionContentError as first_error:
