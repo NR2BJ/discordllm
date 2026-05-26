@@ -72,8 +72,7 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
-DEFAULT_ROUTE_MODEL = os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
-DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("LLM_ENABLE_ACTION_ROUTER", "0"))
+DEFAULT_IMAGE_PROMPT_MODEL = os.environ.get("LLM_IMAGE_PROMPT_MODEL") or os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_PRIVACY = os.environ.get("LLM_PROVIDER_PRIVACY", "allow")
 MEMORY_UPDATE_WINDOW = 8
@@ -82,37 +81,7 @@ CONTEXT_COMPRESSION_MIN_TOKENS = int(os.environ.get("LLM_CONTEXT_COMPRESSION_MIN
 TIMING_DEBUG_LOGS = is_enabled(os.environ.get("LLM_TIMING_DEBUG", "1"))
 PROVIDER_PRIVACY_MODES = ("allow", "deny")
 
-IMAGE_ACTION_NOUN_RE = re.compile(
-    r"(이미지|그림|사진|짤|일러스트|삽화|캐릭터|배경|썸네일|아이콘|로고|아바타|프로필|만화|웹툰|"
-    r"\bimage\b|\bpicture\b|\bphoto\b|\billustration\b|\bdrawing\b|\blogo\b|\bicon\b|\bthumbnail\b|\bmeme\b|\bavatar\b|\bwallpaper\b)",
-    re.IGNORECASE,
-)
-IMAGE_ACTION_VERB_RE = re.compile(
-    r"(그려|그림으로|이미지로|사진처럼|짤로|생성|만들|제작|렌더|편집|수정|변환|합성|지워|넣어|추가|바꿔|"
-    r"\bgenerate\b|\bdraw\b|\bcreate\b|\bmake\b|\brender\b|\bedit\b|\bmodify\b|\btransform\b|\bremove\b|\badd\b)",
-    re.IGNORECASE,
-)
-IMAGE_DRAW_REQUEST_RE = re.compile(r"(그려\s*(줘|봐|라)?|\bdraw\b|\bsketch\b)", re.IGNORECASE)
-CURRENT_IMAGE_EDIT_RE = re.compile(
-    r"(이거|이것|저거|저것|첨부|사진|이미지|그림|짤|reference|attached|this|that).{0,40}"
-    r"(편집|수정|변환|합성|지워|넣어|추가|바꿔|스타일|풍으로|배경|edit|modify|transform|remove|add|style|background)",
-    re.IGNORECASE,
-)
 IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-RECENT_IMAGE_INSPECTION_RE = re.compile(
-    r"((이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title).{0,60}"
-    r"(봐|봐봐|보라|보라고|보여|볼\s*수|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird)|"
-    r"(봐|봐봐|보라|보라고|보여|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird).{0,60}"
-    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title))",
-    re.IGNORECASE,
-)
-RECENT_IMAGE_REFERENCE_RE = re.compile(
-    r"((아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last).{0,40}"
-    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot)|"
-    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot).{0,40}"
-    r"(아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last))",
-    re.IGNORECASE,
-)
 
 _COMMON_RULES = """## General Rules
 - Output response content directly. No prefixes like 'Bot:' or 'Model:'.
@@ -150,28 +119,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
-RECENT_IMAGE_DIR = os.environ.get("LLM_RECENT_IMAGE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_recent_images"))
-RECENT_IMAGE_INDEX_FILE = os.path.join(RECENT_IMAGE_DIR, "index.json")
-RECENT_IMAGE_LIMIT = 2
-
-IMAGE_ROUTE_SCHEMA = {
-    "name": "image_route_decision",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["respond_text", "inspect_recent_images", "generate_image"],
-            },
-            "refined_prompt": {"type": "string"},
-            "use_recent_images": {"type": "boolean"},
-            "reason": {"type": "string"},
-        },
-        "required": ["action", "refined_prompt", "use_recent_images", "reason"],
-        "additionalProperties": False,
-    },
-}
 
 # ================= 2. 데이터 관리자 =================
 class DataManager:
@@ -193,78 +140,6 @@ class DataManager:
         except:
             pass
 
-
-class RecentImageStore:
-    def __init__(self, base_dir, index_file, *, limit=2):
-        self.base_dir = base_dir
-        self.index_file = index_file
-        self.limit = limit
-        os.makedirs(self.base_dir, exist_ok=True)
-        self.index = DataManager.load_json(self.index_file, {})
-
-    def _save(self):
-        DataManager.save_json(self.index_file, self.index)
-
-    def _entries(self, guild_id):
-        gid = str(guild_id)
-        entries = self.index.get(gid, [])
-        if not isinstance(entries, list):
-            entries = []
-        self.index[gid] = entries
-        return entries
-
-    def register_bytes(self, guild_id, *, channel_id, message_id, author_id, display_name, filename, image_bytes, source_kind):
-        gid = str(guild_id)
-        guild_dir = os.path.join(self.base_dir, gid)
-        os.makedirs(guild_dir, exist_ok=True)
-        ext = os.path.splitext(filename or "")[1].lower() or ".png"
-        safe_kind = re.sub(r"[^a-z0-9_]+", "_", (source_kind or "image").lower())
-        safe_name = re.sub(r"[^a-z0-9_]+", "_", os.path.splitext((filename or "image").lower())[0]).strip("_") or "image"
-        output_name = f"{int(message_id)}_{safe_kind}_{safe_name}{ext}"
-        output_path = os.path.join(guild_dir, output_name)
-        with open(output_path, "wb") as f:
-            f.write(image_bytes)
-
-        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
-        entries = [entry for entry in entries if entry.get("path") != output_path]
-        entries.append(
-            {
-                "guild_id": int(guild_id),
-                "channel_id": int(channel_id),
-                "message_id": int(message_id),
-                "author_id": int(author_id),
-                "display_name": display_name or str(author_id),
-                "filename": filename or output_name,
-                "path": output_path,
-                "source_kind": source_kind,
-                "created_at": datetime.now(KST).isoformat(),
-            }
-        )
-        while len(entries) > self.limit:
-            old = entries.pop(0)
-            try:
-                os.remove(old.get("path", ""))
-            except OSError:
-                pass
-        self.index[gid] = entries
-        self._save()
-
-    def list_recent(self, guild_id, *, channel_id=None):
-        gid = str(guild_id)
-        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
-        self.index[gid] = entries
-        if channel_id is not None:
-            entries = [entry for entry in entries if str(entry.get("channel_id")) == str(channel_id)]
-        return entries[-self.limit:]
-
-    def describe_recent(self, guild_id, *, channel_id=None):
-        entries = self.list_recent(guild_id, channel_id=channel_id)
-        if not entries:
-            return "No recent images are stored."
-        return "\n".join(
-            f"{idx}. {entry.get('source_kind', 'image')} | {entry.get('display_name', 'unknown')} | {entry.get('filename', 'image')}"
-            for idx, entry in enumerate(reversed(entries), start=1)
-        )
 
 class DocumentCache:
     def __init__(self, cache_dir):
@@ -1113,7 +988,28 @@ class OpenRouterBot(commands.Bot):
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
-        self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
+        self._migrate_legacy_router_keys()
+
+    def _migrate_legacy_router_keys(self):
+        """라우터 제거에 따른 cfg 마이그레이션:
+        - 옛 `route_model` → 새 `image_prompt_model` (있으면)
+        - 옛 `action_router` 키 제거
+        """
+        changed = False
+        for gid, cfg in self.server_configs.items():
+            if not isinstance(cfg, dict):
+                continue
+            if "route_model" in cfg:
+                if "image_prompt_model" not in cfg and cfg.get("route_model"):
+                    cfg["image_prompt_model"] = cfg["route_model"]
+                    print(f"[MIGRATE] guild {gid}: route_model → image_prompt_model='{cfg['image_prompt_model']}'")
+                cfg.pop("route_model", None)
+                changed = True
+            if "action_router" in cfg:
+                cfg.pop("action_router", None)
+                changed = True
+        if changed:
+            DataManager.save_json(CONFIG_FILE, self.server_configs)
 
     async def setup_hook(self):
         await self.or_client.fetch_models_metadata()
@@ -1133,18 +1029,19 @@ class OpenRouterBot(commands.Bot):
                 "provider_order": [],
                 "history_limit": HISTORY_LIMIT,
                 "image_history_limit": IMAGE_HISTORY_LIMIT,
-                "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
-                "route_model": DEFAULT_ROUTE_MODEL,
+                "image_prompt_model": DEFAULT_IMAGE_PROMPT_MODEL,
             }
         self.server_configs[gid].setdefault("fallback_model", DEFAULT_IMAGE_MODEL)
         self.server_configs[gid].setdefault("provider_privacy", DEFAULT_PROVIDER_PRIVACY)
         self.server_configs[gid].setdefault("provider_order", [])
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
         self.server_configs[gid].setdefault("image_history_limit", IMAGE_HISTORY_LIMIT)
-        self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
-        self.server_configs[gid].setdefault("route_model", DEFAULT_ROUTE_MODEL)
+        self.server_configs[gid].setdefault("image_prompt_model", DEFAULT_IMAGE_PROMPT_MODEL)
         self.server_configs[gid].pop("provider_policy", None)
         self.server_configs[gid].pop("provider_allow_fallbacks", None)
+        # 옛 라우터 키 정리 (재진입 시 대비)
+        self.server_configs[gid].pop("route_model", None)
+        self.server_configs[gid].pop("action_router", None)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -1238,13 +1135,6 @@ def infer_attachment_mime(attachment, detected_mime=None):
     if is_image_attachment(attachment):
         return guess_image_mime(getattr(attachment, "filename", None))
     return "application/octet-stream"
-
-
-def build_recent_image_hint(guild_id, *, channel_id=None):
-    return (
-        "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
-        f"{bot.recent_image_store.describe_recent(guild_id, channel_id=channel_id)}"
-    )
 
 
 async def send_long_message(channel, content):
@@ -1665,134 +1555,6 @@ def should_use_context_compression(messages):
     return CONTEXT_COMPRESSION_MIN_TOKENS > 0 and estimate_message_text_tokens(messages) >= CONTEXT_COMPRESSION_MIN_TOKENS
 
 
-def has_image_generation_signal(text, *, has_current_images=False):
-    text = (text or "").strip()
-    if not text:
-        return False
-    if IMAGE_DRAW_REQUEST_RE.search(text):
-        return True
-    if IMAGE_ACTION_NOUN_RE.search(text) and IMAGE_ACTION_VERB_RE.search(text):
-        return True
-    if has_current_images and CURRENT_IMAGE_EDIT_RE.search(text):
-        return True
-    return False
-
-
-def has_recent_image_reference_signal(text):
-    text = (text or "").strip()
-    if not text:
-        return False
-    return bool(RECENT_IMAGE_REFERENCE_RE.search(text))
-
-
-def has_recent_image_inspection_signal(text):
-    text = (text or "").strip()
-    if not text:
-        return False
-    return bool(RECENT_IMAGE_INSPECTION_RE.search(text))
-
-
-def should_call_action_router(
-    text,
-    *,
-    has_current_images=False,
-    has_recent_images=False,
-    allow_image_generation=True,
-    allow_recent_images=True,
-):
-    if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
-        return True
-    if allow_recent_images and has_recent_images and has_recent_image_inspection_signal(text):
-        return True
-    if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
-        return True
-    return False
-
-
-async def decide_message_action(config, history_messages, current_user_text, guild_id, *, channel_id=None, has_current_images=False):
-    route_model = normalize_model_id((config or {}).get("route_model") or DEFAULT_ROUTE_MODEL or (config or {}).get("model") or DEFAULT_MODEL)
-    excerpt = build_recent_conversation_excerpt(history_messages, current_user_text)
-    recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
-    if recent_images and not has_current_images and has_recent_image_inspection_signal(current_user_text):
-        return {
-            "action": "inspect_recent_images",
-            "refined_prompt": "",
-            "use_recent_images": True,
-            "reason": "direct_recent_image_inspection_signal",
-        }
-
-    inspect_action_text = ""
-    inspect_rule_text = ""
-    recent_image_hint = ""
-    if recent_images:
-        inspect_action_text = "- inspect_recent_images: the app should reattach the stored recent images before answering.\n"
-        inspect_rule_text = (
-            "- Choose inspect_recent_images only when the user is asking about something visible in a previous image.\n"
-            "- `use_recent_images` should be true only when the app should attach the stored recent images as references.\n"
-        )
-        recent_image_hint = f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n\n"
-    route_prompt = (
-        "You are a routing planner for a Discord AI bot.\n"
-        "Decide the next action for the assistant.\n\n"
-        "Available actions:\n"
-        "- respond_text: normal text reply.\n"
-        f"{inspect_action_text}"
-        "- generate_image: the app should send a refined English prompt to the image generation model.\n\n"
-        "Rules:\n"
-        "- Do not choose inspect_recent_images if the current message already includes image attachments.\n"
-        "- Do not infer that product names, drinks, people, or objects refer to stored images by themselves.\n"
-        "- Do not choose generate_image unless the user clearly wants image creation or a visual edit/transformation.\n"
-        f"{inspect_rule_text}\n"
-        f"Current message has image attachments: {has_current_images}\n\n"
-        f"{recent_image_hint}"
-        f"Recent conversation excerpt:\n{excerpt or '(empty)'}\n\n"
-        f"Current user message:\n{current_user_text}"
-    )
-    try:
-        response_text, _, _, _ = await bot.or_client.chat_completion(
-            route_model,
-            [
-                {"role": "system", "content": "Return valid JSON only."},
-                {"role": "user", "content": route_prompt},
-            ],
-            provider=build_provider_preferences(config),
-            cache_control=build_prompt_cache_control(route_model, [
-                {"content": route_prompt},
-            ]),
-        )
-        payload = coerce_json_object(response_text)
-    except Exception as e:
-        print(f"⚠️ 이미지 라우팅 실패: {e}")
-        payload = None
-
-    if not payload:
-        if has_image_generation_signal(current_user_text, has_current_images=has_current_images):
-            return {
-                "action": "generate_image",
-                "refined_prompt": "",
-                "use_recent_images": False,
-                "reason": "route_failed_direct_image_signal",
-            }
-        return {
-            "action": "respond_text",
-            "refined_prompt": "",
-            "use_recent_images": False,
-            "reason": "route_parse_failed",
-        }
-    action = payload.get("action", "respond_text")
-    if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
-        action = "respond_text"
-    if action == "inspect_recent_images" and (has_current_images or not recent_images):
-        action = "respond_text"
-        payload["use_recent_images"] = False
-    return {
-        "action": action,
-        "refined_prompt": (payload.get("refined_prompt") or "").strip(),
-        "use_recent_images": bool(payload.get("use_recent_images", False)),
-        "reason": (payload.get("reason") or "").strip(),
-    }
-
-
 def coerce_json_object(text):
     if isinstance(text, dict):
         return text
@@ -1814,93 +1576,6 @@ def coerce_json_object(text):
     except Exception:
         return None
 
-
-def build_recent_conversation_excerpt(history_messages, current_user_text):
-    lines = []
-    for message in history_messages[-MEMORY_UPDATE_WINDOW:]:
-        content = message.get("content", [])
-        if isinstance(content, list):
-            text_blocks = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
-            if text_blocks:
-                lines.append(sanitize_for_memory_excerpt("\n".join(text_blocks).strip()))
-        elif isinstance(content, str):
-            lines.append(sanitize_for_memory_excerpt(content.strip()))
-    if current_user_text:
-        lines.append(sanitize_for_memory_excerpt(current_user_text.strip()))
-    return "\n\n".join(line for line in lines if line)
-
-
-async def handle_natural_image_request(message, config, history_messages, current_user_text, *, reference_inputs=None):
-    base_model_info = await bot.or_client.resolve_model_info(config["model"])
-    base_caps = bot.or_client.analyze_model_capabilities(config["model"], model_info=base_model_info)
-    generation_model, generation_source = get_active_generation_model(config, base_caps)
-    if not generation_model:
-        await message.channel.send("❌ 현재 설정에서는 채팅 이미지 생성을 사용할 수 없습니다. `/model image`로 폴백 이미지를 설정해보세요.")
-        return True
-
-    model_info, _, caps, error = await validate_model_for_use(generation_model, require_output="image")
-    if error:
-        await message.channel.send(f"❌ {error}")
-        return True
-    if reference_inputs and "image" not in caps["input"]:
-        await message.channel.send(
-            f"❌ `{model_info['id']}` 모델은 참조 이미지 입력을 지원하지 않습니다. `/model image`로 이미지 입력을 지원하는 모델을 선택해보세요."
-        )
-        return True
-
-    excerpt = build_recent_conversation_excerpt(history_messages, "")
-    prompt_parts = []
-    if excerpt:
-        prompt_parts.append(f"[Recent Conversation]\n{excerpt}")
-    prompt_parts.append(f"[Current Request]\n{current_user_text}")
-    prompt_text = "\n\n".join(part for part in prompt_parts if part)
-    content = [{"type": "text", "text": prompt_text}]
-    if reference_inputs:
-        content.extend(reference_inputs)
-
-    response, usage, images, _ = await bot.or_client.chat_completion(
-        model_info["id"],
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Generate the requested image. "
-                    "Use recent conversation only when directly relevant to the current visual request. "
-                    "Keep any text response brief."
-                ),
-            },
-            {"role": "user", "content": content},
-        ],
-        capabilities=caps,
-        provider=build_provider_preferences(config),
-        cache_control=build_prompt_cache_control(model_info["id"], [
-            {"content": prompt_text},
-        ]),
-    )
-
-    response = clean_assistant_response_text(response)
-    if response and response != "...":
-        await send_long_message(message.channel, response)
-    else:
-        label = "현재 모델" if generation_source == "current-model" else "폴백 이미지 모델"
-        await message.channel.send(f"🖼️ {label} `{model_info['id']}`로 이미지 생성 완료")
-
-    async def _register(binary, ext, idx):
-        bot.recent_image_store.register_bytes(
-            message.guild.id,
-            channel_id=message.channel.id,
-            message_id=message.id,
-            author_id=bot.user.id,
-            display_name=get_bot_display_name(),
-            filename=f"chat_image_{idx}.{ext}",
-            image_bytes=binary,
-            source_kind="bot_generated",
-        )
-
-    sent = await send_generated_images(message.channel.send, images, filename_prefix="chat_image", on_sent=_register)
-    if sent == 0:
-        await message.channel.send("⚠️ 이미지 생성 응답은 왔지만 실제 이미지 데이터가 없었습니다. 문장을 조금 더 구체적으로 바꿔 다시 요청해보세요.")
-    return True
 
 # ================= 6. 이벤트 핸들러 =================
 @tasks.loop(hours=1)
@@ -1957,9 +1632,6 @@ async def on_message(message):
                 can_see_video = "video" in caps["input"]
                 can_see_audio = "audio" in caps["input"]
                 can_gen_image = "image" in caps["output"]
-                action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
-                image_command_model, _ = get_active_generation_model(config, base_caps)
-                has_chat_image_support = action_router_enabled and bool(image_command_model)
                 current_display_name = get_server_display_name(message.guild, message.author)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
                 timing_mark("caps")
@@ -1972,10 +1644,9 @@ async def on_message(message):
                     capability_hints.append("You can analyze video files attached by users.")
                 if can_see_audio:
                     capability_hints.append("You can analyze audio files attached by users.")
-                if has_chat_image_support:
-                    capability_hints.append("Chat image generation is available when the user explicitly asks you to create an image.")
                 if config.get("search"):
                     capability_hints.append("Web search is available for up-to-date information when needed.")
+                capability_hints.append("Image generation is only available via the `/image` slash command, not in chat.")
 
                 cannot_hints = []
                 if not can_see_image:
@@ -1984,8 +1655,6 @@ async def on_message(message):
                     cannot_hints.append("analyze videos")
                 if not can_see_audio:
                     cannot_hints.append("analyze audio")
-                if not has_chat_image_support:
-                    cannot_hints.append("generate images in chat")
                 if cannot_hints:
                     capability_hints.append(
                         f"You CANNOT {', '.join(cannot_hints)}. If asked, politely explain the limitation and point the user to the relevant slash command if helpful."
@@ -2006,7 +1675,6 @@ async def on_message(message):
                 image_history_limit = get_image_history_limit(config)
                 history_scan_limit = max(history_limit, image_history_limit)
                 history_inline_images = 0
-                history_reference_inputs = []
 
                 async for msg in message.channel.history(limit=history_scan_limit + 10):
                     if msg.id == message.id:
@@ -2059,7 +1727,6 @@ async def on_message(message):
                                         b64 = base64.b64encode(raw).decode("utf-8")
                                         image_part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
                                         image_inputs.append(image_part)
-                                        history_reference_inputs.append(image_part)
                                         history_inline_images += 1
                                     else:
                                         text_content += " (image download failed)"
@@ -2183,16 +1850,6 @@ async def on_message(message):
                                     current_content.append(image_part)
                                     has_media = True
                                 print(f"[ATT] 이미지 base64 인코딩 완료: {att.filename} ({len(b64)} chars)")
-                                bot.recent_image_store.register_bytes(
-                                    message.guild.id,
-                                    channel_id=message.channel.id,
-                                    message_id=message.id,
-                                    author_id=message.author.id,
-                                    display_name=current_display_name,
-                                    filename=att.filename,
-                                    image_bytes=raw,
-                                    source_kind="user_upload",
-                                )
                                 if not can_see_image:
                                     user_text += f"\n(User attached an image: {att.filename})"
                             else:
@@ -2225,88 +1882,12 @@ async def on_message(message):
                                 user_text += f"\n(User attached an image: {att.filename})"
                 timing_mark(f"attachments current_images={len(current_image_inputs)}")
 
-                recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
-                direct_recent_image_inspection = (
-                    recent_images_available
-                    and not current_image_inputs
-                    and has_recent_image_inspection_signal(message.content)
-                )
-                if direct_recent_image_inspection and not can_see_image:
-                    await message.channel.send(
-                        f"❌ `{current_model}` 모델은 과거 이미지를 다시 분석할 수 없습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
-                    )
-                    return
-
-                should_route_action = action_router_enabled and should_call_action_router(
-                    message.content,
-                    has_current_images=bool(current_image_inputs),
-                    has_recent_images=recent_images_available,
-                    allow_image_generation=has_chat_image_support,
-                    allow_recent_images=can_see_image,
-                )
-
-                if current_image_inputs and not can_see_image and not should_route_action:
-                    await message.channel.send(
-                        f"❌ `{current_model}` 모델은 이미지 분석을 지원하지 않습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
-                    )
-                    return
-
-                route = {
-                    "action": "respond_text",
-                    "refined_prompt": "",
-                    "use_recent_images": False,
-                    "reason": "action_router_skipped",
-                }
-                if direct_recent_image_inspection:
-                    route = {
-                        "action": "inspect_recent_images",
-                        "refined_prompt": "",
-                        "use_recent_images": True,
-                        "reason": "direct_recent_image_inspection_signal",
-                    }
-                elif should_route_action:
-                    route = await decide_message_action(
-                        config,
-                        history_buffer,
-                        user_text,
-                        message.guild.id,
-                        channel_id=message.channel.id,
-                        has_current_images=bool(current_image_inputs),
-                    )
-                timing_mark(
-                    f"route enabled={action_router_enabled} prefilter={should_route_action} action={route.get('action')}"
-                )
-
-                if route.get("action") == "generate_image":
-                    reference_inputs = list(current_image_inputs)
-                    if not reference_inputs and route.get("use_recent_images"):
-                        reference_inputs = list(history_reference_inputs)
-                    handled = await handle_natural_image_request(
-                        message,
-                        config,
-                        history_buffer,
-                        route.get("refined_prompt") or message.content,
-                        reference_inputs=reference_inputs,
-                    )
-                    if handled:
-                        return
-
+                # 현재 메시지에 이미지 첨부됐는데 모델이 비전 미지원이면 거부
                 if current_image_inputs and not can_see_image:
                     await message.channel.send(
                         f"❌ `{current_model}` 모델은 이미지 분석을 지원하지 않습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
                     )
                     return
-
-                if route.get("action") == "inspect_recent_images" and not current_image_inputs and route.get("use_recent_images"):
-                    if not can_see_image:
-                        await message.channel.send(
-                            f"❌ `{current_model}` 모델은 과거 이미지를 다시 분석할 수 없습니다. 비전 입력을 지원하는 `/model set` 모델로 바꿔보세요."
-                        )
-                        return
-                    print(
-                        f"[IMG] 과거 이미지 요청: history_inline_images={history_inline_images} "
-                        f"image_history={image_history_limit} reason={route.get('reason')}"
-                    )
 
                 current_content.append({"type": "text", "text": prepend_user_identity(user_text, message.guild, message.author, kind="current")})
                 messages.append({"role": "user", "content": current_content})
@@ -2427,19 +2008,8 @@ async def on_message(message):
 
                 if response:
                     await send_long_message(message.channel, response)
-                async def _register(binary, ext, idx):
-                    bot.recent_image_store.register_bytes(
-                        message.guild.id,
-                        channel_id=message.channel.id,
-                        message_id=message.id,
-                        author_id=bot.user.id,
-                        display_name=get_bot_display_name(),
-                        filename=f"response_image_{idx}.{ext}",
-                        image_bytes=binary,
-                        source_kind="bot_generated",
-                    )
 
-                await send_generated_images(message.channel.send, images, on_sent=_register)
+                await send_generated_images(message.channel.send, images)
 
             except Exception as e:
                 print(f"❌ 오류: {str(e)}")
@@ -2456,16 +2026,16 @@ async def image_generation_model_autocomplete(interaction: discord.Interaction, 
         predicate=lambda m: "image" in bot.or_client.analyze_model_capabilities(m["id"], model_info=m)["output"],
     )
 
-async def route_model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+async def image_prompt_model_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     current_lower = current.lower()
     special_choices = [
-        app_commands.Choice(name="off - 보조 라우터 끄기", value="off"),
         app_commands.Choice(name="current - 현재 채팅 모델 사용", value="current"),
     ]
     choices = [
         choice for choice in special_choices
         if current_lower in choice.name.lower() or current_lower in choice.value.lower()
     ]
+    # 이미지 prompt 다듬는 텍스트 모델 — vision 입력 지원 모델이면 reference 같이 분석 가능 (하이브리드)
     model_choices = await build_model_choices(
         current,
         predicate=lambda m: "text" in bot.or_client.analyze_model_capabilities(m["id"], model_info=m)["output"],
@@ -2583,37 +2153,28 @@ async def set_fallback_model(interaction: discord.Interaction, model_id: str):
     )
 
 
-@model_group.command(name="router", description="자연어 이미지 라우터 보조 모델 설정")
-@app_commands.autocomplete(model_id=route_model_autocomplete)
-@app_commands.describe(model_id="보조 라우터 모델 ID, current, off/clear")
-async def set_route_model(interaction: discord.Interaction, model_id: str | None = None):
+@model_group.command(name="image_prompt", description="/image 슬래시 커맨드에서 prompt 다듬는 텍스트 모델 설정")
+@app_commands.autocomplete(model_id=image_prompt_model_autocomplete)
+@app_commands.describe(model_id="텍스트 모델 ID 또는 current (현재 채팅 모델 사용)")
+async def set_image_prompt_model(interaction: discord.Interaction, model_id: str | None = None):
     config = bot.get_config(interaction.guild_id)
     actor_name = get_server_display_name(interaction.guild, interaction.user)
-    current_route = config.get("route_model") or config.get("model") or DEFAULT_MODEL
+    current_setting = config.get("image_prompt_model") or "(현재 채팅 모델)"
 
     if model_id is None:
-        state = "ON" if is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED)) else "OFF"
         await interaction.response.send_message(
-            f"현재 보조 라우터: **{state}**\n"
-            f"모델: `{current_route}`"
+            f"현재 /image prompt 다듬는 모델: `{current_setting}`\n"
+            f"채팅 모델: `{config.get('model', DEFAULT_MODEL)}`"
         )
         return
 
     await interaction.response.defer()
     clean_id = normalize_model_id(model_id)
-    if clean_id.lower() in ("clear", "none", "off", "disable", "disabled"):
-        config["action_router"] = False
-        config["route_model"] = None
-        bot.save_config()
-        await interaction.followup.send(f"✅ {actor_name}님이 보조 라우터를 껐습니다.")
-        return
-
     if clean_id.lower() in ("current", "auto", "default"):
-        config["action_router"] = True
-        config["route_model"] = None
+        config["image_prompt_model"] = None
         bot.save_config()
         await interaction.followup.send(
-            f"✅ {actor_name}님이 보조 라우터를 현재 채팅 모델 `{config['model']}` 기준으로 켰습니다."
+            f"✅ {actor_name}님이 /image prompt 다듬는 모델을 현재 채팅 모델로 설정했습니다."
         )
         return
 
@@ -2626,12 +2187,11 @@ async def set_route_model(interaction: discord.Interaction, model_id: str | None
         await interaction.followup.send(f"❌ {error}")
         return
 
-    config["action_router"] = True
-    config["route_model"] = model_info["id"]
+    config["image_prompt_model"] = model_info["id"]
     bot.save_config()
     endpoint_suffix = f" | 엔드포인트: {len(endpoints)}개" if endpoints is not None else ""
     await interaction.followup.send(
-        f"✅ {actor_name}님이 보조 라우터 모델을 설정했습니다.\n"
+        f"✅ {actor_name}님이 /image prompt 다듬는 모델을 설정했습니다.\n"
         f"**{model_info['name']}** (`{model_info['id']}`){endpoint_suffix}"
     )
 
@@ -2789,24 +2349,14 @@ async def dashboard(interaction: discord.Interaction):
     if endpoints is not None:
         embed.add_field(name="🛰️ Routing", value=f"• **Available Endpoints:** {len(endpoints)}", inline=True)
 
-    action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
-    route_model_status = config.get("route_model") or "current chat model"
-    image_command_model, image_command_source = get_active_generation_model(config, caps)
-    if not action_router_enabled:
-        image_command_status = "Natural chat routing OFF"
-    elif not image_command_model:
-        image_command_status = "Unavailable"
-    elif image_command_source == "current-model":
-        image_command_status = "Uses current model"
-    else:
-        image_command_status = f"Uses fallback `{image_command_model}`"
+    image_prompt_model_status = config.get("image_prompt_model") or "(current chat model)"
+    image_model_status = config.get("fallback_model") or DEFAULT_IMAGE_MODEL or "(none)"
 
     helpers = [
         f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
-        f"• **Action Router:** {'ON' if action_router_enabled else 'OFF'}",
-        f"• **Router Model:** `{route_model_status}`",
-        f"• **Chat Image:** {image_command_status}",
-        f"• **Image Models:** {count_image_generation_models()} discovered",
+        f"• **/image — image model:** `{image_model_status}`",
+        f"• **/image — prompt refiner:** `{image_prompt_model_status}`",
+        f"• **Image Models discovered:** {count_image_generation_models()}",
         f"• **Provider:** {format_provider_mode(config)}",
         f"• **History:** {get_history_limit(config)} text / {get_image_history_limit(config)} image messages",
     ]
@@ -2842,6 +2392,171 @@ async def toggle_search(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"✅ 웹 검색: **{state}**\n방식: `openrouter:web_search` server tool\n기본 모델: `{config['model']}`"
     )
+
+
+@bot.tree.command(name="image", description="이미지 생성 (prompt → 텍스트 모델로 다듬은 후 이미지 모델 호출)")
+@app_commands.describe(
+    prompt="생성할 이미지에 대한 설명 (한국어/영어 자유)",
+    reference="참조 이미지 파일 (선택, image-to-image 지원 모델에서만 사용)",
+    reference_url="참조 이미지 URL (선택)",
+)
+async def image_command(
+    interaction: discord.Interaction,
+    prompt: str,
+    reference: discord.Attachment | None = None,
+    reference_url: str | None = None,
+):
+    await interaction.response.defer()
+    config = bot.get_config(interaction.guild_id) if interaction.guild_id else {}
+    actor_name = (
+        get_server_display_name(interaction.guild, interaction.user)
+        if interaction.guild else interaction.user.display_name
+    )
+
+    # 1. 이미지 모델 결정 + capability 확인
+    image_model_id = config.get("fallback_model") or DEFAULT_IMAGE_MODEL
+    if not image_model_id:
+        await interaction.followup.send(
+            "❌ 이미지 모델이 설정되지 않았습니다. `/model image <model_id>`로 먼저 설정해주세요."
+        )
+        return
+    image_info, _, image_caps, image_error = await validate_model_for_use(
+        image_model_id, require_output="image"
+    )
+    if image_error:
+        await interaction.followup.send(f"❌ 이미지 모델 오류: {image_error}")
+        return
+    image_supports_input = "image" in image_caps["input"]
+
+    # 2. Prompt 다듬는 모델 결정 + capability 확인
+    prompt_model_id = config.get("image_prompt_model") or config.get("model") or DEFAULT_MODEL
+    prompt_info, _, prompt_caps, prompt_error = await validate_model_for_use(
+        prompt_model_id, require_output="text"
+    )
+    if prompt_error:
+        await interaction.followup.send(f"❌ Prompt 다듬는 모델 오류: {prompt_error}")
+        return
+    prompt_model_supports_vision = "image" in prompt_caps["input"]
+
+    # 3. Reference 이미지 다운로드 (있으면)
+    reference_b64 = None
+    reference_mime = None
+    if reference is not None:
+        if not is_image_attachment(reference):
+            await interaction.followup.send("❌ 첨부 파일이 이미지 형식이 아닙니다.")
+            return
+        raw, mime = await download_binary(reference.url)
+        if not raw:
+            await interaction.followup.send("❌ 첨부 이미지를 다운로드하지 못했습니다.")
+            return
+        reference_mime = infer_attachment_mime(reference, mime)
+        reference_b64 = base64.b64encode(raw).decode("utf-8")
+    elif reference_url:
+        if not reference_url.lower().startswith(("http://", "https://")):
+            await interaction.followup.send("❌ reference_url은 http(s) 형식이어야 합니다.")
+            return
+        b64, mime = await encode_image(reference_url)
+        if not b64:
+            await interaction.followup.send("❌ URL에서 이미지를 가져오지 못했습니다.")
+            return
+        reference_b64 = b64
+        reference_mime = mime or "image/png"
+
+    has_reference = reference_b64 is not None
+
+    # 4. 사용자 입력 표시 + status 메시지
+    user_display = f"**{actor_name}:** {prompt}"
+    if has_reference:
+        user_display += " *(reference 이미지 포함)*"
+    await interaction.followup.send(user_display)
+
+    notes = []
+    if has_reference and not image_supports_input:
+        notes.append(f"⚠️ 이미지 모델 `{image_model_id}`은 reference 미지원 — 새로 생성됨")
+    if has_reference and not prompt_model_supports_vision:
+        notes.append(f"⚠️ Prompt 다듬는 모델 `{prompt_model_id}`은 vision 미지원 — reference 분석 없이 텍스트만으로 다듬음")
+
+    status_msg = await interaction.followup.send(
+        f"⏳ Prompt 다듬는 중... (`{prompt_model_id}`)"
+        + ("\n" + "\n".join(notes) if notes else "")
+    )
+
+    # 5. Prompt 다듬기 호출 (옵션 Y: 항상 prompt 다듬는 모델 거침)
+    refine_system = (
+        "You are a prompt refiner for an AI image generation model. "
+        "Rewrite the user's request into a detailed, vivid English prompt suitable for diffusion or image generation models. "
+        "Be specific about subject, style, lighting, composition, mood, and key visual details. "
+        "Keep it under ~500 words. "
+        "Output ONLY the refined prompt — no preamble, no quotes, no explanation."
+    )
+    refine_user_parts = [{"type": "text", "text": prompt}]
+    if has_reference and prompt_model_supports_vision:
+        refine_user_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{reference_mime};base64,{reference_b64}"},
+        })
+    refine_messages = [
+        {"role": "system", "content": refine_system},
+        {"role": "user", "content": refine_user_parts},
+    ]
+    try:
+        refined_text, _, _, _ = await bot.or_client.chat_completion(
+            prompt_model_id,
+            refine_messages,
+            provider=build_provider_preferences(config),
+        )
+        refined_text = (refined_text or "").strip() or prompt
+        if len(refined_text) > 2000:
+            refined_text = refined_text[:2000]
+    except Exception as e:
+        print(f"⚠️ /image prompt 다듬기 실패, 원본 사용: {e}")
+        refined_text = prompt
+
+    # 6. 이미지 생성 호출
+    await status_msg.edit(content=(
+        f"🎨 이미지 생성 중... (`{image_model_id}`)\n"
+        f"**Refined Prompt:** ```{refined_text[:1500]}```"
+        + ("\n" + "\n".join(notes) if notes else "")
+    ))
+
+    if has_reference and image_supports_input:
+        image_messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": refined_text},
+                {"type": "image_url", "image_url": {"url": f"data:{reference_mime};base64,{reference_b64}"}},
+            ],
+        }]
+    else:
+        image_messages = [{"role": "user", "content": refined_text}]
+
+    try:
+        _, _, images, _ = await bot.or_client.chat_completion(
+            image_model_id,
+            image_messages,
+            capabilities=image_caps,
+            provider=build_provider_preferences(config),
+        )
+        if not images:
+            await status_msg.edit(content=f"❌ 이미지 생성 실패 — 응답에 이미지 데이터 없음 (`{image_model_id}`)")
+            return
+        await send_generated_images(interaction.followup.send, images)
+        ref_suffix = ""
+        if has_reference:
+            if image_supports_input:
+                ref_suffix += " | reference 사용"
+            else:
+                ref_suffix += " | reference 무시 (모델 미지원)"
+            if prompt_model_supports_vision:
+                ref_suffix += " | reference 분석됨"
+        await status_msg.edit(content=(
+            f"✅ 생성 완료 — 이미지 모델: `{image_model_id}` / prompt: `{prompt_model_id}`{ref_suffix}"
+        ))
+        print(f"  [/image] image_model={image_model_id} prompt_model={prompt_model_id} "
+              f"reference={has_reference} images={len(images)} refined='{refined_text[:80]}'")
+    except Exception as e:
+        print(f"❌ /image 생성 실패: {e}")
+        await status_msg.edit(content=f"❌ 이미지 생성 실패: {str(e)[:300]}")
 
 @model_group.command(name="refresh", description="OpenRouter 모델 리스트 즉시 갱신")
 async def refresh_models_cmd(interaction: discord.Interaction):
