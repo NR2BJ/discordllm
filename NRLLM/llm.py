@@ -473,10 +473,11 @@ def normalize_model_id(model_id):
 
 # ================= 3. OpenRouter API 클라이언트 =================
 class CompletionContentError(Exception):
-    def __init__(self, message, *, reasoning_only=False, finish_reason="unknown"):
+    def __init__(self, message, *, reasoning_only=False, finish_reason="unknown", retryable=True):
         super().__init__(message)
         self.reasoning_only = reasoning_only
         self.finish_reason = finish_reason
+        self.retryable = retryable
 
 
 class APIStatusError(Exception):
@@ -640,10 +641,26 @@ class OpenRouterClient:
             return "Multimodal (" + ", ".join(parts) + ")"
         return "Text Generation"
 
-    def _parse_completion_output(self, data):
+    def _parse_completion_output(self, data, raw_text=""):
         import ast  # 문자열 형태의 리스트 파싱을 위해 추가
 
+        # 200 OK인데 body가 null이거나 choices가 비정상인 경우 방어
+        # (예: minimax 등 일부 provider가 타임아웃/블록 시 빈 body를 200으로 반환 → 기존엔 NoneType 크래시)
+        def _malformed(reason_label):
+            snippet = (raw_text or "").strip() or "(빈 응답 본문)"
+            if len(snippet) > 1200:
+                snippet = snippet[:1200] + " …(이하 생략)"
+            return CompletionContentError(
+                f"모델이 200 OK로 비정상 응답을 반환했습니다 ({reason_label}).\n[응답 원문]\n{snippet}",
+                finish_reason="malformed_body",
+                retryable=False,
+            )
+
+        if not isinstance(data, dict) or not isinstance(data.get('choices'), list) or not data['choices']:
+            raise _malformed("choices 없음")
         choice = data['choices'][0]
+        if not isinstance(choice, dict):
+            raise _malformed("choices[0]가 비정상")
         usage = data.get('usage', {})
         message = choice.get('message', {})
         raw_content = message.get('content', '')
@@ -841,10 +858,14 @@ class OpenRouterClient:
                         or resp.headers.get("X-Provider-Name")
                     )
                     if resp.status == 200:
-                        data = await resp.json()
+                        raw_text = await resp.text()
+                        try:
+                            data = json.loads(raw_text) if raw_text and raw_text.strip() else None
+                        except Exception:
+                            data = None
                         if not provider_used and isinstance(data, dict):
                             provider_used = data.get("provider")
-                        final_content, usage, images, full_data = self._parse_completion_output(data)
+                        final_content, usage, images, full_data = self._parse_completion_output(data, raw_text=raw_text)
                         return final_content, usage, images, full_data
                     error_text = await resp.text()
                     if not provider_used:
@@ -964,6 +985,10 @@ class OpenRouterClient:
                 # web_search 무관 5xx 또는 일반 에러는 그대로 raise (기존 형식 유지)
                 raise Exception(f"API Error ({api_err.status}): {api_err.body}") from api_err
             except CompletionContentError as first_error:
+                if not first_error.retryable:
+                    # 비정상 body 등 재시도 무의미 → 사용자에게 응답 원문 그대로 노출
+                    print(f"[WARN] malformed completion (no retry): model={model} finish_reason={first_error.finish_reason}")
+                    raise
                 print(
                     "[WARN] completion content empty; retrying once "
                     f"(model={model}, reasoning_only={first_error.reasoning_only}, finish_reason={first_error.finish_reason})"
