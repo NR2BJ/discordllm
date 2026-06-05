@@ -840,11 +840,16 @@ class OpenRouterClient:
         # 추론형 모델: 토큰 수를 직접 박지 않고 effort로 reasoning 예산을 자동 스케일한다.
         # effort="high"는 모델별 한도의 약 0.8 비율로 OpenRouter가 변환하므로, 토큰 수를
         # 하드코딩하지 않고도 "허용 최대선에서 자동 조절(과도 제한 없음)"에 해당한다.
-        # reasoning 미지원 모델에는 주입하지 않아 불필요한 endpoint 필터링을 피한다.
-        model_meta = self.get_model_info(model)
-        supported = (model_meta or {}).get("supported_parameters") or []
-        if isinstance(supported, list) and any(str(s).lower() == "reasoning" for s in supported):
-            payload.setdefault("reasoning", {"effort": "high"})
+        # 주의: require_parameter_support(=provider.require_parameters)가 켜진 경우엔 주입하지 않는다.
+        #   reasoning은 best-effort 옵션인데, require_parameters와 함께 보내면 OpenRouter가
+        #   "reasoning까지 지원하는 endpoint"로만 라우팅을 좁혀(특히 web_fetch tool 동반 시)
+        #   reasoning 가능 모델에서도 endpoint가 0개가 될 수 있다.
+        # reasoning 미지원 모델에도 주입하지 않아 불필요한 endpoint 필터링을 피한다.
+        if not require_parameter_support:
+            model_meta = self.get_model_info(model)
+            supported = (model_meta or {}).get("supported_parameters") or []
+            if isinstance(supported, list) and any(str(s).lower() == "reasoning" for s in supported):
+                payload.setdefault("reasoning", {"effort": "high"})
 
         # web_search 켜졌고 차단 캐시에 provider 있으면 ignore 리스트로 주입
         if enable_web_search:
@@ -1015,19 +1020,31 @@ class OpenRouterClient:
                     f"finish_reason={first_error.finish_reason}, provider={first_error.provider or '?'})"
                 )
                 MAX_CONTENT_RETRIES = 2
+                # _build_content_retry_payload가 이미 deepcopy를 반환하므로 루프에선 provider만
+                # 새로 만들어 끼운다(전체 재-deepcopy 불필요). ignore는 호출 간 누적한다.
                 retry_payload = self._build_content_retry_payload(payload)
-                current_err = first_error
-                last_err = first_error
+                ignore_acc = []  # OpenRouter가 보고한 원본 케이스 그대로 유지(대소문자 무시 dedup)
+
+                def _add_ignore(name):
+                    if name and name.lower() not in {x.lower() for x in ignore_acc}:
+                        ignore_acc.append(name)
+
+                _add_ignore(first_error.provider)
+                last_content_err = first_error
+                last_api_err = None
                 for attempt in range(1, MAX_CONTENT_RETRIES + 1):
-                    if current_err.provider:
-                        retry_payload = copy.deepcopy(retry_payload)
+                    if ignore_acc:
                         prov = dict(retry_payload.get("provider") or {})
                         existing = list(prov.get("ignore") or [])
                         existing_lower = {x.lower() for x in existing if isinstance(x, str)}
-                        if current_err.provider.lower() not in existing_lower:
-                            # OpenRouter provider.ignore는 소문자 슬러그를 기대하므로 정규화해서 추가
-                            existing.append(current_err.provider.lower())
+                        for name in ignore_acc:
+                            if name.lower() not in existing_lower:
+                                existing.append(name)
                         prov["ignore"] = existing
+                        # provider_order가 고정(allow_fallbacks=False)돼 있으면 회전이 막히므로
+                        # 실패 회복 경로에서는 fallback을 허용해 다른 provider를 시도할 수 있게 한다.
+                        if prov.get("allow_fallbacks") is False:
+                            prov["allow_fallbacks"] = True
                         retry_payload["provider"] = prov
                         print(f"[WARN] content 재시도 #{attempt}/{MAX_CONTENT_RETRIES}: ignore={existing}")
                     else:
@@ -1037,23 +1054,32 @@ class OpenRouterClient:
                         print(f"[INFO] content 재시도 #{attempt} 성공")
                         return result
                     except CompletionContentError as retry_error:
-                        last_err = retry_error
+                        last_content_err = retry_error
+                        last_api_err = None
                         if not retry_error.retryable:
                             raise
-                        # 회전할 provider 정보가 연속으로 없으면 더 돌려도 동일 결과 → 중단
-                        if not retry_error.provider and not current_err.provider:
+                        # 회전할 provider 정보가 없고 누적 ignore도 없으면 더 돌려도 동일 → 중단
+                        if not retry_error.provider and not ignore_acc:
                             break
-                        current_err = retry_error
+                        _add_ignore(retry_error.provider)
                         continue
                     except APIStatusError as api_retry_err:
-                        # 재시도 중 5xx 등 → search 유지한 채 깔끔한 에러로 변환 (raw 예외 누수 방지)
-                        raise Exception(f"API Error ({api_retry_err.status}): {api_retry_err.body}") from api_retry_err
+                        # 4xx 등은 즉시 깔끔한 에러. 5xx + provider면 그 provider도 ignore에 넣고
+                        # search를 유지한 채 회전을 계속한다(web_search는 절대 제거하지 않음).
+                        if api_retry_err.status < 500 or not api_retry_err.provider:
+                            raise Exception(f"API Error ({api_retry_err.status}): {api_retry_err.body}") from api_retry_err
+                        last_api_err = api_retry_err
+                        _add_ignore(api_retry_err.provider)
+                        continue
+                # 재시도 모두 소진 — 마지막 실패 유형에 맞춰 에러 형식 유지
+                if last_api_err is not None:
+                    raise Exception(f"API Error ({last_api_err.status}): {last_api_err.body}") from last_api_err
                 raise CompletionContentError(
-                    str(last_err).replace("다시 시도하거나 ", "자동 재시도 후에도 실패했습니다. "),
-                    reasoning_only=last_err.reasoning_only,
-                    finish_reason=last_err.finish_reason,
-                    provider=last_err.provider,
-                ) from last_err
+                    str(last_content_err).replace("다시 시도하거나 ", "자동 재시도 후에도 실패했습니다. "),
+                    reasoning_only=last_content_err.reasoning_only,
+                    finish_reason=last_content_err.finish_reason,
+                    provider=last_content_err.provider,
+                ) from last_content_err
 
 # ================= 4. 봇 클래스 =================
 class OpenRouterBot(commands.Bot):
