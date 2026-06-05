@@ -473,11 +473,13 @@ def normalize_model_id(model_id):
 
 # ================= 3. OpenRouter API 클라이언트 =================
 class CompletionContentError(Exception):
-    def __init__(self, message, *, reasoning_only=False, finish_reason="unknown", retryable=True):
+    def __init__(self, message, *, reasoning_only=False, finish_reason="unknown", retryable=True, provider=None):
         super().__init__(message)
         self.reasoning_only = reasoning_only
         self.finish_reason = finish_reason
         self.retryable = retryable
+        # 빈 content를 반환한 provider name (있을 때만). reasoning-only 재시도에서 회전 대상으로 사용.
+        self.provider = provider
 
 
 class APIStatusError(Exception):
@@ -835,6 +837,15 @@ class OpenRouterClient:
         if cache_control:
             payload["cache_control"] = cache_control
 
+        # 추론형 모델: 토큰 수를 직접 박지 않고 effort로 reasoning 예산을 자동 스케일한다.
+        # effort="high"는 모델별 한도의 약 0.8 비율로 OpenRouter가 변환하므로, 토큰 수를
+        # 하드코딩하지 않고도 "허용 최대선에서 자동 조절(과도 제한 없음)"에 해당한다.
+        # reasoning 미지원 모델에는 주입하지 않아 불필요한 endpoint 필터링을 피한다.
+        model_meta = self.get_model_info(model)
+        supported = (model_meta or {}).get("supported_parameters") or []
+        if isinstance(supported, list) and any(str(s).lower() == "reasoning" for s in supported):
+            payload.setdefault("reasoning", {"effort": "high"})
+
         # web_search 켜졌고 차단 캐시에 provider 있으면 ignore 리스트로 주입
         if enable_web_search:
             blocked_now = self._active_web_search_blocked_providers()
@@ -865,7 +876,13 @@ class OpenRouterClient:
                             data = None
                         if not provider_used and isinstance(data, dict):
                             provider_used = data.get("provider")
-                        final_content, usage, images, full_data = self._parse_completion_output(data, raw_text=raw_text)
+                        try:
+                            final_content, usage, images, full_data = self._parse_completion_output(data, raw_text=raw_text)
+                        except CompletionContentError as content_err:
+                            # 빈 content를 반환한 provider를 에러에 실어 보내 재시도에서 회전할 수 있게 한다.
+                            if content_err.provider is None:
+                                content_err.provider = provider_used
+                            raise
                         return final_content, usage, images, full_data
                     error_text = await resp.text()
                     if not provider_used:
@@ -989,19 +1006,53 @@ class OpenRouterClient:
                     # 비정상 body 등 재시도 무의미 → 사용자에게 응답 원문 그대로 노출
                     print(f"[WARN] malformed completion (no retry): model={model} finish_reason={first_error.finish_reason}")
                     raise
+                # 빈 content / reasoning-only 응답은 같은 provider로 재시도하면 동일하게 실패하는 경우가 잦다.
+                # → (1) content 강조 지시문 주입 + (2) 직전 실패 provider를 ignore에 추가해 다른 provider로 회전.
+                # web_search는 답변 신선도에 직결되므로 절대 제거하지 않고 그대로 유지한다.
                 print(
-                    "[WARN] completion content empty; retrying once "
-                    f"(model={model}, reasoning_only={first_error.reasoning_only}, finish_reason={first_error.finish_reason})"
+                    "[WARN] completion content empty; retrying with provider rotation "
+                    f"(model={model}, reasoning_only={first_error.reasoning_only}, "
+                    f"finish_reason={first_error.finish_reason}, provider={first_error.provider or '?'})"
                 )
+                MAX_CONTENT_RETRIES = 2
                 retry_payload = self._build_content_retry_payload(payload)
-                try:
-                    return await _post_completion(retry_payload)
-                except CompletionContentError as retry_error:
-                    raise CompletionContentError(
-                        str(retry_error).replace("다시 시도하거나 ", "자동 재시도 후에도 실패했습니다. "),
-                        reasoning_only=retry_error.reasoning_only,
-                        finish_reason=retry_error.finish_reason,
-                    ) from retry_error
+                current_err = first_error
+                last_err = first_error
+                for attempt in range(1, MAX_CONTENT_RETRIES + 1):
+                    if current_err.provider:
+                        retry_payload = copy.deepcopy(retry_payload)
+                        prov = dict(retry_payload.get("provider") or {})
+                        existing = list(prov.get("ignore") or [])
+                        existing_lower = {x.lower() for x in existing if isinstance(x, str)}
+                        if current_err.provider.lower() not in existing_lower:
+                            existing.append(current_err.provider)
+                        prov["ignore"] = existing
+                        retry_payload["provider"] = prov
+                        print(f"[WARN] content 재시도 #{attempt}/{MAX_CONTENT_RETRIES}: ignore={existing}")
+                    else:
+                        print(f"[WARN] content 재시도 #{attempt}/{MAX_CONTENT_RETRIES}: provider 미상 → 동일 라우팅 재시도")
+                    try:
+                        result = await _post_completion(retry_payload)
+                        print(f"[INFO] content 재시도 #{attempt} 성공")
+                        return result
+                    except CompletionContentError as retry_error:
+                        last_err = retry_error
+                        if not retry_error.retryable:
+                            raise
+                        # 회전할 provider 정보가 연속으로 없으면 더 돌려도 동일 결과 → 중단
+                        if not retry_error.provider and not current_err.provider:
+                            break
+                        current_err = retry_error
+                        continue
+                    except APIStatusError as api_retry_err:
+                        # 재시도 중 5xx 등 → search 유지한 채 깔끔한 에러로 변환 (raw 예외 누수 방지)
+                        raise Exception(f"API Error ({api_retry_err.status}): {api_retry_err.body}") from api_retry_err
+                raise CompletionContentError(
+                    str(last_err).replace("다시 시도하거나 ", "자동 재시도 후에도 실패했습니다. "),
+                    reasoning_only=last_err.reasoning_only,
+                    finish_reason=last_err.finish_reason,
+                    provider=last_err.provider,
+                ) from last_err
 
 # ================= 4. 봇 클래스 =================
 class OpenRouterBot(commands.Bot):
@@ -1670,7 +1721,13 @@ async def on_message(message):
                 if can_see_audio:
                     capability_hints.append("You can analyze audio files attached by users.")
                 if config.get("search"):
-                    capability_hints.append("Web search is available for up-to-date information when needed.")
+                    capability_hints.append(
+                        "Web search is enabled. For anything time-sensitive — recent events, news, "
+                        "product/model releases, version numbers, prices, or facts that may have changed "
+                        "after your training cutoff — you MUST search the web before answering instead of "
+                        "relying on possibly-outdated training knowledge. Prefer the freshest sources and "
+                        "base your answer on what you actually found rather than guessing."
+                    )
                 capability_hints.append("Image generation is only available via the `/image` slash command, not in chat.")
 
                 cannot_hints = []
