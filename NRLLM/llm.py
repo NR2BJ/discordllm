@@ -1025,7 +1025,8 @@ class OpenRouterClient:
                         existing = list(prov.get("ignore") or [])
                         existing_lower = {x.lower() for x in existing if isinstance(x, str)}
                         if current_err.provider.lower() not in existing_lower:
-                            existing.append(current_err.provider)
+                            # OpenRouter provider.ignore는 소문자 슬러그를 기대하므로 정규화해서 추가
+                            existing.append(current_err.provider.lower())
                         prov["ignore"] = existing
                         retry_payload["provider"] = prov
                         print(f"[WARN] content 재시도 #{attempt}/{MAX_CONTENT_RETRIES}: ignore={existing}")
