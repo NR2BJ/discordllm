@@ -81,69 +81,69 @@ AVAILABLE_MODELS = {
     # Pro (3 levels: low / medium / high — minimal 미지원)
     "pro-low": {
         "text": "gemini-pro-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "pro-medium": {
         "text": "gemini-pro-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "pro-high": {
         "text": "gemini-pro-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
     # Flash (4 levels)
     "flash-minimal": {
         "text": "gemini-flash-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "minimal",
     },
     "flash-low": {
         "text": "gemini-flash-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-medium": {
         "text": "gemini-flash-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-high": {
         "text": "gemini-flash-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
     # Flash Lite (4 levels)
     "flash-lite-minimal": {
         "text": "gemini-flash-lite-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "minimal",
     },
     "flash-lite-low": {
         "text": "gemini-flash-lite-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-lite-medium": {
         "text": "gemini-flash-lite-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-lite-high": {
         "text": "gemini-flash-lite-latest",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
     # Deep Research (자체 reasoning, thinking_level 미사용)
     "deep-research": {
         "text": "deep-research-preview-04-2026",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
     },
     "deep-research-max": {
         "text": "deep-research-max-preview-04-2026",
-        "image": "gemini-3.1-flash-image-preview",
+        "image": "gemini-3.1-flash-image",
     },
 }
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
