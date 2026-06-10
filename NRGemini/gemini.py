@@ -136,22 +136,15 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
-    # Deep Research (자체 reasoning, thinking_level 미사용)
-    "deep-research": {
-        "text": "deep-research-preview-04-2026",
-        "image": "gemini-3.1-flash-image",
-    },
-    "deep-research-max": {
-        "text": "deep-research-max-preview-04-2026",
-        "image": "gemini-3.1-flash-image",
-    },
 }
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
-DEEP_RESEARCH_AGENT_IDS = {
-    AVAILABLE_MODELS["deep-research"]["text"],
-    AVAILABLE_MODELS["deep-research-max"]["text"],
+# Deep Research는 모델 선택과 분리된 전용 명령어(/deepo, /deepm)로만 실행
+DEEP_RESEARCH_AGENTS = {
+    "deepo": "deep-research-preview-04-2026",
+    "deepm": "deep-research-max-preview-04-2026",
 }
+DEEP_RESEARCH_AGENT_IDS = set(DEEP_RESEARCH_AGENTS.values())
 ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["flash-lite-minimal"]["text"])
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
@@ -173,8 +166,6 @@ MODEL_HISTORY_LIMITS = {
     AVAILABLE_MODELS["pro-high"]["text"]: 20,
     AVAILABLE_MODELS["flash-high"]["text"]: 20,
     AVAILABLE_MODELS["flash-lite-minimal"]["text"]: 20,
-    AVAILABLE_MODELS["deep-research"]["text"]: 20,
-    AVAILABLE_MODELS["deep-research-max"]["text"]: 20,
 }
 
 IMAGE_ACTION_NOUN_RE = re.compile(
@@ -1421,10 +1412,6 @@ def infer_attachment_mime(attachment, detected_mime=None):
     return "application/octet-stream"
 
 
-def is_deep_research_model(text_model):
-    return text_model in DEEP_RESEARCH_AGENT_IDS
-
-
 def get_structured_helper_model(text_model=None):
     return ROUTING_MODEL
 
@@ -1479,25 +1466,6 @@ def build_gemini_system_prompt():
     return SYSTEM_PROMPT
 
 
-def text_from_parts(parts):
-    chunks = []
-    for part in parts or []:
-        text = getattr(part, "text", None)
-        if text:
-            chunks.append(text)
-    return "\n".join(chunks).strip()
-
-
-def flatten_contents_for_interactions(contents):
-    lines = []
-    for content in contents or []:
-        role = getattr(content, "role", "user") or "user"
-        text = text_from_parts(getattr(content, "parts", []))
-        if text:
-            lines.append(f"{role}: {text}")
-    return "\n\n".join(lines).strip()
-
-
 async def maybe_await(value):
     if inspect.isawaitable(value):
         return await value
@@ -1512,19 +1480,9 @@ async def call_interaction_get(interactions_api, interaction_id):
 
 
 def extract_interaction_text(interaction):
-    outputs = (
-        interaction.get("outputs", [])
-        if isinstance(interaction, dict)
-        else getattr(interaction, "outputs", None) or []
-    )
-    text_parts = []
-    for output in outputs:
-        text = getattr(output, "text", None)
-        if text:
-            text_parts.append(text)
-        elif isinstance(output, dict) and output.get("text"):
-            text_parts.append(output["text"])
-    return "\n\n".join(text_parts).strip()
+    return "\n\n".join(
+        block["text"] for block in collect_interaction_outputs(interaction) if block["type"] == "text"
+    ).strip()
 
 
 def get_interaction_output_value(output, key, default=None):
@@ -1548,13 +1506,29 @@ def decode_interaction_image(data):
 
 
 def collect_interaction_outputs(interaction):
-    outputs = (
-        interaction.get("outputs", [])
+    """Interaction 응답에서 텍스트/이미지 블록을 순서대로 수집.
+
+    google-genai 2.x의 Interactions API는 결과를 `outputs`가 아니라
+    `steps[].content[]`(type=model_output)로 반환한다. thought/tool 스텝은 건너뛰고
+    model_output 스텝의 content 블록만 모은다. 구형 `outputs` 응답도 폴백으로 지원."""
+    steps = (
+        interaction.get("steps")
         if isinstance(interaction, dict)
-        else getattr(interaction, "outputs", None) or []
-    )
+        else getattr(interaction, "steps", None)
+    ) or []
+    blocks = []
+    for step in steps:
+        if get_interaction_output_value(step, "type", "") != "model_output":
+            continue
+        blocks.extend(get_interaction_output_value(step, "content", None) or [])
+    if not blocks:
+        blocks = (
+            interaction.get("outputs")
+            if isinstance(interaction, dict)
+            else getattr(interaction, "outputs", None)
+        ) or []
     collected = []
-    for output in outputs:
+    for output in blocks:
         output_type = get_interaction_output_value(output, "type", "")
         text = get_interaction_output_value(output, "text")
         data = get_interaction_output_value(output, "data")
@@ -1738,27 +1712,18 @@ def build_deep_research_report(interaction, *, agent_id):
     }
 
 
-async def send_deep_research_report(channel, report):
-    pdf = report.get("pdf_bytes")
-    if not pdf:
-        await channel.send("[ERROR] Deep Research PDF 데이터가 비어 있습니다.")
-        return
-    await channel.send(
-        report.get("summary") or "[Deep Research] 완료했습니다.",
-        file=discord.File(fp=io.BytesIO(pdf), filename=report.get("filename") or "deep_research_report.pdf"),
-    )
-
-
-async def call_deep_research(history_contents, agent_id):
+async def call_deep_research(research_topic, agent_id):
+    """대화 컨텍스트 없이 입력된 주제만 단독으로 리서치한다."""
     if not CLIENT:
         return "Error: API Client not initialized"
-    conversation = flatten_contents_for_interactions(history_contents)
-    if not conversation:
+    research_topic = (research_topic or "").strip()
+    if not research_topic:
         return "[ERROR] Deep Research에 전달할 텍스트가 없습니다."
     prompt = (
-        f"{build_gemini_system_prompt()}\n\n"
-        "## Conversation\n"
-        f"{conversation}"
+        "Research the topic below and produce a thorough, well-structured report. "
+        "Write the report in the same language as the topic (e.g. Korean topic → Korean report).\n\n"
+        "## Research Topic\n"
+        f"{research_topic}"
     )
 
     interactions_api = getattr(getattr(CLIENT, "aio", None), "interactions", None)
@@ -1792,9 +1757,10 @@ async def call_deep_research(history_contents, agent_id):
                     if text:
                         return f"[ERROR] Deep Research PDF 생성 실패: {e}\n\n{text}"
                     return f"[ERROR] Deep Research PDF 생성 실패: {e}"
-            if status == "failed":
+            if status in ("failed", "cancelled", "incomplete", "budget_exceeded", "requires_action"):
                 error = getattr(result, "error", None) or (result.get("error") if isinstance(result, dict) else None)
-                return f"[ERROR] Deep Research 실패: {error}"
+                detail = f": {error}" if error else ""
+                return f"[ERROR] Deep Research 중단 (status={status}){detail}"
         return "[ERROR] Deep Research 작업이 제한 시간 안에 끝나지 않았습니다."
     except Exception as e:
         return f"[ERROR] Deep Research 호출 실패: {e}"
@@ -2034,8 +2000,6 @@ async def call_gemini(history_contents, last_user_msg="", text_model=None, think
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
-    if is_deep_research_model(text_model):
-        return await call_deep_research(history_contents, text_model), 0
     tools = [types.Tool(google_search=types.GoogleSearch())]
 
     safety_settings = [
@@ -2076,6 +2040,7 @@ class GeminiBot(commands.Bot):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self._migrate_thinking_budget_to_level()
+        self._migrate_deep_research_text_models()
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
@@ -2124,6 +2089,22 @@ class GeminiBot(commands.Bot):
             else:
                 print(f"[MIGRATE] guild {gid}: drop legacy thinking_budget={budget} (thinking_level already set)")
             changed = True
+        if changed:
+            DataManager.save_json(CONFIG_FILE, self.server_configs)
+
+    def _migrate_deep_research_text_models(self):
+        """모델 선택 목록에서 제외된 Deep Research가 text_model로 남아있으면 기본 모델로 복구.
+        Deep Research는 이제 /deepo·/deepm 명령어 전용."""
+        changed = False
+        for gid, cfg in self.server_configs.items():
+            if not isinstance(cfg, dict):
+                continue
+            if cfg.get("text_model") in DEEP_RESEARCH_AGENT_IDS:
+                old = cfg["text_model"]
+                cfg["text_model"] = TEXT_MODEL
+                cfg["image_model"] = IMAGE_MODEL
+                print(f"[MIGRATE] guild {gid}: text_model {old} → {TEXT_MODEL} (Deep Research는 /deepo·/deepm 전용)")
+                changed = True
         if changed:
             DataManager.save_json(CONFIG_FILE, self.server_configs)
 
@@ -3196,21 +3177,12 @@ async def on_message(message):
                 # 현재 메시지의 [CURRENT MESSAGE from ...] prefix는 이미 current_parts[0]에 포함됨
                 full_contents = history_list + [types.Content(role="user", parts=current_parts)]
 
-                if is_deep_research_model(server_text_model):
-                    await message.channel.send(
-                        f"[Deep Research] `{server_text_model}` 작업을 시작했습니다. 몇 분 정도 걸릴 수 있습니다."
-                    )
-
                 response, token_usage = await call_gemini(
                     full_contents,
                     message.content,
                     text_model=server_text_model,
                     thinking_level=config.get("thinking_level"),
                 )
-
-                if isinstance(response, dict) and response.get("kind") == "deep_research_report":
-                    await send_deep_research_report(message.channel, response)
-                    return
 
                 if isinstance(response, str):
                     response = clean_assistant_response_text(response)
@@ -3373,46 +3345,17 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
         ]
 
-        if is_deep_research_model(TEXT_MODEL):
-            await interaction.followup.send(
-                f"[Deep Research] `{TEXT_MODEL}` 작업을 시작했습니다. 몇 분 정도 걸릴 수 있습니다."
+        response = await CLIENT.aio.models.generate_content(
+            model=TEXT_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=CHAT_SYSTEM_PROMPT,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.7,
+                safety_settings=safety_settings
             )
-            response, token_usage = await call_gemini(
-                [types.Content(role="user", parts=parts)],
-                message,
-                text_model=TEXT_MODEL,
-            )
-        else:
-            response = await CLIENT.aio.models.generate_content(
-                model=TEXT_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=CHAT_SYSTEM_PROMPT,
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.7,
-                    safety_settings=safety_settings
-                )
-            )
-            token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
-
-        if isinstance(response, dict) and response.get("kind") == "deep_research_report":
-            await interaction.followup.send(
-                response.get("summary") or "[Deep Research] 완료했습니다.",
-                file=discord.File(
-                    fp=io.BytesIO(response["pdf_bytes"]),
-                    filename=response.get("filename") or "deep_research_report.pdf",
-                ),
-            )
-            print(f"  [BOT]({TEXT_MODEL}): [Deep Research PDF]")
-            print("-------")
-            return
-
-        if isinstance(response, str):
-            for chunk in [response[i:i+1900] for i in range(0, len(response), 1900)]:
-                await interaction.followup.send(chunk)
-            print(f"  [BOT]({TEXT_MODEL}): {response}")
-            print("-------")
-            return
+        )
+        token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
 
         if not response.candidates:
             await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
@@ -4070,6 +4013,76 @@ class ControlPanelView(discord.ui.View):
 
     async def on_timeout(self):
         self.clear_items()
+
+
+# ================= Deep Research 명령어 =================
+
+async def run_deep_research_command(interaction: discord.Interaction, prompt: str, agent_key: str):
+    """대화 컨텍스트 없이 입력 프롬프트만 단독 리서치. 채널 락을 잡지 않으므로 일반 대화와 병렬로 돈다."""
+    agent_id = DEEP_RESEARCH_AGENTS[agent_key]
+    log_time = datetime.now().strftime('%H:%M:%S')
+    location = f"[{interaction.guild.name}]" if interaction.guild else "[DM]"
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
+    print(f"[{log_time}] {location} [/{agent_key}] {actor_name}: {prompt}")
+
+    await interaction.response.send_message(
+        f"[Deep Research] `{agent_id}` 작업을 시작했습니다.\n"
+        f"**주제:** {prompt[:300]}\n"
+        f"완료까지 10분 안팎 걸릴 수 있습니다. 완료되면 멘션으로 알려드립니다."
+    )
+
+    async def send_result(content, *, pdf=None, filename=None):
+        try:
+            if pdf:
+                await interaction.followup.send(content, file=discord.File(fp=io.BytesIO(pdf), filename=filename))
+            else:
+                await interaction.followup.send(content)
+        except Exception as followup_error:
+            # followup 토큰 만료(15분) 등 — 채널 직접 전송으로 폴백
+            print(f"[DEEP] followup 실패, 채널 전송으로 폴백: {followup_error}")
+            if interaction.channel is None:
+                raise
+            if pdf:
+                await interaction.channel.send(content, file=discord.File(fp=io.BytesIO(pdf), filename=filename))
+            else:
+                await interaction.channel.send(content)
+
+    try:
+        result = await call_deep_research(prompt, agent_id)
+        mention = interaction.user.mention
+
+        if isinstance(result, dict) and result.get("kind") == "deep_research_report":
+            await send_result(
+                f"{mention} {result.get('summary') or '[Deep Research] 완료했습니다.'}",
+                pdf=result.get("pdf_bytes"),
+                filename=result.get("filename") or "deep_research_report.pdf",
+            )
+            print(f"  [BOT]({agent_id}): [Deep Research PDF]")
+        else:
+            text = f"{mention} {result if isinstance(result, str) else str(result)}"
+            for chunk in [text[i:i+1900] for i in range(0, len(text), 1900)]:
+                await send_result(chunk)
+            print(f"  [BOT]({agent_id}): {str(result)[:200]}")
+        print("-------")
+    except Exception as e:
+        print(f"  [ERROR] /{agent_key}: {e}")
+        print("-------")
+
+
+@bot.tree.command(name="deepo", description="Deep Research — 입력한 주제만 단독 리서치 (약 10분, PDF 리포트)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(prompt="리서치할 주제/질문 (대화 컨텍스트는 참조하지 않음)")
+async def deepo_command(interaction: discord.Interaction, prompt: str):
+    await run_deep_research_command(interaction, prompt, "deepo")
+
+
+@bot.tree.command(name="deepm", description="Deep Research Max — 입력한 주제만 단독 리서치 (더 깊게, 더 오래 걸림)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(prompt="리서치할 주제/질문 (대화 컨텍스트는 참조하지 않음)")
+async def deepm_command(interaction: discord.Interaction, prompt: str):
+    await run_deep_research_command(interaction, prompt, "deepm")
 
 
 # ================= 모델 전환 =================
