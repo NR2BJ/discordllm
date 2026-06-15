@@ -1295,7 +1295,13 @@ def clean_assistant_response_text(text):
     text = re.sub(r"^\s*\[ID:[^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
     text = re.sub(r"\s*discord_author=\{[^\n]*\}\s*$", "", text)
-    return text.lstrip()
+    # 히스토리 이미지 마커 흉내 제거 (모델이 '(Bot sent an image: ...)' 같은 재구성 마커를 응답에 흘리는 경우 방어)
+    text = re.sub(r"\(Bot sent an image:[^)\n]*\)", "", text)
+    text = re.sub(r"\(Bot generated an image here[^)\n]*\)", "", text)
+    text = re.sub(r"\(User attached an image:[^)\n]*\)", "", text)
+    text = re.sub(r"\[이미지 첨부됨\]", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def coerce_json_object(text):
@@ -2955,15 +2961,9 @@ async def on_message(message):
                         if msg.attachments:
                             for att in msg.attachments:
                                 if is_image_attachment(att):
-                                    content += f"\n(Bot sent an image: {att.filename})"
-                                elif within_text_history and att.content_type and att.content_type.startswith('video'):
-                                    content += f"\n(Bot generated a video here: {att.filename})"
-                    else:
-                        content = msg.content if (within_text_history or within_image_history) else ""
-                        if msg.attachments:
-                            for att in msg.attachments:
-                                if is_image_attachment(att):
-                                    content += f"\n(User attached an image: {att.filename})"
+                                    # 봇이 과거 생성/전송한 이미지: 마커 대신 실제 이미지 재첨부 (이미지 윈도우 내).
+                                    # '(Bot sent an image: ...)' 마커를 모델 role 히스토리에 남기면 모델이 그 텍스트를
+                                    # 흉내내서 generate_image 툴 호출 대신 마커만 출력함. 마커는 절대 남기지 않음.
                                     if within_image_history:
                                         d, m = await download_media(att.url)
                                         if d:
@@ -2975,8 +2975,32 @@ async def on_message(message):
                                                 history_ref_images.append(Image.open(io.BytesIO(raw)).copy())
                                             except Exception:
                                                 pass
+                                    # 윈도우 밖이면 마커 없이 생략
+                                elif within_text_history and att.content_type and att.content_type.startswith('video'):
+                                    content += f"\n(Bot generated a video here: {att.filename})"
+                    else:
+                        content = msg.content if (within_text_history or within_image_history) else ""
+                        if msg.attachments:
+                            for att in msg.attachments:
+                                if is_image_attachment(att):
+                                    # 이미지 윈도우 내: 실제 이미지 재첨부(마커 없음). 윈도우 밖: 마커로만 컨텍스트 표시.
+                                    reattached = False
+                                    if within_image_history:
+                                        d, m = await download_media(att.url)
+                                        if d:
+                                            raw = d.getvalue()
+                                            m = infer_attachment_mime(att, m)
+                                            image_parts.append(types.Part(inline_data=types.Blob(mime_type=m, data=raw)))
+                                            history_inline_images += 1
+                                            try:
+                                                history_ref_images.append(Image.open(io.BytesIO(raw)).copy())
+                                            except Exception:
+                                                pass
+                                            reattached = True
                                         else:
-                                            content += " (image download failed)"
+                                            content += f"\n(User attached an image: {att.filename}) (image download failed)"
+                                    if not reattached and within_text_history and not within_image_history:
+                                        content += f"\n(User attached an image: {att.filename})"
                                 elif within_text_history and is_audio_or_video_attachment(att):
                                     media_type = attachment_media_type(att)
                                     content += f"\n(User attached a {media_type} file: {att.filename})"
