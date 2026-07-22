@@ -94,48 +94,52 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
-    # Flash (4 levels)
+    # Gemini 3.6 Flash (4 levels)
     "flash-minimal": {
-        "text": "gemini-flash-latest",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "minimal",
     },
     "flash-low": {
-        "text": "gemini-flash-latest",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-medium": {
-        "text": "gemini-flash-latest",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-high": {
-        "text": "gemini-flash-latest",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
-    # Flash Lite (4 levels)
+    # Gemini 3.5 Flash-Lite (4 levels)
     "flash-lite-minimal": {
-        "text": "gemini-flash-lite-latest",
+        "text": "gemini-3.5-flash-lite",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "minimal",
     },
     "flash-lite-low": {
-        "text": "gemini-flash-lite-latest",
+        "text": "gemini-3.5-flash-lite",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-lite-medium": {
-        "text": "gemini-flash-lite-latest",
+        "text": "gemini-3.5-flash-lite",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-lite-high": {
-        "text": "gemini-flash-lite-latest",
+        "text": "gemini-3.5-flash-lite",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
+}
+LEGACY_TEXT_MODEL_ALIASES = {
+    "gemini-flash-latest": "gemini-3.6-flash",
+    "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
 }
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
@@ -145,7 +149,8 @@ DEEP_RESEARCH_AGENTS = {
     "deepm": "deep-research-max-preview-04-2026",
 }
 DEEP_RESEARCH_AGENT_IDS = set(DEEP_RESEARCH_AGENTS.values())
-ROUTING_MODEL = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["flash-lite-minimal"]["text"])
+_configured_routing_model = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["flash-lite-minimal"]["text"])
+ROUTING_MODEL = LEGACY_TEXT_MODEL_ALIASES.get(_configured_routing_model, _configured_routing_model)
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
@@ -251,11 +256,17 @@ You are a helpful AI assistant.
 IMAGE_SYSTEM_PROMPT = f"""
 You are an AI image generator assistant.
 {_COMMON_RULES}
-- When the user wants to generate or edit an image, use the `generate_image` tool.
-- Create a detailed English prompt for the image based on the user's request.
-- You can also provide a brief text response along with generating the image.
-- If a reference image is provided, set ref_count to 1 for editing.
+- Return a detailed English image prompt based on the user's request.
+- The `message` field may contain a brief response to the user, or be empty.
+- If a reference image is provided, describe the requested edit while preserving relevant source details.
 """
+
+INTERACTION_SAFETY_SETTINGS = [
+    {"type": "harassment", "threshold": "block_none"},
+    {"type": "hate_speech", "threshold": "block_none"},
+    {"type": "sexually_explicit", "threshold": "block_none"},
+    {"type": "dangerous_content", "threshold": "block_none"},
+]
 
 # 현재 파일(gemini.py)이 있는 폴더 경로를 구함
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -934,6 +945,15 @@ IMAGE_ACTION_SCHEMA = {
     "required": ["action", "refined_prompt", "use_recent_images", "reason"],
 }
 
+IMAGE_PROMPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "prompt": {"type": "string"},
+        "message": {"type": "string"},
+    },
+    "required": ["prompt"],
+}
+
 
 class RecentImageStore:
     def __init__(self, base_dir, index_file, *, limit=2):
@@ -1329,22 +1349,6 @@ def coerce_json_object(text):
         return None
 
 
-def build_json_generation_config(schema):
-    base = {
-        "temperature": 0.0,
-        "response_mime_type": "application/json",
-    }
-    for schema_key in ("response_json_schema", "response_schema"):
-        try:
-            return types.GenerateContentConfig(**base, **{schema_key: schema})
-        except Exception:
-            continue
-    try:
-        return types.GenerateContentConfig(**base)
-    except Exception:
-        return {**base, "response_json_schema": schema}
-
-
 def build_recent_conversation_excerpt(history_texts, limit=MEMORY_EXCERPT_MAX_CHARS, window=8):
     lines = []
     for text in (history_texts or [])[-window:]:
@@ -1478,6 +1482,127 @@ async def maybe_await(value):
     return value
 
 
+def get_interactions_api():
+    if CLIENT is None:
+        return None
+    return getattr(getattr(CLIENT, "aio", None), "interactions", None) or getattr(CLIENT, "interactions", None)
+
+
+def interaction_media_type(mime_type):
+    mime_type = (mime_type or "").lower()
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type in {"application/pdf", "text/csv"}:
+        return "document"
+    return None
+
+
+def encode_interaction_data(data):
+    if isinstance(data, str):
+        return data
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(data)).decode("ascii")
+    return None
+
+
+def gemini_part_to_interaction_content(part):
+    text = getattr(part, "text", None)
+    if text:
+        return {"type": "text", "text": text}
+
+    inline_data = getattr(part, "inline_data", None)
+    if inline_data is not None:
+        mime_type = getattr(inline_data, "mime_type", None)
+        content_type = interaction_media_type(mime_type)
+        data = encode_interaction_data(getattr(inline_data, "data", None))
+        if content_type and data:
+            return {"type": content_type, "mime_type": mime_type, "data": data}
+
+    file_data = getattr(part, "file_data", None)
+    if file_data is not None:
+        mime_type = getattr(file_data, "mime_type", None)
+        content_type = interaction_media_type(mime_type)
+        uri = getattr(file_data, "file_uri", None)
+        if content_type and uri:
+            return {"type": content_type, "mime_type": mime_type, "uri": uri}
+    return None
+
+
+def gemini_contents_to_interaction_steps(contents):
+    steps = []
+    for content in contents or []:
+        role = getattr(content, "role", None)
+        step_type = "model_output" if role == "model" else "user_input"
+        blocks = []
+        for part in getattr(content, "parts", None) or []:
+            block = gemini_part_to_interaction_content(part)
+            if block:
+                blocks.append(block)
+        if blocks:
+            steps.append({"type": step_type, "content": blocks})
+    return steps
+
+
+def image_generation_inputs_to_blocks(contents):
+    blocks = []
+    for item in contents or []:
+        if isinstance(item, str):
+            blocks.append({"type": "text", "text": item})
+            continue
+        if isinstance(item, Image.Image):
+            image_buffer = io.BytesIO()
+            item.save(image_buffer, format="PNG")
+            blocks.append(
+                {
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(image_buffer.getvalue()).decode("ascii"),
+                }
+            )
+    return blocks
+
+
+async def create_model_interaction(
+    *,
+    model,
+    input_data,
+    system_instruction=None,
+    tools=None,
+    safety_settings=None,
+    thinking_level=None,
+    response_schema=None,
+    response_format=None,
+    store=False,
+):
+    interactions_api = get_interactions_api()
+    if interactions_api is None:
+        raise RuntimeError("현재 google-genai SDK에서 Interactions API를 찾을 수 없습니다. 패키지 업데이트가 필요합니다.")
+
+    kwargs = {"model": model, "input": input_data, "store": store}
+    if system_instruction:
+        kwargs["system_instruction"] = system_instruction
+    if tools:
+        kwargs["tools"] = tools
+    if safety_settings:
+        if "safety_settings" in inspect.signature(interactions_api.create).parameters:
+            kwargs["safety_settings"] = safety_settings
+        else:
+            kwargs["extra_body"] = {"safety_settings": safety_settings}
+    if thinking_level is not None:
+        kwargs["generation_config"] = {"thinking_level": thinking_level}
+    if response_schema is not None:
+        kwargs["response_format"] = [
+            {"type": "text", "mime_type": "application/json", "schema": response_schema}
+        ]
+    elif response_format is not None:
+        kwargs["response_format"] = response_format
+    return await maybe_await(interactions_api.create(**kwargs))
+
+
 async def call_interaction_get(interactions_api, interaction_id):
     try:
         return await maybe_await(interactions_api.get(interaction_id))
@@ -1486,9 +1611,21 @@ async def call_interaction_get(interactions_api, interaction_id):
 
 
 def extract_interaction_text(interaction):
-    return "\n\n".join(
+    text = "\n\n".join(
         block["text"] for block in collect_interaction_outputs(interaction) if block["type"] == "text"
     ).strip()
+    if text:
+        return text
+    return (get_interaction_output_value(interaction, "output_text", "") or "").strip()
+
+
+def get_interaction_usage(interaction):
+    usage = get_interaction_output_value(interaction, "usage")
+    return int(get_interaction_output_value(usage, "total_tokens", 0) or 0)
+
+
+def get_interaction_status(interaction):
+    return get_interaction_output_value(interaction, "status", "completed") or "completed"
 
 
 def get_interaction_output_value(output, key, default=None):
@@ -1732,9 +1869,7 @@ async def call_deep_research(research_topic, agent_id):
         f"{research_topic}"
     )
 
-    interactions_api = getattr(getattr(CLIENT, "aio", None), "interactions", None)
-    if interactions_api is None:
-        interactions_api = getattr(CLIENT, "interactions", None)
+    interactions_api = get_interactions_api()
     if interactions_api is None:
         return "[ERROR] 현재 google-genai SDK에서 Interactions API를 찾을 수 없습니다. 패키지 업데이트가 필요합니다."
 
@@ -1833,12 +1968,12 @@ User message:
 """.strip()
 
     try:
-        response = await CLIENT.aio.models.generate_content(
+        interaction = await create_model_interaction(
             model=text_model,
-            contents=prompt,
-            config=build_json_generation_config(IMAGE_ACTION_SCHEMA),
+            input_data=prompt,
+            response_schema=IMAGE_ACTION_SCHEMA,
         )
-        payload = coerce_json_object(response.text)
+        payload = coerce_json_object(extract_interaction_text(interaction))
         if not payload:
             raise ValueError("empty or invalid JSON route response")
         action = payload.get("action", "respond_text")
@@ -1952,18 +2087,27 @@ async def call_nano_banana(contents, image_model=None):
 
     for attempt in range(max_retries):
         try:
-            coro = CLIENT.aio.models.generate_content(
+            input_blocks = image_generation_inputs_to_blocks(contents)
+            if not input_blocks:
+                raise ValueError("이미지 생성 입력이 비어 있습니다.")
+            coro = create_model_interaction(
                 model=image_model,
-                contents=contents
+                input_data=input_blocks,
+                response_format={"type": "image"},
             )
-            response = await asyncio.wait_for(coro, timeout=90.0)
+            interaction = await asyncio.wait_for(coro, timeout=90.0)
+            status = get_interaction_status(interaction)
+            if status not in {"completed", "incomplete"}:
+                raise Exception(f"Image interaction status: {status}")
 
-            if not response.candidates: raise Exception("No response candidate")
-            candidate = response.candidates[0]
-            if candidate.finish_reason != "STOP": raise Exception(f"Blocked: {candidate.finish_reason}")
+            for output in collect_interaction_outputs(interaction):
+                if output["type"] == "image":
+                    return output["data"]
 
-            for part in candidate.content.parts:
-                if part.inline_data: return part.inline_data.data
+            output_image = get_interaction_output_value(interaction, "output_image")
+            image_data = decode_interaction_image(get_interaction_output_value(output_image, "data"))
+            if image_data:
+                return image_data
 
             raise Exception("No image data found in response")
 
@@ -1976,66 +2120,21 @@ async def call_nano_banana(contents, image_model=None):
             else:
                 raise e
 
-async def check_media_intent(last_user_msg, text_model=None):
-    """사용자가 이미지/동영상 생성을 원하는지 판별. 'IMAGE', 'VIDEO', 또는 'NONE' 반환"""
-    if not CLIENT: return "NONE"
-    if text_model is None:
-        text_model = TEXT_MODEL
-    prompt = f"""
-    Analyze the user's request: "{last_user_msg}"
-    Determine if the user explicitly wants the AI to:
-    - GENERATE, DRAW, EDIT, or MODIFY an IMAGE → return "IMAGE"
-    - GENERATE or CREATE a VIDEO/ANIMATION/CLIP → return "VIDEO"
-    - Neither → return "NONE"
-    Return ONLY one word: "IMAGE", "VIDEO", or "NONE".
-    """
-    try:
-        response = await CLIENT.aio.models.generate_content(
-            model=text_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.0)
-        )
-        result = response.text.strip().upper()
-        if "VIDEO" in result: return "VIDEO"
-        if "IMAGE" in result: return "IMAGE"
-        return "NONE"
-    except:
-        return "NONE"
-
-async def call_gemini(history_contents, last_user_msg="", text_model=None, thinking_level=None):
+async def call_gemini(history_contents, text_model=None, thinking_level=None):
     if not CLIENT: return "Error: API Client not initialized", 0
     if text_model is None:
         text_model = TEXT_MODEL
-    tools = [types.Tool(google_search=types.GoogleSearch())]
-
-    safety_settings = [
-        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-    ]
-
-    config_kwargs = {
-        "system_instruction": build_gemini_system_prompt(),
-        "tools": tools,
-        "temperature": 0.7,
-        "safety_settings": safety_settings,
-    }
-    if thinking_level is not None:
-        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
 
     try:
-        response = await CLIENT.aio.models.generate_content(
+        interaction = await create_model_interaction(
             model=text_model,
-            contents=history_contents,
-            config=types.GenerateContentConfig(**config_kwargs)
+            input_data=gemini_contents_to_interaction_steps(history_contents),
+            system_instruction=build_gemini_system_prompt(),
+            tools=[{"type": "google_search"}],
+            safety_settings=INTERACTION_SAFETY_SETTINGS,
+            thinking_level=thinking_level,
         )
-
-        usage = 0
-        if response.usage_metadata:
-            usage = response.usage_metadata.total_token_count
-
-        return response, usage
+        return interaction, get_interaction_usage(interaction)
 
     except Exception as e:
         return f"Error: {e}", 0
@@ -2045,6 +2144,7 @@ class GeminiBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
+        self._migrate_legacy_text_models()
         self._migrate_thinking_budget_to_level()
         self._migrate_deep_research_text_models()
         self.channel_locks = {}
@@ -2070,6 +2170,22 @@ class GeminiBot(commands.Bot):
         self.mafic_pool = mafic.NodePool(self) if LAVALINK_ENABLED else None
         self.mafic_node = None
         self.mafic_connect_lock = asyncio.Lock()
+
+    def _migrate_legacy_text_models(self):
+        """저장된 latest 별칭을 현재 고정 모델 ID로 치환한다."""
+        changed = False
+        for gid, cfg in self.server_configs.items():
+            if not isinstance(cfg, dict):
+                continue
+            old = cfg.get("text_model")
+            new = LEGACY_TEXT_MODEL_ALIASES.get(old)
+            if not new:
+                continue
+            cfg["text_model"] = new
+            print(f"[MIGRATE] guild {gid}: text_model {old} → {new}")
+            changed = True
+        if changed:
+            DataManager.save_json(CONFIG_FILE, self.server_configs)
 
     def _migrate_thinking_budget_to_level(self):
         """레거시 thinking_budget 정수를 신규 thinking_level enum으로 일괄 변환.
@@ -3203,7 +3319,6 @@ async def on_message(message):
 
                 response, token_usage = await call_gemini(
                     full_contents,
-                    message.content,
                     text_model=server_text_model,
                     thinking_level=config.get("thinking_level"),
                 )
@@ -3213,30 +3328,26 @@ async def on_message(message):
                     await send_long_message(message.channel, response)
                     return
 
-                if not response.candidates:
-                    await message.channel.send("[BLOCKED] 응답이 차단되었습니다.")
+                status = get_interaction_status(response)
+                if status not in {"completed", "incomplete"}:
+                    error = get_interaction_output_value(response, "error")
+                    detail = f": {error}" if error else ""
+                    await message.channel.send(f"[ERROR] 응답 생성 중단 (status={status}){detail}")
                     return
+                if status == "incomplete":
+                    print("[WARN] Gemini interaction이 incomplete 상태로 종료되어 부분 응답을 전송합니다.")
 
                 log_time = datetime.now().strftime('%H:%M:%S')
                 print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
 
-                candidate = response.candidates[0]
-                finish_reason = candidate.finish_reason
-                if finish_reason and str(finish_reason) != "STOP":
-                    print(f"[WARN] finish_reason: {finish_reason}")
-
-                if not candidate.content or not candidate.content.parts:
-                    print(f"[WARN] content.parts가 없음, 응답 스킵 (finish_reason: {finish_reason})")
+                text_reply = extract_interaction_text(response)
+                if not text_reply:
+                    print(f"[WARN] model_output 텍스트가 없음 (status: {status})")
                     return
-
-                text_reply = ""
-                for part in candidate.content.parts:
-                    if part.text:
-                        text_reply += part.text
 
                 if text_reply.strip():
                     text_reply = clean_assistant_response_text(text_reply)
-                    print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Finish: {finish_reason})")
+                    print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Status: {status})")
                     await send_long_message(message.channel, text_reply)
 
                 # video_calls 처리 — 비용 절감으로 임시 비활성화
@@ -3362,32 +3473,23 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
 
         contents = [types.Content(role="user", parts=parts)]
 
-        safety_settings = [
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-        ]
-
-        response = await CLIENT.aio.models.generate_content(
+        response = await create_model_interaction(
             model=TEXT_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=CHAT_SYSTEM_PROMPT,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.7,
-                safety_settings=safety_settings
-            )
+            input_data=gemini_contents_to_interaction_steps(contents),
+            system_instruction=CHAT_SYSTEM_PROMPT,
+            tools=[{"type": "google_search"}],
+            safety_settings=INTERACTION_SAFETY_SETTINGS,
         )
-        token_usage = response.usage_metadata.total_token_count if response.usage_metadata else 0
+        token_usage = get_interaction_usage(response)
 
-        if not response.candidates:
-            await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
+        status = get_interaction_status(response)
+        if status not in {"completed", "incomplete"}:
+            await interaction.followup.send(f"[ERROR] 응답 생성 중단 (status={status})")
             return
+        if status == "incomplete":
+            print("  [WARN] Gemini interaction이 incomplete 상태로 종료되어 부분 응답을 전송합니다.")
 
-        text_reply = ""
-        for part in response.candidates[0].content.parts:
-            if part.text: text_reply += part.text
+        text_reply = extract_interaction_text(response)
 
         if text_reply.strip():
             if len(text_reply) > 2000:
@@ -3455,64 +3557,29 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
         else:
             await interaction.followup.send(user_display)
 
-        gen_tool = types.Tool(
-            function_declarations=[
-                types.FunctionDeclaration(
-                    name="generate_image",
-                    description="Generate or edit an image based on the prompt.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "prompt": types.Schema(type="STRING", description="Detailed English description for the image."),
-                            "ref_count": types.Schema(type="INTEGER", description="0 = generate new, 1 = edit reference image. Only 0 or 1 allowed.")
-                        },
-                        required=["prompt", "ref_count"]
-                    )
-                )
-            ]
-        )
-
-        safety_settings = [
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-        ]
-
         user_message = f"User request: {prompt}"
         if has_reference:
             user_message += "\n(A reference image is provided for editing)"
-        user_message += "\n\n(System: Generate the image using the `generate_image` tool. You may also provide a brief text response.)"
+        user_message += "\n\nReturn the refined image prompt and an optional brief user-facing message."
 
-        response = await CLIENT.aio.models.generate_content(
+        response = await create_model_interaction(
             model=TEXT_MODEL,
-            contents=[types.Content(role="user", parts=[types.Part(text=user_message)])],
-            config=types.GenerateContentConfig(
-                system_instruction=IMAGE_SYSTEM_PROMPT,
-                tools=[gen_tool],
-                tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="AUTO")),
-                temperature=0.7,
-                safety_settings=safety_settings
-            )
+            input_data=user_message,
+            system_instruction=IMAGE_SYSTEM_PROMPT,
+            safety_settings=INTERACTION_SAFETY_SETTINGS,
+            response_schema=IMAGE_PROMPT_SCHEMA,
         )
 
-        if not response.candidates:
-            await interaction.followup.send("[BLOCKED] 응답이 차단되었습니다.")
+        status = get_interaction_status(response)
+        if status not in {"completed", "incomplete"}:
+            await interaction.followup.send(f"[ERROR] 이미지 프롬프트 생성 중단 (status={status})")
             return
+        if status == "incomplete":
+            print("  [WARN] 이미지 프롬프트 interaction이 incomplete 상태로 종료되었습니다.")
 
-        candidate = response.candidates[0]
-        text_reply = ""
-        generated_prompt = None
-
-        for part in candidate.content.parts:
-            if part.text:
-                text_reply += part.text
-            if part.function_call and part.function_call.name == "generate_image":
-                args = part.function_call.args
-                generated_prompt = args.get("prompt", prompt)
-
-        if not generated_prompt:
-            generated_prompt = prompt
+        prompt_payload = coerce_json_object(extract_interaction_text(response)) or {}
+        generated_prompt = (prompt_payload.get("prompt") or prompt).strip()
+        text_reply = (prompt_payload.get("message") or "").strip()
 
         print(f"  [PROMPT] 정제된 프롬프트: {generated_prompt}")
 
