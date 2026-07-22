@@ -261,13 +261,6 @@ You are an AI image generator assistant.
 - If a reference image is provided, describe the requested edit while preserving relevant source details.
 """
 
-INTERACTION_SAFETY_SETTINGS = [
-    {"type": "harassment", "threshold": "block_none"},
-    {"type": "hate_speech", "threshold": "block_none"},
-    {"type": "sexually_explicit", "threshold": "block_none"},
-    {"type": "dangerous_content", "threshold": "block_none"},
-]
-
 # 현재 파일(gemini.py)이 있는 폴더 경로를 구함
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1572,7 +1565,6 @@ async def create_model_interaction(
     input_data,
     system_instruction=None,
     tools=None,
-    safety_settings=None,
     thinking_level=None,
     response_schema=None,
     response_format=None,
@@ -1587,11 +1579,6 @@ async def create_model_interaction(
         kwargs["system_instruction"] = system_instruction
     if tools:
         kwargs["tools"] = tools
-    if safety_settings:
-        if "safety_settings" in inspect.signature(interactions_api.create).parameters:
-            kwargs["safety_settings"] = safety_settings
-        else:
-            kwargs["extra_body"] = {"safety_settings": safety_settings}
     if thinking_level is not None:
         kwargs["generation_config"] = {"thinking_level": thinking_level}
     if response_schema is not None:
@@ -2131,7 +2118,6 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
             input_data=gemini_contents_to_interaction_steps(history_contents),
             system_instruction=build_gemini_system_prompt(),
             tools=[{"type": "google_search"}],
-            safety_settings=INTERACTION_SAFETY_SETTINGS,
             thinking_level=thinking_level,
         )
         return interaction, get_interaction_usage(interaction)
@@ -3478,7 +3464,6 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             input_data=gemini_contents_to_interaction_steps(contents),
             system_instruction=CHAT_SYSTEM_PROMPT,
             tools=[{"type": "google_search"}],
-            safety_settings=INTERACTION_SAFETY_SETTINGS,
         )
         token_usage = get_interaction_usage(response)
 
@@ -3566,7 +3551,6 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
             model=TEXT_MODEL,
             input_data=user_message,
             system_instruction=IMAGE_SYSTEM_PROMPT,
-            safety_settings=INTERACTION_SAFETY_SETTINGS,
             response_schema=IMAGE_PROMPT_SCHEMA,
         )
 
