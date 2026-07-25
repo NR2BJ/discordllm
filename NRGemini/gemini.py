@@ -1296,16 +1296,28 @@ def prepend_bot_target(text, display_name, user_id):
     return f"{marker}\n{body}"
 
 
+_INTERNAL_IDENTITY_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"\s*(?:>\s*)?(?:\*\*|__|`)?"
+    r"(?:"
+    r"\[CURRENT MESSAGE from [^\n]*? \(id:[^)\n]+\)\]|"
+    r"\[Bot replied to [^\n]*? \(id:[^)\n]+\)\]|"
+    r"\[from [^\n]*? \(id:[^)\n]+\)\]|"
+    r"\[사용자:[^\]\n]+\]|"
+    r"\[ID:[^\]\n]+\]"
+    r")"
+    r"(?:\*\*|__|`)?\s*"
+    r")+",
+    re.IGNORECASE,
+)
+
+
 def clean_assistant_response_text(text):
     if not isinstance(text, str):
         return text
-    # 신규 형식
-    text = re.sub(r"^\s*\[CURRENT MESSAGE from [^\]\n]+\]\s*", "", text)
-    text = re.sub(r"^\s*\[Bot replied to [^\]\n]+\]\s*", "", text)
-    text = re.sub(r"^\s*\[from [^\]\n]+\]\s*", "", text)
-    # 레거시 형식 호환
-    text = re.sub(r"^\s*\[사용자:[^\]\n]+\]\s*(?:\n\s*\[ID:[^\]\n]+\]\s*)?", "", text)
-    text = re.sub(r"^\s*\[ID:[^\]\n]+\]\s*", "", text)
+    # 모델이 Markdown을 씌우거나 같은 마커를 여러 번 복사해도 모두 제거한다.
+    text = _INTERNAL_IDENTITY_PREFIX_RE.sub("", text)
+    # 레거시 footer 형식 호환
     text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
     text = re.sub(r"\s*discord_author=\{[^\n]*\}\s*$", "", text)
     # 히스토리 이미지 마커 흉내 제거 (모델이 '(Bot sent an image: ...)' 같은 재구성 마커를 응답에 흘리는 경우 방어)
@@ -1619,6 +1631,65 @@ def get_interaction_output_value(output, key, default=None):
     if isinstance(output, dict):
         return output.get(key, default)
     return getattr(output, key, default)
+
+
+def summarize_interaction_response(interaction):
+    """Return a content-free diagnostic summary for failed/empty interactions."""
+    steps = get_interaction_output_value(interaction, "steps", None) or []
+    step_summaries = []
+    for step in steps:
+        step_type = str(get_interaction_output_value(step, "type", "unknown"))
+        summary = {"type": step_type}
+
+        if step_type == "model_output":
+            content = get_interaction_output_value(step, "content", None) or []
+            summary["content"] = [
+                {
+                    "type": str(get_interaction_output_value(item, "type", "unknown")),
+                    "text_chars": len(get_interaction_output_value(item, "text", "") or ""),
+                }
+                for item in content
+            ]
+            error = get_interaction_output_value(step, "error")
+            if error:
+                summary["error"] = {
+                    "code": get_interaction_output_value(error, "code"),
+                    "message": get_interaction_output_value(error, "message"),
+                    "details": get_interaction_output_value(error, "details"),
+                }
+        elif step_type == "thought":
+            thought_summary = get_interaction_output_value(step, "summary", None) or []
+            summary["summary_chars"] = sum(
+                len(get_interaction_output_value(item, "text", "") or "")
+                for item in thought_summary
+            )
+        elif step_type.endswith("_result"):
+            is_error = get_interaction_output_value(step, "is_error")
+            if is_error is not None:
+                summary["is_error"] = bool(is_error)
+
+        step_summaries.append(summary)
+
+    usage = get_interaction_output_value(interaction, "usage")
+    usage_summary = {
+        key: get_interaction_output_value(usage, key)
+        for key in (
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_thought_tokens",
+            "total_tool_use_tokens",
+            "total_tokens",
+        )
+        if get_interaction_output_value(usage, key) is not None
+    }
+    diagnostic = {
+        "id": get_interaction_output_value(interaction, "id"),
+        "status": get_interaction_status(interaction),
+        "model": get_interaction_output_value(interaction, "model"),
+        "steps": step_summaries,
+        "usage": usage_summary,
+    }
+    return json.dumps(diagnostic, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
 def decode_interaction_image(data):
@@ -2113,13 +2184,25 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
         text_model = TEXT_MODEL
 
     try:
-        interaction = await create_model_interaction(
-            model=text_model,
-            input_data=gemini_contents_to_interaction_steps(history_contents),
-            system_instruction=build_gemini_system_prompt(),
-            tools=[{"type": "google_search"}],
-            thinking_level=thinking_level,
-        )
+        input_data = gemini_contents_to_interaction_steps(history_contents)
+        interaction = None
+        for attempt in range(2):
+            interaction = await create_model_interaction(
+                model=text_model,
+                input_data=input_data,
+                system_instruction=build_gemini_system_prompt(),
+                tools=[{"type": "google_search"}],
+                thinking_level=thinking_level,
+            )
+            status = get_interaction_status(interaction)
+            raw_text = extract_interaction_text(interaction)
+            if status not in {"completed", "incomplete"} or clean_assistant_response_text(raw_text):
+                break
+            empty_kind = "marker_only" if raw_text else "empty"
+            print(
+                f"[WARN] Gemini {empty_kind} response "
+                f"(attempt={attempt + 1}/2) {summarize_interaction_response(interaction)}"
+            )
         return interaction, get_interaction_usage(interaction)
 
     except Exception as e:
@@ -3326,15 +3409,15 @@ async def on_message(message):
                 log_time = datetime.now().strftime('%H:%M:%S')
                 print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
 
-                text_reply = extract_interaction_text(response)
+                raw_text_reply = extract_interaction_text(response)
+                text_reply = clean_assistant_response_text(raw_text_reply)
                 if not text_reply:
-                    print(f"[WARN] model_output 텍스트가 없음 (status: {status})")
+                    print(f"[WARN] 빈 응답 또는 식별 마커만 반환됨 (status: {status})")
+                    await message.channel.send("[WARN] 모델이 내용 없는 응답을 반환했습니다. 다시 시도해주세요.")
                     return
 
-                if text_reply.strip():
-                    text_reply = clean_assistant_response_text(text_reply)
-                    print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Status: {status})")
-                    await send_long_message(message.channel, text_reply)
+                print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Status: {status})")
+                await send_long_message(message.channel, text_reply)
 
                 # video_calls 처리 — 비용 절감으로 임시 비활성화
 
