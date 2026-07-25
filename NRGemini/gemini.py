@@ -1365,6 +1365,39 @@ def merge_adjacent_contents(contents):
     return merged
 
 
+def label_discord_user_contents(entries):
+    """Add natural speaker labels while keeping Discord IDs out of model input."""
+    ordered_user_ids = []
+    display_names = {}
+    for content, user_id, display_name in entries:
+        if content.role != "user" or user_id is None:
+            continue
+        if user_id not in display_names:
+            ordered_user_ids.append(user_id)
+        display_names[user_id] = (display_name or str(user_id)).strip()
+
+    users_by_name = {}
+    for user_id in ordered_user_ids:
+        users_by_name.setdefault(display_names[user_id], []).append(user_id)
+
+    speaker_labels = {}
+    for display_name, user_ids in users_by_name.items():
+        for index, user_id in enumerate(user_ids, start=1):
+            speaker_labels[user_id] = (
+                display_name if len(user_ids) == 1 else f"{display_name} ({index})"
+            )
+
+    labeled = []
+    for content, user_id, _display_name in entries:
+        if content.role == "user" and user_id in speaker_labels:
+            content = types.Content(
+                role=content.role,
+                parts=[types.Part(text=f"{speaker_labels[user_id]}:\n"), *(content.parts or [])],
+            )
+        labeled.append(content)
+    return labeled
+
+
 def image_generation_inputs_to_blocks(contents):
     blocks = []
     for item in contents or []:
@@ -2923,7 +2956,7 @@ async def on_message(message):
                 reset_ts = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
 
-                history_list = []
+                history_entries = []
                 history_texts = []
                 history_position = 0
                 history_inline_images = 0
@@ -3000,16 +3033,21 @@ async def on_message(message):
                         if history_position >= history_scan_limit:
                             break
                         continue
-                    history_list.insert(0, types.Content(role=role, parts=parts))
+                    history_entries.insert(
+                        0,
+                        (
+                            types.Content(role=role, parts=parts),
+                            msg.author.id if role == "user" else None,
+                            get_server_display_name(message.guild, msg.author) if role == "user" else None,
+                        ),
+                    )
                     history_texts.insert(0, content)
                     history_position += 1
                     if history_position >= history_scan_limit:
                         break
 
-                history_list = merge_adjacent_contents(history_list)
-
                 print(
-                    f"[HISTORY] count={len(history_list)} text_window={history_limit} "
+                    f"[HISTORY] count={len(history_entries)} text_window={history_limit} "
                     f"image_window={image_history_limit} inline_images={history_inline_images}"
                 )
 
@@ -3133,8 +3171,15 @@ async def on_message(message):
                         await status_msg.edit(embed=status_embed)
                     return
 
+                conversation_entries = history_entries + [
+                    (
+                        types.Content(role="user", parts=current_parts),
+                        message.author.id,
+                        current_display_name,
+                    )
+                ]
                 full_contents = merge_adjacent_contents(
-                    history_list + [types.Content(role="user", parts=current_parts)]
+                    label_discord_user_contents(conversation_entries)
                 )
 
                 response, token_usage = await call_gemini(
