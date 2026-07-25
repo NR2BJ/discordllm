@@ -199,42 +199,15 @@ FOLLOWUP_IMAGE_EDIT_RE = re.compile(
     r"(만들|그려|그리|바꿔|변환|수정|편집|합성|처럼|같이|느낌|스타일|풍으로|make|draw|turn|change|edit|style)",
     re.IGNORECASE,
 )
-RECENT_IMAGE_INSPECTION_RE = re.compile(
-    r"((이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title).{0,60}"
-    r"(봐|봐봐|보라|보라고|보여|볼\s*수|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird)|"
-    r"(봐|봐봐|보라|보라고|보여|확인|분석|읽|제목|수상|이상|see|look|view|inspect|analy[sz]e|read|title|weird).{0,60}"
-    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|파일|제목|image|picture|photo|attachment|screenshot|title))",
-    re.IGNORECASE,
-)
-RECENT_IMAGE_REFERENCE_RE = re.compile(
-    r"((아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last).{0,40}"
-    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot)|"
-    r"(이미지|그림|사진|짤|첨부|캡처|스크린샷|image|picture|photo|attachment|screenshot).{0,40}"
-    r"(아까|방금|전에|이전|최근|위에|저번|earlier|previous|recent|above|last))",
-    re.IGNORECASE,
-)
-
 _COMMON_RULES = """## General Rules
-- Output response content directly. No prefixes like 'Bot:' or 'Model:'.
 - Respond in the user's language and mirror their tone (casual, formal, vulgar — match them).
 - If the user sets up a specific roleplay scenario (character, world, setting), maintain it consistently within that conversation. Do NOT treat casual chat as "established context" that must persist.
-- If you see `[System Error]` or `[Error]` in history, YOUR previous action failed.
-- When a URL is in the message, the system fetches it and attaches `[Webpage Content]` — use that content directly.
 - Analyze attached files (images/video/audio) when supported.
 - Keep responses concise and Discord-appropriate.
-- Never output fake tool-call JSON or fake actions such as `dalle.text2im`. If a tool was not actually called by the app, do not pretend it was.
 - Use Google Grounding Search (Web Search) actively since your training cutoff may be outdated."""
 
 SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
-
-## User Identification
-- Each historical user message starts with `[from display_name (id:numeric_id)]`.
-- The CURRENT message you should respond to starts with `[CURRENT MESSAGE from display_name (id:numeric_id)]` — focus your reply on this user.
-- Past bot replies start with `[Bot replied to display_name (id:numeric_id)]`, indicating which user that reply addressed.
-- The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
-- NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
-- Track each user's statements separately. What User A said is not what User B said.
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -268,9 +241,6 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("GEMINI_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_doc_cache"))
 DOC_CACHE_AUTO_REPLAY_WINDOW = 2
-RECENT_IMAGE_DIR = os.environ.get("GEMINI_RECENT_IMAGE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "gemini_recent_images"))
-RECENT_IMAGE_INDEX_FILE = os.path.join(RECENT_IMAGE_DIR, "index.json")
-RECENT_IMAGE_LIMIT = 2
 
 SOUND_DIR = os.path.join(BASE_DIR, "sb")
 SOUND_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.weba')
@@ -929,7 +899,7 @@ IMAGE_ACTION_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["respond_text", "inspect_recent_images", "generate_image"],
+            "enum": ["respond_text", "generate_image"],
         },
         "refined_prompt": {"type": "string"},
         "use_recent_images": {"type": "boolean"},
@@ -947,78 +917,6 @@ IMAGE_PROMPT_SCHEMA = {
     "required": ["prompt"],
 }
 
-
-class RecentImageStore:
-    def __init__(self, base_dir, index_file, *, limit=2):
-        self.base_dir = base_dir
-        self.index_file = index_file
-        self.limit = limit
-        os.makedirs(self.base_dir, exist_ok=True)
-        self.index = DataManager.load_json(self.index_file, {})
-
-    def _save(self):
-        DataManager.save_json(self.index_file, self.index)
-
-    def _entries(self, guild_id):
-        gid = str(guild_id)
-        entries = self.index.get(gid, [])
-        if not isinstance(entries, list):
-            entries = []
-        self.index[gid] = entries
-        return entries
-
-    def register_bytes(self, guild_id, *, channel_id, message_id, author_id, display_name, filename, image_bytes, source_kind):
-        gid = str(guild_id)
-        guild_dir = os.path.join(self.base_dir, gid)
-        os.makedirs(guild_dir, exist_ok=True)
-        ext = os.path.splitext(filename or "")[1].lower() or ".png"
-        safe_kind = re.sub(r"[^a-z0-9_]+", "_", (source_kind or "image").lower())
-        safe_name = re.sub(r"[^a-z0-9_]+", "_", Path(filename or "image").stem.lower()).strip("_") or "image"
-        output_name = f"{int(message_id)}_{safe_kind}_{safe_name}{ext}"
-        output_path = os.path.join(guild_dir, output_name)
-        with open(output_path, "wb") as f:
-            f.write(image_bytes)
-
-        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
-        entries = [entry for entry in entries if entry.get("path") != output_path]
-        entries.append(
-            {
-                "guild_id": int(guild_id),
-                "channel_id": int(channel_id),
-                "message_id": int(message_id),
-                "author_id": int(author_id),
-                "display_name": display_name or str(author_id),
-                "filename": filename or output_name,
-                "path": output_path,
-                "source_kind": source_kind,
-                "created_at": datetime.now(KST).isoformat(),
-            }
-        )
-        while len(entries) > self.limit:
-            old = entries.pop(0)
-            try:
-                os.remove(old.get("path", ""))
-            except OSError:
-                pass
-        self.index[gid] = entries
-        self._save()
-
-    def list_recent(self, guild_id, *, channel_id=None):
-        gid = str(guild_id)
-        entries = [entry for entry in self._entries(guild_id) if os.path.exists(entry.get("path", ""))]
-        self.index[gid] = entries
-        if channel_id is not None:
-            entries = [entry for entry in entries if str(entry.get("channel_id")) == str(channel_id)]
-        return entries[-self.limit:]
-
-    def describe_recent(self, guild_id, *, channel_id=None):
-        entries = self.list_recent(guild_id, channel_id=channel_id)
-        if not entries:
-            return "No recent images are stored."
-        return "\n".join(
-            f"{idx}. {entry.get('source_kind', 'image')} | {entry.get('display_name', 'unknown')} | {entry.get('filename', 'image')}"
-            for idx, entry in enumerate(reversed(entries), start=1)
-        )
 
 class DocumentCache:
     def __init__(self, cache_dir):
@@ -1122,18 +1020,16 @@ class DocumentCache:
 
     def render_blocks(self, message_id, full_content=False):
         blocks = []
+        if not full_content:
+            return blocks
         for doc in self.get_docs_for_message(message_id):
             doc_id = doc["id"]
             label = doc.get("source_label", "")
-            if full_content:
-                content = self.get_content(doc_id)
-                if content is None:
-                    continue
-                title = "Cached Webpage Content" if doc.get("type") == "webpage" else "Cached File Content"
-                blocks.append(f"[{title}: {doc_id} | {label}]\n```\n{content}\n```")
-            else:
-                title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
-                blocks.append(f"[{title}: {doc_id} | {label}]")
+            content = self.get_content(doc_id)
+            if content is None:
+                continue
+            source = "Webpage" if doc.get("type") == "webpage" else "Attached file"
+            blocks.append(f'{source} "{label}":\n\n{content}')
         return blocks
 
 
@@ -1141,7 +1037,7 @@ def trim_document_text(text, limit=MAX_DOC_CHARS):
     cleaned = (text or "").strip()
     if len(cleaned) <= limit:
         return cleaned
-    return cleaned[:limit].rstrip() + "\n...[truncated]..."
+    return cleaned[:limit].rstrip()
 
 
 def decode_text_bytes(raw_bytes):
@@ -1193,7 +1089,7 @@ def extract_xlsx_text(raw_bytes):
                 if cells:
                     rows.append(" | ".join(cells))
             if rows:
-                blocks.append(f"[Sheet: {sheet.title}]\n" + "\n".join(rows))
+                blocks.append(f'Sheet "{sheet.title}":\n' + "\n".join(rows))
         workbook.close()
         return trim_document_text("\n\n".join(blocks))
     except Exception:
@@ -1239,19 +1135,6 @@ async def extract_attachment_text(att):
     return None, None
 
 
-def build_recent_image_hint(guild_id, *, channel_id=None):
-    recent_desc = bot.recent_image_store.describe_recent(guild_id, channel_id=channel_id)
-    return (
-        "Recent stored images (actual files can be reattached by the app if you request visual inspection or editing):\n"
-        f"{recent_desc}"
-    )
-
-
-def get_bot_display_name():
-    user = getattr(bot, "user", None)
-    return getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
-
-
 def get_server_display_name(guild, user):
     user_id = getattr(user, "id", None)
     member = guild.get_member(user_id) if guild and user_id is not None else None
@@ -1262,71 +1145,6 @@ def get_server_display_name(guild, user):
     if guild:
         return str(user_id or "unknown")
     return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id or "unknown")
-
-
-def format_user_identity(guild, user, kind="history"):
-    """사용자 식별 마커 생성. kind: 'history' | 'current'"""
-    name = get_server_display_name(guild, user)
-    uid = str(getattr(user, "id", "unknown"))
-    if kind == "current":
-        return f"[CURRENT MESSAGE from {name} (id:{uid})]"
-    return f"[from {name} (id:{uid})]"
-
-
-def format_bot_target_marker(display_name, user_id):
-    """봇 응답이 어떤 사용자에게 답한 것인지 표시하는 prefix 마커."""
-    return f"[Bot replied to {display_name} (id:{user_id})]"
-
-
-def prepend_user_identity(text, guild, user, kind="history"):
-    """사용자 메시지 본문 앞에 식별 마커를 prefix로 붙임."""
-    body = (text or "").lstrip()
-    marker = format_user_identity(guild, user, kind=kind)
-    if not body:
-        return marker
-    return f"{marker}\n{body}"
-
-
-def prepend_bot_target(text, display_name, user_id):
-    """봇 응답 본문 앞에 응답 대상 사용자 마커를 prefix로 붙임."""
-    body = (text or "").lstrip()
-    marker = format_bot_target_marker(display_name, user_id)
-    if not body:
-        return marker
-    return f"{marker}\n{body}"
-
-
-_INTERNAL_IDENTITY_PREFIX_RE = re.compile(
-    r"^(?:"
-    r"\s*(?:>\s*)?(?:\*\*|__|`)?"
-    r"(?:"
-    r"\[CURRENT MESSAGE from [^\n]*? \(id:[^)\n]+\)\]|"
-    r"\[Bot replied to [^\n]*? \(id:[^)\n]+\)\]|"
-    r"\[from [^\n]*? \(id:[^)\n]+\)\]|"
-    r"\[사용자:[^\]\n]+\]|"
-    r"\[ID:[^\]\n]+\]"
-    r")"
-    r"(?:\*\*|__|`)?\s*"
-    r")+",
-    re.IGNORECASE,
-)
-
-
-def clean_assistant_response_text(text):
-    if not isinstance(text, str):
-        return text
-    # 모델이 Markdown을 씌우거나 같은 마커를 여러 번 복사해도 모두 제거한다.
-    text = _INTERNAL_IDENTITY_PREFIX_RE.sub("", text)
-    # 레거시 footer 형식 호환
-    text = re.sub(r"^\s*discord_author=\{[^\n]*\}\s*", "", text)
-    text = re.sub(r"\s*discord_author=\{[^\n]*\}\s*$", "", text)
-    # 히스토리 이미지 마커 흉내 제거 (모델이 '(Bot sent an image: ...)' 같은 재구성 마커를 응답에 흘리는 경우 방어)
-    text = re.sub(r"\(Bot sent an image:[^)\n]*\)", "", text)
-    text = re.sub(r"\(Bot generated an image here[^)\n]*\)", "", text)
-    text = re.sub(r"\(User attached an image:[^)\n]*\)", "", text)
-    text = re.sub(r"\[이미지 첨부됨\]", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
 
 def coerce_json_object(text):
@@ -1362,7 +1180,7 @@ def build_recent_conversation_excerpt(history_texts, limit=MEMORY_EXCERPT_MAX_CH
             lines.append(cleaned)
     excerpt = "\n\n".join(lines)
     if len(excerpt) > limit:
-        excerpt = "...[earlier context omitted]...\n" + excerpt[-limit:].lstrip()
+        excerpt = excerpt[-limit:].lstrip()
     return excerpt
 
 
@@ -1375,10 +1193,10 @@ def build_contextual_image_prompt(refined_prompt, current_request, history_texts
         "If the preferred visual prompt is generic or incomplete, make it specific using the current request and recent context.",
     ]
     if recent_context:
-        parts.append(f"[Recent Conversation Context]\n{recent_context}")
-    parts.append(f"[Current User Request]\n{(current_request or '').strip()}")
+        parts.append(f"Recent conversation context:\n{recent_context}")
+    parts.append(f"Current user request:\n{(current_request or '').strip()}")
     if refined_prompt:
-        parts.append(f"[Preferred Visual Prompt]\n{refined_prompt.strip()}")
+        parts.append(f"Preferred visual prompt:\n{refined_prompt.strip()}")
     return "\n\n".join(parts)
 
 
@@ -1444,20 +1262,6 @@ def has_image_generation_signal(text, *, has_current_images=False):
     return False
 
 
-def has_recent_image_reference_signal(text):
-    text = (text or "").strip()
-    if not text:
-        return False
-    return bool(RECENT_IMAGE_REFERENCE_RE.search(text))
-
-
-def has_recent_image_inspection_signal(text):
-    text = (text or "").strip()
-    if not text:
-        return False
-    return bool(RECENT_IMAGE_INSPECTION_RE.search(text))
-
-
 def should_call_action_router(
     text,
     *,
@@ -1469,10 +1273,6 @@ def should_call_action_router(
     if allow_image_generation and has_image_generation_signal(text, has_current_images=has_current_images):
         return True
     if allow_recent_images and has_recent_images and FOLLOWUP_IMAGE_EDIT_RE.search(text or ""):
-        return True
-    if allow_recent_images and has_recent_images and has_recent_image_inspection_signal(text):
-        return True
-    if allow_recent_images and has_recent_images and has_recent_image_reference_signal(text):
         return True
     return False
 
@@ -1552,6 +1352,19 @@ def gemini_contents_to_interaction_steps(contents):
     return steps
 
 
+def merge_adjacent_contents(contents):
+    merged = []
+    for content in contents or []:
+        if merged and merged[-1].role == content.role:
+            merged[-1] = types.Content(
+                role=content.role,
+                parts=[*(merged[-1].parts or []), *(content.parts or [])],
+            )
+        else:
+            merged.append(content)
+    return merged
+
+
 def image_generation_inputs_to_blocks(contents):
     blocks = []
     for item in contents or []:
@@ -1610,12 +1423,31 @@ async def call_interaction_get(interactions_api, interaction_id):
 
 
 def extract_interaction_text(interaction):
-    text = "\n\n".join(
-        block["text"] for block in collect_interaction_outputs(interaction) if block["type"] == "text"
-    ).strip()
-    if text:
-        return text
-    return (get_interaction_output_value(interaction, "output_text", "") or "").strip()
+    output_text = get_interaction_output_value(interaction, "output_text", "")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    parts = []
+    collecting = False
+    steps = get_interaction_output_value(interaction, "steps", None) or []
+    for step in reversed(steps):
+        step_type = get_interaction_output_value(step, "type", "")
+        if step_type == "user_input":
+            break
+        if step_type != "model_output":
+            if collecting:
+                break
+            continue
+        for block in reversed(get_interaction_output_value(step, "content", None) or []):
+            text = get_interaction_output_value(block, "text")
+            if get_interaction_output_value(block, "type", "") == "text" and text:
+                collecting = True
+                parts.append(text)
+            elif collecting:
+                parts.reverse()
+                return "".join(parts).strip()
+    parts.reverse()
+    return "".join(parts).strip()
 
 
 def get_interaction_usage(interaction):
@@ -1631,6 +1463,23 @@ def get_interaction_output_value(output, key, default=None):
     if isinstance(output, dict):
         return output.get(key, default)
     return getattr(output, key, default)
+
+
+def get_interaction_error_message(interaction):
+    error = get_interaction_output_value(interaction, "error")
+    steps = get_interaction_output_value(interaction, "steps", None) or []
+    if not error:
+        for step in reversed(steps):
+            error = get_interaction_output_value(step, "error")
+            if error:
+                break
+    if not error:
+        return ""
+    message = get_interaction_output_value(error, "message")
+    code = get_interaction_output_value(error, "code")
+    if message and code:
+        return f"{code}: {message}"
+    return str(message or code or error)
 
 
 def summarize_interaction_response(interaction):
@@ -1711,7 +1560,7 @@ def collect_interaction_outputs(interaction):
 
     google-genai 2.x의 Interactions API는 결과를 `outputs`가 아니라
     `steps[].content[]`(type=model_output)로 반환한다. thought/tool 스텝은 건너뛰고
-    model_output 스텝의 content 블록만 모은다. 구형 `outputs` 응답도 폴백으로 지원."""
+    model_output 스텝의 content 블록만 모은다."""
     steps = (
         interaction.get("steps")
         if isinstance(interaction, dict)
@@ -1722,12 +1571,6 @@ def collect_interaction_outputs(interaction):
         if get_interaction_output_value(step, "type", "") != "model_output":
             continue
         blocks.extend(get_interaction_output_value(step, "content", None) or [])
-    if not blocks:
-        blocks = (
-            interaction.get("outputs")
-            if isinstance(interaction, dict)
-            else getattr(interaction, "outputs", None)
-        ) or []
     collected = []
     for output in blocks:
         output_type = get_interaction_output_value(output, "type", "")
@@ -1965,7 +1808,14 @@ async def call_deep_research(research_topic, agent_id):
         return f"[ERROR] Deep Research 호출 실패: {e}"
 
 
-async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_current_images=False, text_model=None, recent_context=None):
+async def route_message_action(
+    last_user_msg,
+    *,
+    has_current_images=False,
+    has_recent_images=False,
+    text_model=None,
+    recent_context=None,
+):
     if not CLIENT:
         return {
             "action": "respond_text",
@@ -1976,26 +1826,6 @@ async def route_message_action(last_user_msg, *, guild_id, channel_id=None, has_
     if text_model is None:
         text_model = TEXT_MODEL
     text_model = get_structured_helper_model(text_model)
-    recent_images = bot.recent_image_store.list_recent(guild_id, channel_id=channel_id)
-    if recent_images and not has_current_images and has_recent_image_inspection_signal(last_user_msg):
-        return {
-            "action": "inspect_recent_images",
-            "refined_prompt": "",
-            "use_recent_images": True,
-            "reason": "direct_recent_image_inspection_signal",
-        }
-
-    inspect_action_text = ""
-    inspect_rule_text = ""
-    recent_image_hint = ""
-    if recent_images:
-        inspect_action_text = "- inspect_recent_images: the app should reattach the stored recent images before answering."
-        inspect_rule_text = (
-            "- Choose inspect_recent_images only when the user is asking about something visible in a previous image.\n"
-            "- `use_recent_images` should be true only when the app should attach the stored recent images as references."
-        )
-        recent_image_hint = f"{build_recent_image_hint(guild_id, channel_id=channel_id)}\n"
-
     recent_context = (recent_context or "").strip()
     prompt = f"""
 You are a routing planner for a Discord AI bot.
@@ -2003,20 +1833,17 @@ Decide the next action for the assistant.
 
 Available actions:
 - respond_text: normal text reply.
-{inspect_action_text}
 - generate_image: the user wants a new image or wants to edit/transform an image. In this case, write a refined English prompt for the image model.
 
 Rules:
-- Do not choose inspect_recent_images if the current message already includes image attachments.
 - Do not infer that product names, drinks, people, or objects refer to stored images by themselves.
 - Do not choose generate_image unless the user clearly wants image creation or visual transformation/editing.
 - If the current message is only a complaint, acknowledgement, or confusion about a previous answer/image, choose respond_text.
 - If the current message is a follow-up image request or edit request, use the recent conversation excerpt to resolve the subject/style and write a specific refined prompt.
-{inspect_rule_text}
+- `use_recent_images` should be true only for editing or transforming a recent image.
 
 Current message has image attachments: {has_current_images}
-
-{recent_image_hint}
+Recent image references are available: {has_recent_images}
 
 Recent conversation excerpt:
 {recent_context or '(empty)'}
@@ -2035,16 +1862,13 @@ User message:
         if not payload:
             raise ValueError("empty or invalid JSON route response")
         action = payload.get("action", "respond_text")
-        if action not in {"respond_text", "inspect_recent_images", "generate_image"}:
+        if action not in {"respond_text", "generate_image"}:
             action = "respond_text"
-        if action == "inspect_recent_images" and (has_current_images or not recent_images):
-            action = "respond_text"
-            payload["use_recent_images"] = False
         if (
             action == "generate_image"
             and not payload.get("use_recent_images")
             and not has_current_images
-            and recent_images
+            and has_recent_images
             and FOLLOWUP_IMAGE_EDIT_RE.search(last_user_msg or "")
         ):
             payload["use_recent_images"] = True
@@ -2061,7 +1885,7 @@ User message:
             return {
                 "action": "generate_image",
                 "refined_prompt": "",
-                "use_recent_images": bool(is_followup_edit and recent_images and not has_current_images),
+                "use_recent_images": bool(is_followup_edit and has_recent_images and not has_current_images),
                 "reason": "routing failure direct image signal",
             }
         return {
@@ -2179,34 +2003,20 @@ async def call_nano_banana(contents, image_model=None):
                 raise e
 
 async def call_gemini(history_contents, text_model=None, thinking_level=None):
-    if not CLIENT: return "Error: API Client not initialized", 0
+    if not CLIENT:
+        raise RuntimeError("API Client not initialized")
     if text_model is None:
         text_model = TEXT_MODEL
 
-    try:
-        input_data = gemini_contents_to_interaction_steps(history_contents)
-        interaction = None
-        for attempt in range(2):
-            interaction = await create_model_interaction(
-                model=text_model,
-                input_data=input_data,
-                system_instruction=build_gemini_system_prompt(),
-                tools=[{"type": "google_search"}],
-                thinking_level=thinking_level,
-            )
-            status = get_interaction_status(interaction)
-            raw_text = extract_interaction_text(interaction)
-            if status not in {"completed", "incomplete"} or clean_assistant_response_text(raw_text):
-                break
-            empty_kind = "marker_only" if raw_text else "empty"
-            print(
-                f"[WARN] Gemini {empty_kind} response "
-                f"(attempt={attempt + 1}/2) {summarize_interaction_response(interaction)}"
-            )
-        return interaction, get_interaction_usage(interaction)
-
-    except Exception as e:
-        return f"Error: {e}", 0
+    input_data = gemini_contents_to_interaction_steps(history_contents)
+    interaction = await create_model_interaction(
+        model=text_model,
+        input_data=input_data,
+        system_instruction=build_gemini_system_prompt(),
+        tools=[{"type": "google_search"}],
+        thinking_level=thinking_level,
+    )
+    return interaction, get_interaction_usage(interaction)
 
 # ================= 4. 봇 메인 로직 =================
 class GeminiBot(commands.Bot):
@@ -2224,7 +2034,6 @@ class GeminiBot(commands.Bot):
         self.voice_bad_state_counts = {}
         self.loop_monitor_expected = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
-        self.recent_image_store = RecentImageStore(RECENT_IMAGE_DIR, RECENT_IMAGE_INDEX_FILE, limit=RECENT_IMAGE_LIMIT)
         self.sound_files = scan_sound_files()
         global_cfg = self.get_global_config()
         self.sound_volume = clamp_sound_volume(global_cfg.get("sound_volume", SOUND_VOLUME))
@@ -3116,7 +2925,6 @@ async def on_message(message):
 
                 history_list = []
                 history_texts = []
-                history_meta = []
                 history_position = 0
                 history_inline_images = 0
                 history_ref_images = []
@@ -3125,7 +2933,11 @@ async def on_message(message):
                     if msg.id == message.id: continue
                     if msg.id > message.id and msg.author != bot.user: continue
                     if reset_ts and msg.created_at < reset_ts: break
-                    if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
+                    interaction_output = msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None
+                    has_image_output = any(is_image_attachment(att) for att in msg.attachments)
+                    if interaction_output and not has_image_output:
+                        continue
+                    if msg.author == bot.user and not msg.content and not msg.attachments:
                         continue
 
                     within_text_history = history_position < history_limit
@@ -3139,16 +2951,9 @@ async def on_message(message):
                     image_parts = []
                     if msg.author == bot.user:
                         content = msg.content if within_text_history else ""
-                        if within_text_history and ('"action":' in content or '"prompt":' in content):
-                            content = "[System Log: Action Performed]"
-                        elif within_text_history and "Error" in content:
-                            content = "[System Error Log]"
                         if msg.attachments:
                             for att in msg.attachments:
                                 if is_image_attachment(att):
-                                    # 봇이 과거 생성/전송한 이미지: 마커 대신 실제 이미지 재첨부 (이미지 윈도우 내).
-                                    # '(Bot sent an image: ...)' 마커를 모델 role 히스토리에 남기면 모델이 그 텍스트를
-                                    # 흉내내서 generate_image 툴 호출 대신 마커만 출력함. 마커는 절대 남기지 않음.
                                     if within_image_history:
                                         d, m = await download_media(att.url)
                                         if d:
@@ -3160,16 +2965,11 @@ async def on_message(message):
                                                 history_ref_images.append(Image.open(io.BytesIO(raw)).copy())
                                             except Exception:
                                                 pass
-                                    # 윈도우 밖이면 마커 없이 생략
-                                elif within_text_history and att.content_type and att.content_type.startswith('video'):
-                                    content += f"\n(Bot generated a video here: {att.filename})"
                     else:
-                        content = msg.content if (within_text_history or within_image_history) else ""
+                        content = msg.content if within_text_history else ""
                         if msg.attachments:
                             for att in msg.attachments:
                                 if is_image_attachment(att):
-                                    # 이미지 윈도우 내: 실제 이미지 재첨부(마커 없음). 윈도우 밖: 마커로만 컨텍스트 표시.
-                                    reattached = False
                                     if within_image_history:
                                         d, m = await download_media(att.url)
                                         if d:
@@ -3181,28 +2981,16 @@ async def on_message(message):
                                                 history_ref_images.append(Image.open(io.BytesIO(raw)).copy())
                                             except Exception:
                                                 pass
-                                            reattached = True
-                                        else:
-                                            content += f"\n(User attached an image: {att.filename}) (image download failed)"
-                                    if not reattached and within_text_history and not within_image_history:
-                                        content += f"\n(User attached an image: {att.filename})"
-                                elif within_text_history and is_audio_or_video_attachment(att):
-                                    media_type = attachment_media_type(att)
-                                    content += f"\n(User attached a {media_type} file: {att.filename})"
                                 elif within_text_history:
                                     file_text, file_kind = await extract_attachment_text(att)
                                     if file_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
                                         bot.doc_cache.store_document("text_file", att.filename, file_text, msg.id, msg.channel.id)
-                                        content += f"\n\n[Attached File Content: {att.filename}]\n```\n{file_text}\n```"
-                                    elif file_kind:
-                                        content += f"\n(User attached a {file_kind} file: {att.filename})"
+                                        content += f'\n\nAttached file "{att.filename}":\n\n{file_text}'
 
                     if cached_doc_blocks:
                         content += "\n\n" + "\n\n".join(cached_doc_blocks)
 
                     role = "model" if msg.author == bot.user else "user"
-                    if role == "user":
-                        content = prepend_user_identity(content, message.guild, msg.author, kind="history")
                     parts = []
                     if content.strip():
                         parts.append(types.Part(text=content))
@@ -3214,29 +3002,11 @@ async def on_message(message):
                         continue
                     history_list.insert(0, types.Content(role=role, parts=parts))
                     history_texts.insert(0, content)
-                    # 후처리(봇 응답 대상 마커)용 메타 — history_list와 1:1
-                    user_info = (
-                        None if msg.author == bot.user
-                        else (get_server_display_name(message.guild, msg.author), str(msg.author.id))
-                    )
-                    history_meta.insert(0, {"is_bot": msg.author == bot.user, "user_info": user_info})
                     history_position += 1
                     if history_position >= history_scan_limit:
                         break
 
-                # 봇 응답에 [Bot replied to ...] prefix 추가 (직전 user 메시지 기준)
-                last_user_info = None
-                for idx, meta in enumerate(history_meta):
-                    if meta["is_bot"]:
-                        if last_user_info:
-                            cur = history_list[idx]
-                            if cur.parts and cur.parts[0].text:
-                                new_text = prepend_bot_target(cur.parts[0].text, *last_user_info)
-                                history_list[idx] = types.Content(role=cur.role, parts=[types.Part(text=new_text)])
-                                history_texts[idx] = new_text
-                    else:
-                        if meta["user_info"]:
-                            last_user_info = meta["user_info"]
+                history_list = merge_adjacent_contents(history_list)
 
                 print(
                     f"[HISTORY] count={len(history_list)} text_window={history_limit} "
@@ -3244,11 +3014,11 @@ async def on_message(message):
                 )
 
                 current_display_name = get_server_display_name(message.guild, message.author)
-                # 현재 메시지 본문에 [CURRENT MESSAGE from ...] prefix 적용
-                current_text_with_marker = prepend_user_identity(message.content, message.guild, message.author, kind="current")
-                current_parts = [types.Part(text=current_text_with_marker)] if current_text_with_marker else []
+                current_text = message.content.strip()
+                current_parts = [types.Part(text=current_text)] if current_text else []
                 current_ref_images = []
                 has_current_images = False
+                failed_attachments = []
 
                 urls = re.findall(r'(https?://\S+)', message.content)
                 for url in urls:
@@ -3256,7 +3026,7 @@ async def on_message(message):
                     if web_content:
                         doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
                         print(f"[CACHE] webpage 저장: {doc_id} ({url})")
-                        current_parts.append(types.Part(text=f"\n\n[Webpage Content: {url}]\n```\n{web_content}\n```"))
+                        current_parts.append(types.Part(text=f'Webpage "{url}":\n\n{web_content}'))
                         print(f"[WEB] 웹사이트 내용 읽음: {url}")
 
                 if message.attachments:
@@ -3272,18 +3042,8 @@ async def on_message(message):
                                     current_ref_images.append(Image.open(io.BytesIO(raw)).copy())
                                 except Exception:
                                     pass
-                                bot.recent_image_store.register_bytes(
-                                    message.guild.id,
-                                    channel_id=message.channel.id,
-                                    message_id=message.id,
-                                    author_id=message.author.id,
-                                    display_name=current_display_name,
-                                    filename=att.filename,
-                                    image_bytes=raw,
-                                    source_kind="user_upload",
-                                )
                             else:
-                                current_parts.append(types.Part(text=f"\n(User attached an image: {att.filename}, but it could not be downloaded.)"))
+                                failed_attachments.append(att.filename)
                         elif is_audio_or_video_attachment(att):
                             d, m = await download_media(att.url)
                             if d:
@@ -3296,13 +3056,25 @@ async def on_message(message):
                                     file_ref = await upload_file_api(file_bytes, m)
                                     if file_ref:
                                         current_parts.append(types.Part(file_data=types.FileData(file_uri=file_ref.uri, mime_type=m)))
+                                    else:
+                                        failed_attachments.append(att.filename)
                                 print(f"[{media_type.upper()}] {media_type} 첨부: {att.filename} ({len(file_bytes)} bytes)")
+                            else:
+                                failed_attachments.append(att.filename)
                         else:
                             file_content, file_kind = await extract_attachment_text(att)
                             if file_content:
                                 doc_id = bot.doc_cache.store_document("text_file", att.filename, file_content, message.id, message.channel.id)
                                 print(f"[CACHE] {file_kind or 'text'} file 저장: {doc_id} ({att.filename})")
-                                current_parts.append(types.Part(text=f"\n\n[Attached File Content: {att.filename}]\n```\n{file_content}\n```"))
+                                current_parts.append(types.Part(text=f'Attached file "{att.filename}":\n\n{file_content}'))
+                            else:
+                                failed_attachments.append(att.filename)
+
+                if failed_attachments:
+                    print(f"[WARN] 첨부 파일 읽기 실패: {', '.join(failed_attachments)}")
+                if not current_parts:
+                    await message.channel.send("첨부 파일을 읽지 못했습니다. 파일을 다시 올려주세요.")
+                    return
 
                 route = {
                     "action": "respond_text",
@@ -3311,21 +3083,9 @@ async def on_message(message):
                     "reason": "action_router_skipped",
                 }
                 action_router_enabled = is_enabled(config.get("action_router", DEFAULT_ACTION_ROUTER_ENABLED))
-                recent_images_available = bool(bot.recent_image_store.list_recent(message.guild.id, channel_id=message.channel.id))
+                recent_images_available = bool(history_ref_images)
                 recent_context = build_recent_conversation_excerpt(history_texts)
-                direct_recent_image_inspection = (
-                    recent_images_available
-                    and not has_current_images
-                    and has_recent_image_inspection_signal(message.content)
-                )
-                if direct_recent_image_inspection:
-                    route = {
-                        "action": "inspect_recent_images",
-                        "refined_prompt": "",
-                        "use_recent_images": True,
-                        "reason": "direct_recent_image_inspection_signal",
-                    }
-                elif action_router_enabled and should_call_action_router(
+                if action_router_enabled and should_call_action_router(
                     message.content,
                     has_current_images=has_current_images,
                     has_recent_images=recent_images_available,
@@ -3334,9 +3094,8 @@ async def on_message(message):
                 ):
                     route = await route_message_action(
                         message.content,
-                        guild_id=message.guild.id,
-                        channel_id=message.channel.id,
                         has_current_images=has_current_images,
+                        has_recent_images=recent_images_available,
                         text_model=server_text_model,
                         recent_context=recent_context,
                     )
@@ -3351,40 +3110,32 @@ async def on_message(message):
                         ref_images = list(history_ref_images)
 
                     print(f"[IMG] 라우팅 생성 요청: '{display_prompt}' (현재첨부={len(current_ref_images)} 최근참조={len(ref_images)} ctx={len(recent_context)})")
-                    status_msg = await message.channel.send(f"**Prompt:** `{compact_prompt_for_status(display_prompt)}`")
+                    status_embed = discord.Embed(
+                        title="이미지 생성 중",
+                        description=compact_prompt_for_status(display_prompt),
+                    )
+                    status_msg = await message.channel.send(embed=status_embed)
                     req_content = ref_images + [generation_prompt]
                     try:
                         img_data = await call_nano_banana(req_content, image_model=server_image_model)
-                        bot.recent_image_store.register_bytes(
-                            message.guild.id,
-                            channel_id=message.channel.id,
-                            message_id=message.id,
-                            author_id=bot.user.id,
-                            display_name=get_bot_display_name(),
-                            filename="generated.png",
-                            image_bytes=img_data,
-                            source_kind="bot_generated",
-                        )
                         with io.BytesIO(img_data) as binary:
                             binary.seek(0)
                             fn = "edited.png" if ref_images else "generated.png"
                             await message.channel.send(file=discord.File(fp=binary, filename=fn))
-                        await status_msg.edit(content=f"[OK] **Generated Prompt:** `{compact_prompt_for_status(display_prompt)}`")
+                        status_embed.title = "이미지 생성 완료"
+                        await status_msg.edit(embed=status_embed)
                         print(f"[BOT]({server_image_model}): [이미지 생성 완료]")
                     except Exception as e:
-                        err_msg = f"[ERROR] Image Generation Failed: {str(e)}"
+                        err_msg = f"이미지 생성 실패: {str(e)}"
                         print(err_msg)
-                        await status_msg.edit(content=err_msg)
+                        status_embed.title = "이미지 생성 실패"
+                        status_embed.description = str(e)
+                        await status_msg.edit(embed=status_embed)
                     return
 
-                if route.get("action") == "inspect_recent_images" and not has_current_images and route.get("use_recent_images"):
-                    print(
-                        f"[IMG] 과거 이미지 요청: history_inline_images={history_inline_images} "
-                        f"image_history={image_history_limit} reason={route.get('reason')}"
-                    )
-
-                # 현재 메시지의 [CURRENT MESSAGE from ...] prefix는 이미 current_parts[0]에 포함됨
-                full_contents = history_list + [types.Content(role="user", parts=current_parts)]
+                full_contents = merge_adjacent_contents(
+                    history_list + [types.Content(role="user", parts=current_parts)]
+                )
 
                 response, token_usage = await call_gemini(
                     full_contents,
@@ -3392,16 +3143,11 @@ async def on_message(message):
                     thinking_level=config.get("thinking_level"),
                 )
 
-                if isinstance(response, str):
-                    response = clean_assistant_response_text(response)
-                    await send_long_message(message.channel, response)
-                    return
-
                 status = get_interaction_status(response)
                 if status not in {"completed", "incomplete"}:
-                    error = get_interaction_output_value(response, "error")
+                    error = get_interaction_error_message(response)
                     detail = f": {error}" if error else ""
-                    await message.channel.send(f"[ERROR] 응답 생성 중단 (status={status}){detail}")
+                    await message.channel.send(f"응답 생성이 중단되었습니다 (status={status}){detail}")
                     return
                 if status == "incomplete":
                     print("[WARN] Gemini interaction이 incomplete 상태로 종료되어 부분 응답을 전송합니다.")
@@ -3409,11 +3155,12 @@ async def on_message(message):
                 log_time = datetime.now().strftime('%H:%M:%S')
                 print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
 
-                raw_text_reply = extract_interaction_text(response)
-                text_reply = clean_assistant_response_text(raw_text_reply)
+                text_reply = extract_interaction_text(response)
                 if not text_reply:
-                    print(f"[WARN] 빈 응답 또는 식별 마커만 반환됨 (status: {status})")
-                    await message.channel.send("[WARN] 모델이 내용 없는 응답을 반환했습니다. 다시 시도해주세요.")
+                    error = get_interaction_error_message(response)
+                    print(f"[WARN] Gemini content-free response {summarize_interaction_response(response)}")
+                    detail = f" ({error})" if error else ""
+                    await message.channel.send(f"Gemini가 텍스트 응답을 생성하지 못했습니다{detail}")
                     return
 
                 print(f"[BOT]({server_text_model}): {text_reply} (Tokens: {token_usage}, Status: {status})")
@@ -3425,7 +3172,7 @@ async def on_message(message):
 
             except Exception as e:
                 print(f"[CRITICAL] Error: {e}")
-                await message.channel.send(f"[ERROR] 오류 발생: {e}")
+                await message.channel.send(f"오류가 발생했습니다: {e}")
 
 # ================= 5. 서버 설정 명령어 =================
 
@@ -3627,7 +3374,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
 
         user_message = f"User request: {prompt}"
         if has_reference:
-            user_message += "\n(A reference image is provided for editing)"
+            user_message += "\nA reference image is provided for editing."
         user_message += "\n\nReturn the refined image prompt and an optional brief user-facing message."
 
         response = await create_model_interaction(
@@ -3651,29 +3398,15 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
         print(f"  [PROMPT] 정제된 프롬프트: {generated_prompt}")
 
         if text_reply.strip():
-            clean_reply = re.sub(r'\{.*"prompt".*\}', '', text_reply, flags=re.DOTALL).strip()
-            clean_reply = clean_assistant_response_text(clean_reply)
-            if clean_reply:
-                if len(clean_reply) > 1900:
-                    clean_reply = clean_reply[:1900] + "..."
-                await interaction.followup.send(clean_reply)
-                print(f"  [BOT]({TEXT_MODEL}): {clean_reply}")
+            if len(text_reply) > 1900:
+                text_reply = text_reply[:1900] + "..."
+            await interaction.followup.send(text_reply)
+            print(f"  [BOT]({TEXT_MODEL}): {text_reply}")
 
         status_msg = await interaction.followup.send(f"**Generating:** `{generated_prompt}`")
 
         req_content = ref_images + [generated_prompt] if ref_images else [generated_prompt]
         img_data = await call_nano_banana(req_content)
-        if interaction.guild_id is not None:
-            bot.recent_image_store.register_bytes(
-                interaction.guild_id,
-                channel_id=interaction.channel_id,
-                message_id=interaction.id,
-                author_id=bot.user.id,
-                display_name=get_bot_display_name(),
-                filename="generated.png",
-                image_bytes=img_data,
-                source_kind="bot_generated",
-            )
         with io.BytesIO(img_data) as binary:
             binary.seek(0)
             fn = "edited.png" if ref_images else "generated.png"
