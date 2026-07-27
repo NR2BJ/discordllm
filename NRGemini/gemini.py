@@ -16,9 +16,11 @@ import io
 import warnings
 import re
 import tempfile
+import traceback
 import time as time_module
 import math
 import inspect
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from PIL import Image
 from datetime import datetime, timedelta, timezone
@@ -42,6 +44,11 @@ except Exception:
     load_workbook = None
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.genai._api_client")
+
+try:
+    GENAI_SDK_VERSION = package_version("google-genai")
+except PackageNotFoundError:
+    GENAI_SDK_VERSION = "unknown"
 
 
 def is_enabled(value):
@@ -76,6 +83,8 @@ try:
 except Exception as e:
     print(f"[ERROR] Google Client 초기화 실패: {e}")
     CLIENT = None
+
+print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 
 AVAILABLE_MODELS = {
     # Pro (3 levels: low / medium / high — minimal 미지원)
@@ -1499,6 +1508,144 @@ def get_interaction_output_value(output, key, default=None):
     return getattr(output, key, default)
 
 
+def summarize_interaction_request(
+    input_data,
+    *,
+    model,
+    thinking_level,
+    system_instruction,
+    tools,
+    store,
+):
+    """Summarize request shape without logging message text or media payloads."""
+    step_counts = {}
+    block_counts = {}
+    text_chars = 0
+    inline_media_bytes = 0
+    uri_media = 0
+
+    for step in input_data or []:
+        step_type = str(get_interaction_output_value(step, "type", "unknown"))
+        step_counts[step_type] = step_counts.get(step_type, 0) + 1
+        for block in get_interaction_output_value(step, "content", None) or []:
+            block_type = str(get_interaction_output_value(block, "type", "unknown"))
+            block_counts[block_type] = block_counts.get(block_type, 0) + 1
+            text_chars += len(get_interaction_output_value(block, "text", "") or "")
+
+            data = get_interaction_output_value(block, "data")
+            if isinstance(data, str):
+                payload = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+                inline_media_bytes += max(0, (len(payload) * 3) // 4 - payload[-2:].count("="))
+            elif isinstance(data, (bytes, bytearray, memoryview)):
+                inline_media_bytes += len(data)
+            if get_interaction_output_value(block, "uri"):
+                uri_media += 1
+
+    tool_types = [
+        str(get_interaction_output_value(tool, "type", type(tool).__name__))
+        for tool in (tools or [])
+    ]
+    return {
+        "model": model,
+        "thinking_level": thinking_level or "model_default",
+        "store": bool(store),
+        "system_chars": len(system_instruction or ""),
+        "steps": step_counts,
+        "blocks": block_counts,
+        "stateless_model_history_without_thought_steps": bool(
+            step_counts.get("model_output") and not step_counts.get("thought")
+        ),
+        "text_chars": text_chars,
+        "inline_media_bytes": inline_media_bytes,
+        "uri_media": uri_media,
+        "tools": tool_types,
+    }
+
+
+async def create_traced_interaction(
+    call_trace,
+    *,
+    phase,
+    model,
+    input_data,
+    system_instruction,
+    thinking_level,
+    tools=None,
+):
+    request_summary = summarize_interaction_request(
+        input_data,
+        model=model,
+        thinking_level=thinking_level,
+        system_instruction=system_instruction,
+        tools=tools,
+        store=False,
+    )
+    started = time_module.perf_counter()
+    try:
+        interaction = await create_model_interaction(
+            model=model,
+            input_data=input_data,
+            system_instruction=system_instruction,
+            tools=tools,
+            thinking_level=thinking_level,
+        )
+    except Exception as e:
+        call_trace["calls"].append(
+            {
+                "phase": phase,
+                "elapsed_ms": round((time_module.perf_counter() - started) * 1000),
+                "request": request_summary,
+            }
+        )
+        print(
+            f"[ERROR] Gemini {phase} interaction failed "
+            f"trace={json.dumps(call_trace, ensure_ascii=False, default=str, separators=(',', ':'))} "
+            f"exception={type(e).__name__}: {e}"
+        )
+        raise
+
+    call_trace["calls"].append(
+        {
+            "phase": phase,
+            "elapsed_ms": round((time_module.perf_counter() - started) * 1000),
+            "request": request_summary,
+        }
+    )
+    return interaction
+
+
+def get_interaction_present_fields(interaction):
+    if isinstance(interaction, dict):
+        return sorted(str(key) for key in interaction)
+
+    fields = getattr(interaction, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(interaction, "__fields_set__", None)
+    return sorted(str(key) for key in (fields or []))
+
+
+def classify_content_free_interaction(interaction):
+    steps = get_interaction_output_value(interaction, "steps", None) or []
+    usage = get_interaction_output_value(interaction, "usage")
+    output_tokens = int(get_interaction_output_value(usage, "total_output_tokens", 0) or 0)
+    thought_tokens = int(get_interaction_output_value(usage, "total_thought_tokens", 0) or 0)
+
+    if not steps:
+        if thought_tokens and not output_tokens:
+            return "thought_tokens_without_output_steps"
+        return "no_output_steps"
+
+    model_outputs = [
+        step for step in steps
+        if get_interaction_output_value(step, "type", "") == "model_output"
+    ]
+    if not model_outputs:
+        return "no_model_output_step"
+    if any(get_interaction_output_value(step, "error") for step in model_outputs):
+        return "model_output_error"
+    return "model_output_without_text"
+
+
 def get_interaction_error_message(interaction):
     error = get_interaction_output_value(interaction, "error")
     steps = get_interaction_output_value(interaction, "steps", None) or []
@@ -1597,6 +1744,12 @@ def summarize_interaction_response(interaction):
         "id": get_interaction_output_value(interaction, "id"),
         "status": get_interaction_status(interaction),
         "model": get_interaction_output_value(interaction, "model"),
+        "empty_kind": classify_content_free_interaction(interaction),
+        "present_fields": get_interaction_present_fields(interaction),
+        "created": get_interaction_output_value(interaction, "created"),
+        "updated": get_interaction_output_value(interaction, "updated"),
+        "service_tier": get_interaction_output_value(interaction, "service_tier"),
+        "response_modalities": get_interaction_output_value(interaction, "response_modalities"),
         "steps": step_summaries,
         "usage": usage_summary,
     }
@@ -2071,10 +2224,14 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
         text_model = TEXT_MODEL
 
     input_data = gemini_contents_to_interaction_steps(history_contents)
-    interaction = await create_model_interaction(
+    system_instruction = build_gemini_system_prompt()
+    call_trace = {"sdk_version": GENAI_SDK_VERSION, "calls": []}
+    interaction = await create_traced_interaction(
+        call_trace,
+        phase="initial",
         model=text_model,
         input_data=input_data,
-        system_instruction=build_gemini_system_prompt(),
+        system_instruction=system_instruction,
         tools=[GOOGLE_SEARCH_TOOL],
         thinking_level=thinking_level,
     )
@@ -2085,17 +2242,21 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
         if continuation_steps:
             print(
                 "[WARN] Google Search 결과 뒤 최종 출력이 없어 같은 검색 결과로 생성을 이어갑니다. "
-                f"{summarize_interaction_response(interaction)}"
+                f"response={summarize_interaction_response(interaction)} "
+                f"call={json.dumps(call_trace, ensure_ascii=False, default=str, separators=(',', ':'))}"
             )
-            interaction = await create_model_interaction(
+            continuation_input = [*input_data, *continuation_steps]
+            interaction = await create_traced_interaction(
+                call_trace,
+                phase="search_continuation",
                 model=text_model,
-                input_data=[*input_data, *continuation_steps],
-                system_instruction=build_gemini_system_prompt(),
+                input_data=continuation_input,
+                system_instruction=system_instruction,
                 thinking_level=thinking_level,
             )
             token_usage += get_interaction_usage(interaction)
 
-    return interaction, token_usage
+    return interaction, token_usage, call_trace
 
 # ================= 4. 봇 메인 로직 =================
 class GeminiBot(commands.Bot):
@@ -3228,7 +3389,7 @@ async def on_message(message):
                     label_discord_user_contents(conversation_entries)
                 )
 
-                response, token_usage = await call_gemini(
+                response, token_usage, call_trace = await call_gemini(
                     full_contents,
                     text_model=server_text_model,
                     thinking_level=config.get("thinking_level"),
@@ -3237,6 +3398,11 @@ async def on_message(message):
                 status = get_interaction_status(response)
                 if status not in {"completed", "incomplete"}:
                     error = get_interaction_error_message(response)
+                    print(
+                        "[WARN] Gemini non-completed response "
+                        f"response={summarize_interaction_response(response)} "
+                        f"call={json.dumps(call_trace, ensure_ascii=False, default=str, separators=(',', ':'))}"
+                    )
                     detail = f": {error}" if error else ""
                     await message.channel.send(f"응답 생성이 중단되었습니다 (status={status}){detail}")
                     return
@@ -3249,7 +3415,21 @@ async def on_message(message):
                 text_reply = extract_interaction_text(response)
                 if not text_reply:
                     error = get_interaction_error_message(response)
-                    print(f"[WARN] Gemini content-free response {summarize_interaction_response(response)}")
+                    failure_context = {
+                        "message_id": message.id,
+                        "guild_id": message.guild.id,
+                        "channel_id": message.channel.id,
+                        "history_entries": len(history_entries),
+                        "history_inline_images": history_inline_images,
+                        "current_images": len(current_ref_images),
+                        "route": route.get("action"),
+                        "call": call_trace,
+                    }
+                    print(
+                        "[WARN] Gemini content-free response "
+                        f"response={summarize_interaction_response(response)} "
+                        f"context={json.dumps(failure_context, ensure_ascii=False, default=str, separators=(',', ':'))}"
+                    )
                     detail = f" ({error})" if error else ""
                     await message.channel.send(f"Gemini가 텍스트 응답을 생성하지 못했습니다{detail}")
                     return
@@ -3263,6 +3443,7 @@ async def on_message(message):
 
             except Exception as e:
                 print(f"[CRITICAL] Error: {e}")
+                traceback.print_exc()
                 await message.channel.send(f"오류가 발생했습니다: {e}")
 
 # ================= 5. 서버 설정 명령어 =================
