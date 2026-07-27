@@ -203,8 +203,9 @@ _COMMON_RULES = """## General Rules
 - Respond in the user's language and mirror their tone (casual, formal, vulgar — match them).
 - If the user sets up a specific roleplay scenario (character, world, setting), maintain it consistently within that conversation. Do NOT treat casual chat as "established context" that must persist.
 - Analyze attached files (images/video/audio) when supported.
-- Keep responses concise and Discord-appropriate.
-- Use Google Grounding Search (Web Search) actively since your training cutoff may be outdated."""
+- Keep responses concise and Discord-appropriate."""
+
+GOOGLE_SEARCH_TOOL = {"type": "google_search", "search_types": ["web_search"]}
 
 SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
@@ -1515,6 +1516,34 @@ def get_interaction_error_message(interaction):
     return str(message or code or error)
 
 
+def interaction_step_to_dict(step):
+    if isinstance(step, dict):
+        return step
+    model_dump = getattr(step, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(exclude_none=True, mode="json")
+    to_dict = getattr(step, "dict", None)
+    if callable(to_dict):
+        return to_dict(exclude_none=True)
+    return None
+
+
+def collect_search_continuation_steps(interaction):
+    """Collect a completed search turn that is missing its final model output."""
+    continuation_steps = []
+    has_successful_result = False
+    for step in get_interaction_output_value(interaction, "steps", None) or []:
+        step_type = get_interaction_output_value(step, "type", "")
+        if step_type not in {"thought", "google_search_call", "google_search_result"}:
+            continue
+        serialized = interaction_step_to_dict(step)
+        if serialized:
+            continuation_steps.append(serialized)
+        if step_type == "google_search_result" and not get_interaction_output_value(step, "is_error", False):
+            has_successful_result = True
+    return continuation_steps if has_successful_result else []
+
+
 def summarize_interaction_response(interaction):
     """Return a content-free diagnostic summary for failed/empty interactions."""
     steps = get_interaction_output_value(interaction, "steps", None) or []
@@ -2046,10 +2075,27 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
         model=text_model,
         input_data=input_data,
         system_instruction=build_gemini_system_prompt(),
-        tools=[{"type": "google_search"}],
+        tools=[GOOGLE_SEARCH_TOOL],
         thinking_level=thinking_level,
     )
-    return interaction, get_interaction_usage(interaction)
+    token_usage = get_interaction_usage(interaction)
+
+    if not extract_interaction_text(interaction):
+        continuation_steps = collect_search_continuation_steps(interaction)
+        if continuation_steps:
+            print(
+                "[WARN] Google Search 결과 뒤 최종 출력이 없어 같은 검색 결과로 생성을 이어갑니다. "
+                f"{summarize_interaction_response(interaction)}"
+            )
+            interaction = await create_model_interaction(
+                model=text_model,
+                input_data=[*input_data, *continuation_steps],
+                system_instruction=build_gemini_system_prompt(),
+                thinking_level=thinking_level,
+            )
+            token_usage += get_interaction_usage(interaction)
+
+    return interaction, token_usage
 
 # ================= 4. 봇 메인 로직 =================
 class GeminiBot(commands.Bot):
