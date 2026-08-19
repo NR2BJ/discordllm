@@ -142,12 +142,6 @@ AVAILABLE_MODELS = {
         "thinking_level": "high",
     },
 }
-LEGACY_TEXT_MODEL_ALIASES = {
-    "gemini-pro-latest": "gemini-3.1-pro-preview",
-    "gemini-flash-latest": "gemini-3.7-flash",
-    "gemini-3.6-flash": "gemini-3.7-flash",
-    "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
-}
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
 # Deep Research는 모델 선택과 분리된 전용 명령어(/deepo, /deepm)로만 실행
@@ -155,9 +149,10 @@ DEEP_RESEARCH_AGENTS = {
     "deepo": "deep-research-preview-04-2026",
     "deepm": "deep-research-max-preview-04-2026",
 }
-DEEP_RESEARCH_AGENT_IDS = set(DEEP_RESEARCH_AGENTS.values())
-_configured_routing_model = os.environ.get("GEMINI_ROUTING_MODEL", AVAILABLE_MODELS["flash-lite-minimal"]["text"])
-ROUTING_MODEL = LEGACY_TEXT_MODEL_ALIASES.get(_configured_routing_model, _configured_routing_model)
+ROUTING_MODEL = os.environ.get(
+    "GEMINI_ROUTING_MODEL",
+    AVAILABLE_MODELS["flash-lite-minimal"]["text"],
+)
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
 
@@ -2346,9 +2341,6 @@ class GeminiBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
-        self._migrate_legacy_text_models()
-        self._migrate_thinking_budget_to_level()
-        self._migrate_deep_research_text_models()
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
@@ -2371,68 +2363,6 @@ class GeminiBot(commands.Bot):
         self.mafic_pool = mafic.NodePool(self) if LAVALINK_ENABLED else None
         self.mafic_node = None
         self.mafic_connect_lock = asyncio.Lock()
-
-    def _migrate_legacy_text_models(self):
-        """저장된 latest 별칭을 현재 고정 모델 ID로 치환한다."""
-        changed = False
-        for gid, cfg in self.server_configs.items():
-            if not isinstance(cfg, dict):
-                continue
-            old = cfg.get("text_model")
-            new = LEGACY_TEXT_MODEL_ALIASES.get(old)
-            if not new:
-                continue
-            cfg["text_model"] = new
-            if new == "gemini-3.7-flash" and cfg.get("thinking_level") == "minimal":
-                cfg["thinking_level"] = "low"
-                print(f"[MIGRATE] guild {gid}: thinking_level minimal → low (Gemini 3.7 Flash)")
-            print(f"[MIGRATE] guild {gid}: text_model {old} → {new}")
-            changed = True
-        if changed:
-            DataManager.save_json(CONFIG_FILE, self.server_configs)
-
-    def _migrate_thinking_budget_to_level(self):
-        """레거시 thinking_budget 정수를 신규 thinking_level enum으로 일괄 변환.
-        Gemini 3 시리즈는 thinking_level 사용 권장(deprecated thinking_budget 정리)."""
-        budget_to_level = {
-            0: "minimal",
-            2048: "low",
-            8192: "medium",
-            24576: "high",
-            -1: "high",  # dynamic 역할 흡수
-        }
-        changed = False
-        for gid, cfg in self.server_configs.items():
-            if not isinstance(cfg, dict):
-                continue
-            if "thinking_budget" not in cfg:
-                continue
-            budget = cfg.pop("thinking_budget")
-            if "thinking_level" not in cfg:
-                level = budget_to_level.get(budget, "minimal")
-                cfg["thinking_level"] = level
-                print(f"[MIGRATE] guild {gid}: thinking_budget={budget} → thinking_level={level}")
-            else:
-                print(f"[MIGRATE] guild {gid}: drop legacy thinking_budget={budget} (thinking_level already set)")
-            changed = True
-        if changed:
-            DataManager.save_json(CONFIG_FILE, self.server_configs)
-
-    def _migrate_deep_research_text_models(self):
-        """모델 선택 목록에서 제외된 Deep Research가 text_model로 남아있으면 기본 모델로 복구.
-        Deep Research는 이제 /deepo·/deepm 명령어 전용."""
-        changed = False
-        for gid, cfg in self.server_configs.items():
-            if not isinstance(cfg, dict):
-                continue
-            if cfg.get("text_model") in DEEP_RESEARCH_AGENT_IDS:
-                old = cfg["text_model"]
-                cfg["text_model"] = TEXT_MODEL
-                cfg["image_model"] = IMAGE_MODEL
-                print(f"[MIGRATE] guild {gid}: text_model {old} → {TEXT_MODEL} (Deep Research는 /deepo·/deepm 전용)")
-                changed = True
-        if changed:
-            DataManager.save_json(CONFIG_FILE, self.server_configs)
 
     def _get_sound_dir_mtime(self):
         """SOUND_DIR 전체의 최신 mtime 반환."""
@@ -4365,8 +4295,6 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         cfg = bot.get_config(interaction.guild_id)
         cfg["text_model"] = TEXT_MODEL
         cfg["image_model"] = IMAGE_MODEL
-        # 레거시 키 정리 (thinking_budget은 deprecated)
-        cfg.pop("thinking_budget", None)
         if thinking_level is None:
             cfg.pop("thinking_level", None)
         else:
