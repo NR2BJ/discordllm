@@ -104,24 +104,19 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
-    # Gemini 3.6 Flash (4 levels)
-    "flash-minimal": {
-        "text": "gemini-3.6-flash",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "minimal",
-    },
+    # Gemini 3.7 Flash (3 levels; minimal 미지원)
     "flash-low": {
-        "text": "gemini-3.6-flash",
+        "text": "gemini-3.7-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-medium": {
-        "text": "gemini-3.6-flash",
+        "text": "gemini-3.7-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-high": {
-        "text": "gemini-3.6-flash",
+        "text": "gemini-3.7-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
@@ -149,7 +144,8 @@ AVAILABLE_MODELS = {
 }
 LEGACY_TEXT_MODEL_ALIASES = {
     "gemini-pro-latest": "gemini-3.1-pro-preview",
-    "gemini-flash-latest": "gemini-3.6-flash",
+    "gemini-flash-latest": "gemini-3.7-flash",
+    "gemini-3.6-flash": "gemini-3.7-flash",
     "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
 }
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
@@ -2387,6 +2383,9 @@ class GeminiBot(commands.Bot):
             if not new:
                 continue
             cfg["text_model"] = new
+            if new == "gemini-3.7-flash" and cfg.get("thinking_level") == "minimal":
+                cfg["thinking_level"] = "low"
+                print(f"[MIGRATE] guild {gid}: thinking_level minimal → low (Gemini 3.7 Flash)")
             print(f"[MIGRATE] guild {gid}: text_model {old} → {new}")
             changed = True
         if changed:
