@@ -26,6 +26,7 @@ from PIL import Image
 from datetime import datetime, timedelta, timezone
 import glob as glob_module
 import unicodedata
+from urllib.parse import urlsplit
 from xml.sax.saxutils import escape as xml_escape
 
 try:
@@ -87,19 +88,19 @@ except Exception as e:
 print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 
 AVAILABLE_MODELS = {
-    # Pro (3 levels: low / medium / high — minimal 미지원)
+    # Gemini 3.1 Pro Preview (3 levels: low / medium / high — minimal 미지원)
     "pro-low": {
-        "text": "gemini-pro-latest",
+        "text": "gemini-3.1-pro-preview",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "pro-medium": {
-        "text": "gemini-pro-latest",
+        "text": "gemini-3.1-pro-preview",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "pro-high": {
-        "text": "gemini-pro-latest",
+        "text": "gemini-3.1-pro-preview",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
@@ -147,6 +148,7 @@ AVAILABLE_MODELS = {
     },
 }
 LEGACY_TEXT_MODEL_ALIASES = {
+    "gemini-pro-latest": "gemini-3.1-pro-preview",
     "gemini-flash-latest": "gemini-3.6-flash",
     "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
 }
@@ -215,6 +217,10 @@ _COMMON_RULES = """## General Rules
 - Keep responses concise and Discord-appropriate."""
 
 GOOGLE_SEARCH_TOOL = {"type": "google_search", "search_types": ["web_search"]}
+RAW_CITATION_MARKER_RE = re.compile(
+    r"(?:[ \t]*\[cite:\s*[^\]\r\n]+\])+",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
@@ -1465,32 +1471,94 @@ async def call_interaction_get(interactions_api, interaction_id):
         return await maybe_await(interactions_api.get(id=interaction_id))
 
 
-def extract_interaction_text(interaction):
-    output_text = get_interaction_output_value(interaction, "output_text", "")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
-    parts = []
+def get_final_interaction_text_blocks(interaction):
+    output_steps = []
     collecting = False
     steps = get_interaction_output_value(interaction, "steps", None) or []
     for step in reversed(steps):
         step_type = get_interaction_output_value(step, "type", "")
         if step_type == "user_input":
             break
-        if step_type != "model_output":
-            if collecting:
-                break
-            continue
-        for block in reversed(get_interaction_output_value(step, "content", None) or []):
-            text = get_interaction_output_value(block, "text")
-            if get_interaction_output_value(block, "type", "") == "text" and text:
-                collecting = True
-                parts.append(text)
-            elif collecting:
-                parts.reverse()
-                return "".join(parts).strip()
-    parts.reverse()
-    return "".join(parts).strip()
+        if step_type == "model_output":
+            collecting = True
+            output_steps.append(step)
+        elif collecting:
+            break
+
+    blocks = []
+    for step in reversed(output_steps):
+        for block in get_interaction_output_value(step, "content", None) or []:
+            if get_interaction_output_value(block, "type", "") == "text":
+                blocks.append(block)
+    return blocks
+
+
+def collect_interaction_url_citations(text_blocks):
+    citations = []
+    seen_urls = set()
+    for block in text_blocks:
+        for annotation in get_interaction_output_value(block, "annotations", None) or []:
+            annotation_type = str(get_interaction_output_value(annotation, "type", "")).lower()
+            if not annotation_type.endswith("url_citation"):
+                continue
+            url = str(get_interaction_output_value(annotation, "url", "") or "").strip()
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or url in seen_urls:
+                continue
+            title = re.sub(
+                r"\s+",
+                " ",
+                str(get_interaction_output_value(annotation, "title", "") or ""),
+            ).strip()
+            citations.append({"title": title or parsed.netloc, "url": url})
+            seen_urls.add(url)
+    return citations
+
+
+def format_interaction_citations(citations):
+    lines = []
+    for index, citation in enumerate(citations, start=1):
+        title = (
+            citation["title"]
+            .replace("\\", "\\\\")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+        )
+        url = (
+            citation["url"]
+            .replace("\\", "%5C")
+            .replace(" ", "%20")
+            .replace("(", "%28")
+            .replace(")", "%29")
+        )
+        lines.append(f"{index}. [{title}]({url})")
+    return "**출처:**\n" + "\n".join(lines)
+
+
+def extract_interaction_text(interaction):
+    text_blocks = get_final_interaction_text_blocks(interaction)
+    if text_blocks:
+        raw_text = "".join(
+            get_interaction_output_value(block, "text", "") or ""
+            for block in text_blocks
+        )
+    else:
+        output_text = get_interaction_output_value(interaction, "output_text", "")
+        raw_text = output_text if isinstance(output_text, str) else ""
+
+    text, marker_count = RAW_CITATION_MARKER_RE.subn("", raw_text)
+    text = text.strip()
+    citations = [
+        citation
+        for citation in collect_interaction_url_citations(text_blocks)
+        if citation["url"] not in text
+    ]
+    if marker_count and not citations:
+        print(f"[WARN] Gemini citation markers had no URL annotations: count={marker_count}")
+    if citations:
+        citation_text = format_interaction_citations(citations)
+        return f"{text}\n\n{citation_text}" if text else citation_text
+    return text
 
 
 def get_interaction_usage(interaction):
@@ -2171,10 +2239,29 @@ async def scrap_webpage(url):
         print(f"[WARN] URL 읽기 실패: {e}")
     return None
 
+
+def split_discord_message(content, limit=1900):
+    chunks = []
+    remaining = content or ""
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n\n", 0, limit + 1)
+        if split_at < limit // 2:
+            split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at < limit // 2:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 async def send_long_message(channel, content):
-    if not content: return
-    for chunk in [content[i:i+1900] for i in range(0, len(content), 1900)]:
+    for chunk in split_discord_message(content):
         await channel.send(chunk)
+
 
 async def call_nano_banana(contents, image_model=None):
     if not CLIENT: return None
@@ -3565,7 +3652,7 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             model=TEXT_MODEL,
             input_data=gemini_contents_to_interaction_steps(contents),
             system_instruction=CHAT_SYSTEM_PROMPT,
-            tools=[{"type": "google_search"}],
+            tools=[GOOGLE_SEARCH_TOOL],
         )
         token_usage = get_interaction_usage(response)
 
@@ -3579,12 +3666,8 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
         text_reply = extract_interaction_text(response)
 
         if text_reply.strip():
-            if len(text_reply) > 2000:
-                chunks = [text_reply[i:i+1900] for i in range(0, len(text_reply), 1900)]
-                for chunk in chunks:
-                    await interaction.followup.send(chunk)
-            else:
-                await interaction.followup.send(text_reply)
+            for chunk in split_discord_message(text_reply):
+                await interaction.followup.send(chunk)
 
             print(f"  [BOT]({TEXT_MODEL}): {text_reply}")
             print(f"  [TOKEN]: {token_usage}")
