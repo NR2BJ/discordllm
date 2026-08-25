@@ -149,6 +149,8 @@ DEEP_RESEARCH_AGENTS = {
     "deepo": "deep-research-preview-04-2026",
     "deepm": "deep-research-max-preview-04-2026",
 }
+DEEP_RESEARCH_POLL_INTERVAL_SECONDS = 10
+DEEP_RESEARCH_STATUS_LOG_INTERVAL_SECONDS = 300
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
     AVAILABLE_MODELS["flash-lite-minimal"]["text"],
@@ -2061,10 +2063,23 @@ async def call_deep_research(research_topic, agent_id):
         if not interaction_id:
             return "[ERROR] Deep Research 작업 ID를 받지 못했습니다."
 
-        for _ in range(90):
-            await asyncio.sleep(10)
+        print(f"[DEEP] started agent={agent_id} interaction_id={interaction_id}")
+        started_at = time_module.monotonic()
+        last_status = None
+        last_status_log_at = started_at
+        while True:
+            await asyncio.sleep(DEEP_RESEARCH_POLL_INTERVAL_SECONDS)
             result = await call_interaction_get(interactions_api, interaction_id)
             status = getattr(result, "status", None) or (result.get("status") if isinstance(result, dict) else None)
+            now = time_module.monotonic()
+            if status != last_status or now - last_status_log_at >= DEEP_RESEARCH_STATUS_LOG_INTERVAL_SECONDS:
+                elapsed = int(now - started_at)
+                print(
+                    f"[DEEP] interaction_id={interaction_id} status={status or 'unknown'} "
+                    f"elapsed={elapsed}s"
+                )
+                last_status = status
+                last_status_log_at = now
             if status == "completed":
                 try:
                     return build_deep_research_report(result, agent_id=agent_id)
@@ -2077,7 +2092,6 @@ async def call_deep_research(research_topic, agent_id):
                 error = getattr(result, "error", None) or (result.get("error") if isinstance(result, dict) else None)
                 detail = f": {error}" if error else ""
                 return f"[ERROR] Deep Research 중단 (status={status}){detail}"
-        return "[ERROR] Deep Research 작업이 제한 시간 안에 끝나지 않았습니다."
     except Exception as e:
         return f"[ERROR] Deep Research 호출 실패: {e}"
 
@@ -4203,24 +4217,24 @@ async def run_deep_research_command(interaction: discord.Interaction, prompt: st
     await interaction.response.send_message(
         f"[Deep Research] `{agent_id}` 작업을 시작했습니다.\n"
         f"**주제:** {prompt[:300]}\n"
-        f"완료까지 10분 안팎 걸릴 수 있습니다. 완료되면 멘션으로 알려드립니다."
+        f"작업 시간이 길어져도 완료될 때까지 추적하며, 완료되면 멘션으로 알려드립니다."
     )
 
+    target_channel = interaction.channel
+    target_channel_id = interaction.channel_id
+
     async def send_result(content, *, pdf=None, filename=None):
-        try:
-            if pdf:
-                await interaction.followup.send(content, file=discord.File(fp=io.BytesIO(pdf), filename=filename))
-            else:
-                await interaction.followup.send(content)
-        except Exception as followup_error:
-            # followup 토큰 만료(15분) 등 — 채널 직접 전송으로 폴백
-            print(f"[DEEP] followup 실패, 채널 전송으로 폴백: {followup_error}")
-            if interaction.channel is None:
-                raise
-            if pdf:
-                await interaction.channel.send(content, file=discord.File(fp=io.BytesIO(pdf), filename=filename))
-            else:
-                await interaction.channel.send(content)
+        channel = target_channel
+        if channel is None and target_channel_id is not None:
+            channel = bot.get_channel(target_channel_id)
+        if channel is None and target_channel_id is not None:
+            channel = await bot.fetch_channel(target_channel_id)
+        if channel is None:
+            raise RuntimeError("Deep Research 결과를 전송할 채널을 찾지 못했습니다.")
+        if pdf:
+            await channel.send(content, file=discord.File(fp=io.BytesIO(pdf), filename=filename))
+        else:
+            await channel.send(content)
 
     try:
         result = await call_deep_research(prompt, agent_id)
