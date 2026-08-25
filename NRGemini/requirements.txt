@@ -8,4 +8,4 @@ pypdf
 python-docx
 openpyxl
 uvloop
-reportlab
+Markdown

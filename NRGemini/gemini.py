@@ -12,6 +12,7 @@ import os
 import asyncio
 import aiohttp
 import hashlib
+import html as html_module
 import io
 import warnings
 import re
@@ -27,7 +28,6 @@ from datetime import datetime, timedelta, timezone
 import glob as glob_module
 import unicodedata
 from urllib.parse import urlsplit
-from xml.sax.saxutils import escape as xml_escape
 
 try:
     from pypdf import PdfReader
@@ -1864,171 +1864,573 @@ def collect_interaction_outputs(interaction):
     return collected
 
 
-def add_markdownish_text(story, text, styles):
-    from reportlab.platypus import Paragraph, Spacer
+DEEP_RESEARCH_HTML_ALLOWED_TAGS = {
+    "a", "blockquote", "br", "code", "dd", "del", "div", "dl", "dt", "em",
+    "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol",
+    "p", "pre", "s", "span", "strong", "sub", "sup", "table", "tbody", "td",
+    "tfoot", "th", "thead", "tr", "ul",
+}
+DEEP_RESEARCH_HTML_DANGEROUS_TAGS = {
+    "base", "button", "embed", "form", "frame", "frameset", "iframe", "input",
+    "link", "meta", "object", "script", "select", "style", "textarea",
+}
 
-    in_code = False
-    code_lines = []
 
-    def flush_code():
-        nonlocal code_lines
-        if code_lines:
-            escaped = xml_escape("\n".join(code_lines)).replace("\n", "<br/>")
-            story.append(Paragraph(escaped, styles["Code"]))
-            story.append(Spacer(1, 8))
-            code_lines = []
+def prepare_deep_research_image(raw, mime_type):
+    """해상도 손실 없이 PNG를 더 작은 lossless WebP로 바꿀 수 있을 때만 변환한다."""
+    detected_mime = mime_type or "application/octet-stream"
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            format_mime = {
+                "GIF": "image/gif",
+                "JPEG": "image/jpeg",
+                "PNG": "image/png",
+                "WEBP": "image/webp",
+            }
+            detected_mime = format_mime.get(image.format, detected_mime)
+            if image.format != "PNG" or getattr(image, "is_animated", False):
+                return raw, detected_mime
 
-    for raw_line in (text or "").splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            if in_code:
-                flush_code()
-                in_code = False
+            image.load()
+            converted = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            webp_buffer = io.BytesIO()
+            save_kwargs = {"format": "WEBP", "lossless": True, "method": 6}
+            if image.info.get("icc_profile"):
+                save_kwargs["icc_profile"] = image.info["icc_profile"]
+            converted.save(webp_buffer, **save_kwargs)
+            webp = webp_buffer.getvalue()
+            if len(webp) < len(raw):
+                print(f"[DeepResearch HTML] lossless WebP: {len(raw):,} -> {len(webp):,} bytes")
+                return webp, "image/webp"
+    except Exception as e:
+        print(f"[DeepResearch HTML] image optimization skipped: {e}")
+    return raw, detected_mime
+
+
+def sanitize_deep_research_html(fragment):
+    """Markdown 결과에서 실행 가능 콘텐츠와 외부 이미지 요청을 제거한다."""
+    soup = BeautifulSoup(fragment, "html.parser")
+    for tag in list(soup.find_all(True)):
+        name = tag.name.lower()
+        if name in DEEP_RESEARCH_HTML_DANGEROUS_TAGS:
+            tag.decompose()
+            continue
+        if name not in DEEP_RESEARCH_HTML_ALLOWED_TAGS:
+            tag.unwrap()
+            continue
+        if name == "img":
+            src = (tag.get("src") or "").strip()
+            alt = (tag.get("alt") or "외부 이미지").strip()
+            note = soup.new_tag("span")
+            note["class"] = ["external-image-note"]
+            if urlsplit(src).scheme in ("http", "https"):
+                link = soup.new_tag("a", href=src, target="_blank", rel="noopener noreferrer")
+                link.string = f"외부 이미지 링크: {alt}"
+                note.append(link)
             else:
-                in_code = True
+                note.string = f"외부 이미지 제외: {alt}"
+            tag.replace_with(note)
             continue
-        if in_code:
-            code_lines.append(line)
-            continue
-        if not stripped:
-            story.append(Spacer(1, 6))
-            continue
-        if stripped.startswith("# "):
-            story.append(Paragraph(xml_escape(stripped[2:].strip()), styles["Heading1"]))
-        elif stripped.startswith("## "):
-            story.append(Paragraph(xml_escape(stripped[3:].strip()), styles["Heading2"]))
-        elif stripped.startswith("### "):
-            story.append(Paragraph(xml_escape(stripped[4:].strip()), styles["Heading3"]))
-        elif re.match(r"^[-*]\s+", stripped):
-            story.append(Paragraph("• " + xml_escape(re.sub(r"^[-*]\s+", "", stripped)), styles["Body"]))
-        elif re.match(r"^\d+[.)]\s+", stripped):
-            story.append(Paragraph(xml_escape(stripped), styles["Body"]))
-        else:
-            story.append(Paragraph(xml_escape(stripped), styles["Body"]))
-    flush_code()
+
+        clean_attrs = {}
+        raw_id = (tag.get("id") or "").strip()
+        if raw_id and name in ("div", "li", "p", "span", "sup"):
+            clean_attrs["id"] = re.sub(r"[^\w:.-]+", "-", raw_id)[:160]
+        if name == "a":
+            href = (tag.get("href") or "").strip()
+            scheme = urlsplit(href).scheme.lower()
+            if href.startswith("#") or scheme in ("http", "https", "mailto"):
+                clean_attrs["href"] = href
+            if scheme in ("http", "https", "mailto"):
+                clean_attrs["target"] = "_blank"
+                clean_attrs["rel"] = "noopener noreferrer"
+            allowed_classes = {
+                value for value in (tag.get("class") or [])
+                if value in ("footnote-ref", "footnote-backref")
+            }
+            if allowed_classes:
+                clean_attrs["class"] = sorted(allowed_classes)
+        elif name == "code":
+            language_classes = [
+                value for value in (tag.get("class") or [])
+                if re.fullmatch(r"language-[A-Za-z0-9_+-]+", value)
+            ]
+            if language_classes:
+                clean_attrs["class"] = language_classes
+        elif name == "div" and "footnote" in (tag.get("class") or []):
+            clean_attrs["class"] = ["footnote"]
+        elif name in ("th", "td"):
+            alignment = (tag.get("align") or "").lower()
+            style = tag.get("style") or ""
+            style_match = re.fullmatch(r"\s*text-align\s*:\s*(left|center|right)\s*;?\s*", style)
+            if not alignment and style_match:
+                alignment = style_match.group(1)
+            if alignment in ("left", "center", "right"):
+                clean_attrs["class"] = [f"align-{alignment}"]
+        elif name == "ol" and str(tag.get("start") or "").isdigit():
+            clean_attrs["start"] = str(tag["start"])
+        tag.attrs = clean_attrs
+    return soup
 
 
-DEEP_RESEARCH_PDF_FONT_CANDIDATES = (
-    ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
-    ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf", None),
-    ("NotoSansCJK", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
-    ("NanumGothic", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf", None),
-    ("AppleSDGothicNeo", "/System/Library/Fonts/AppleSDGothicNeo.ttc", 0),
-    ("AppleGothic", "/System/Library/Fonts/Supplemental/AppleGothic.ttf", None),
-)
-
-
-def register_deep_research_pdf_font(pdfmetrics, TTFont, UnicodeCIDFont):
-    for font_name, font_path, subfont_index in DEEP_RESEARCH_PDF_FONT_CANDIDATES:
-        if not os.path.exists(font_path):
-            continue
-        try:
-            if font_name not in pdfmetrics.getRegisteredFontNames():
-                try:
-                    kwargs = {"subfontIndex": subfont_index} if subfont_index is not None else {}
-                    pdfmetrics.registerFont(TTFont(font_name, font_path, **kwargs))
-                except TypeError:
-                    pdfmetrics.registerFont(TTFont(font_name, font_path))
-            print(f"[DeepResearch PDF] using font: {font_name} ({font_path})")
-            return font_name
-        except Exception as e:
-            print(f"[DeepResearch PDF] font unavailable: {font_path} ({e})")
-
+def build_deep_research_html(outputs, *, agent_id, title):
     try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HYGoThic-Medium"))
-        print("[DeepResearch PDF] using fallback CID font: HYGoThic-Medium")
-        return "HYGoThic-Medium"
+        import markdown as markdown_module
     except Exception as e:
-        print(f"[DeepResearch PDF] Korean font fallback failed, using Helvetica ({e})")
-        return "Helvetica"
+        raise RuntimeError("Markdown 패키지가 설치되어 있지 않습니다.") from e
 
-
-def build_deep_research_pdf(outputs, *, agent_id):
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import ParagraphStyle
-        from reportlab.lib.units import mm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as PdfImage
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-        from reportlab.pdfbase.ttfonts import TTFont
-    except Exception as e:
-        raise RuntimeError("reportlab 패키지가 설치되어 있지 않습니다.") from e
-
-    body_font = register_deep_research_pdf_font(pdfmetrics, TTFont, UnicodeCIDFont)
-
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=18 * mm,
-        rightMargin=18 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
-        title="Gemini Deep Research Report",
-    )
-    styles = {
-        "Title": ParagraphStyle("Title", fontName=body_font, fontSize=18, leading=24, spaceAfter=14),
-        "Meta": ParagraphStyle("Meta", fontName=body_font, fontSize=9, leading=12, textColor="#555555", spaceAfter=12),
-        "Heading1": ParagraphStyle("Heading1", fontName=body_font, fontSize=15, leading=20, spaceBefore=10, spaceAfter=6),
-        "Heading2": ParagraphStyle("Heading2", fontName=body_font, fontSize=13, leading=18, spaceBefore=8, spaceAfter=5),
-        "Heading3": ParagraphStyle("Heading3", fontName=body_font, fontSize=11, leading=16, spaceBefore=6, spaceAfter=4),
-        "Body": ParagraphStyle("Body", fontName=body_font, fontSize=9.5, leading=14, spaceAfter=4),
-        "Code": ParagraphStyle("Code", fontName=body_font, fontSize=8, leading=11, leftIndent=8, backColor="#f2f2f2", spaceAfter=6),
-    }
-
-    story = [
-        Paragraph("Gemini Deep Research Report", styles["Title"]),
-        Paragraph(
-            xml_escape(f"Agent: {agent_id} | Generated: {datetime.now(KST).strftime('%Y-%m-%d %H:%M JST')}"),
-            styles["Meta"],
-        ),
-    ]
-    image_index = 1
-    max_width = A4[0] - doc.leftMargin - doc.rightMargin
-    max_height = 165 * mm
-
+    markdown_parts = []
+    embedded_images = []
+    text_char_count = 0
     for output in outputs:
         if output["type"] == "text":
-            add_markdownish_text(story, output.get("text", ""), styles)
-        elif output["type"] == "image":
-            raw = output.get("data")
-            if not raw:
-                continue
-            try:
-                image = Image.open(io.BytesIO(raw))
-                width, height = image.size
-                scale = min(max_width / width, max_height / height, 1.0)
-                story.append(Spacer(1, 8))
-                story.append(Paragraph(f"Visualization {image_index}", styles["Heading3"]))
-                story.append(PdfImage(io.BytesIO(raw), width=width * scale, height=height * scale))
-                story.append(Spacer(1, 8))
-                image_index += 1
-            except Exception as e:
-                story.append(Paragraph(xml_escape(f"[Image omitted: {e}]"), styles["Body"]))
+            text = output.get("text", "")
+            markdown_parts.append(text)
+            text_char_count += len(text)
+        elif output["type"] == "image" and output.get("data"):
+            index = len(embedded_images) + 1
+            raw = output["data"]
+            token = f"DEEPRESEARCHIMAGE{index:04d}{hashlib.sha1(raw).hexdigest()[:12]}PLACEHOLDER"
+            markdown_parts.append(f"\n\n{token}\n\n")
+            embedded_images.append((token, raw, output.get("mime_type")))
 
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
+    renderer = markdown_module.Markdown(
+        extensions=["extra", "sane_lists"],
+        output_format="html5",
+    )
+    soup = sanitize_deep_research_html(renderer.convert("\n\n".join(markdown_parts)))
+
+    for index, (token, raw, mime_type) in enumerate(embedded_images, start=1):
+        placeholder = soup.find(string=lambda value: isinstance(value, str) and value.strip() == token)
+        if placeholder is None:
+            continue
+        prepared, prepared_mime = prepare_deep_research_image(raw, mime_type)
+        encoded = base64.b64encode(prepared).decode("ascii")
+        figure = soup.new_tag("figure")
+        figure["class"] = ["report-figure"]
+        image_tag = soup.new_tag(
+            "img",
+            src=f"data:{prepared_mime};base64,{encoded}",
+            alt=f"Deep Research 시각 자료 {index}",
+            loading="lazy",
+        )
+        image_tag["tabindex"] = "0"
+        image_tag["role"] = "button"
+        image_tag["aria-label"] = f"시각 자료 {index} 크게 보기"
+        caption = soup.new_tag("figcaption")
+        caption.string = f"시각 자료 {index}"
+        figure.extend([image_tag, caption])
+        parent = placeholder.parent
+        if parent is not None and parent.name == "p" and parent.get_text(strip=True) == token:
+            parent.replace_with(figure)
+        else:
+            placeholder.replace_with(figure)
+
+    table_count = 0
+    for table in list(soup.find_all("table")):
+        table_count += 1
+        first_row = table.find("tr")
+        column_count = len(first_row.find_all(("th", "td"), recursive=False)) if first_row else 0
+        table["class"] = ["data-table"] + (["wide-table"] if column_count >= 7 else [])
+        table["data-sortable"] = "true"
+        wrapper = soup.new_tag("div")
+        wrapper["class"] = ["table-wrap"]
+        wrapper["tabindex"] = "0"
+        table.wrap(wrapper)
+
+    used_ids = set()
+    toc_items = []
+    for index, heading in enumerate(soup.find_all(("h1", "h2", "h3")), start=1):
+        label = heading.get_text(" ", strip=True) or f"Section {index}"
+        base_id = re.sub(r"[^\w-]+", "-", label.lower()).strip("-") or f"section-{index}"
+        heading_id = base_id
+        suffix = 2
+        while heading_id in used_ids:
+            heading_id = f"{base_id}-{suffix}"
+            suffix += 1
+        used_ids.add(heading_id)
+        heading["id"] = heading_id
+        level = int(heading.name[1])
+        toc_items.append(
+            f'<li class="toc-level-{level}"><a href="#{html_module.escape(heading_id, quote=True)}">'
+            f'{html_module.escape(label)}</a></li>'
+        )
+
+    content = soup.new_tag("div")
+    content["class"] = ["report-content"]
+    current_section = None
+    section_index = 0
+    for child in list(soup.contents):
+        child_name = getattr(child, "name", None)
+        if current_section is None or child_name in ("h1", "h2"):
+            section_index += 1
+            current_section = soup.new_tag("section")
+            current_section["class"] = ["report-section"]
+            current_section["data-section"] = str(section_index)
+            content.append(current_section)
+        current_section.append(child.extract())
+
+    safe_title = html_module.escape((title or "Deep Research Report").strip())
+    safe_agent = html_module.escape(agent_id)
+    generated_at = html_module.escape(datetime.now(KST).strftime("%Y-%m-%d %H:%M JST"))
+    language = "ko" if re.search(r"[가-힣]", title or "") else "en"
+    toc_html = "".join(toc_items) or '<li class="toc-empty">목차가 없습니다.</li>'
+    body_html = str(content)
+    image_count = len(embedded_images)
+
+    return (
+        '<!doctype html>\n'
+        f'<html lang="{language}">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; '
+        'style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; connect-src \'none\'; '
+        'font-src data:; object-src \'none\'; base-uri \'none\'; form-action \'none\'">\n'
+        f'<title>{safe_title} · Deep Research</title>\n'
+        """<style>
+:root {
+  color-scheme: light;
+  --canvas: #e9eee9;
+  --paper: #fffdf8;
+  --paper-2: #f4f2e9;
+  --ink: #172522;
+  --muted: #65736e;
+  --line: #d8ded8;
+  --accent: #0d6b5d;
+  --accent-strong: #084b42;
+  --accent-soft: #d9ece6;
+  --warm: #c56a3a;
+  --code: #13201e;
+  --shadow: 0 24px 70px rgba(27, 48, 42, .16);
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #111816;
+  --paper: #17201e;
+  --paper-2: #1f2a27;
+  --ink: #eef4f0;
+  --muted: #a9b8b2;
+  --line: #33433e;
+  --accent: #63c5b3;
+  --accent-strong: #8ed9cb;
+  --accent-soft: #203d37;
+  --warm: #f09a68;
+  --code: #0c1211;
+  --shadow: 0 24px 70px rgba(0, 0, 0, .38);
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 8% 4%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 28rem),
+    linear-gradient(145deg, var(--canvas), color-mix(in srgb, var(--canvas) 84%, #fff));
+  color: var(--ink);
+  font-family: "Noto Sans CJK KR", "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  line-height: 1.72;
+  overflow-wrap: anywhere;
+}
+button, input { font: inherit; }
+a { color: var(--accent); text-underline-offset: .18em; }
+a:hover { color: var(--warm); }
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  gap: .55rem;
+  align-items: center;
+  padding: .7rem max(1rem, calc((100vw - 1180px) / 2));
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(16px);
+}
+.toolbar input {
+  min-width: 12rem;
+  flex: 1;
+  padding: .58rem .8rem;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: .65rem;
+  background: var(--paper);
+}
+.toolbar button, .section-toggle {
+  padding: .5rem .72rem;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: .65rem;
+  background: var(--paper);
+  cursor: pointer;
+}
+.toolbar button:hover, .section-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.document {
+  width: min(1180px, calc(100% - 2rem));
+  margin: 2rem auto 5rem;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+  border-radius: 1.35rem;
+  background: var(--paper);
+  box-shadow: var(--shadow);
+}
+.cover {
+  position: relative;
+  isolation: isolate;
+  min-height: 25rem;
+  padding: clamp(2.2rem, 6vw, 5.5rem);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  background:
+    linear-gradient(120deg, color-mix(in srgb, var(--accent-soft) 86%, var(--paper)), var(--paper-2));
+}
+.cover::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  width: 26rem;
+  height: 26rem;
+  right: -7rem;
+  top: -10rem;
+  border: 5rem solid color-mix(in srgb, var(--accent) 20%, transparent);
+  border-radius: 50%;
+}
+.eyebrow { margin: 0 0 1rem; color: var(--accent); font-size: .76rem; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+.cover h1 { max-width: 18ch; margin: 0; font-size: clamp(2.1rem, 5.4vw, 4.8rem); line-height: 1.08; letter-spacing: -.045em; }
+.cover-meta { margin-top: 2rem; color: var(--muted); font-size: .88rem; }
+.stat-row { display: flex; flex-wrap: wrap; gap: .65rem; margin-top: 1.2rem; }
+.stat { padding: .42rem .68rem; border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--line)); border-radius: 999px; background: color-mix(in srgb, var(--paper) 72%, transparent); font-size: .78rem; }
+.report-grid { display: grid; grid-template-columns: 15.5rem minmax(0, 1fr); gap: clamp(1.5rem, 4vw, 4rem); padding: clamp(1.5rem, 5vw, 4.5rem); }
+.toc { align-self: start; position: sticky; top: 5rem; max-height: calc(100vh - 7rem); overflow: auto; padding-right: .75rem; }
+.toc h2 { margin: 0 0 .8rem; font-size: .78rem; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); }
+.toc ol { list-style: none; padding: 0; margin: 0; }
+.toc li { margin: .18rem 0; }
+.toc a { display: block; padding: .34rem .5rem; border-left: 2px solid transparent; color: var(--muted); text-decoration: none; font-size: .82rem; line-height: 1.35; }
+.toc a:hover, .toc a.active { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); }
+.toc-level-2 a { padding-left: 1rem; }
+.toc-level-3 a { padding-left: 1.55rem; font-size: .76rem; }
+.report-grid > article { min-width: 0; }
+.report-content { min-width: 0; }
+.report-section { position: relative; margin: 0 0 2.8rem; scroll-margin-top: 5rem; }
+.report-section[hidden] { display: none; }
+.report-section.collapsed > :not(h1):not(h2) { display: none; }
+.section-toggle { float: right; margin-left: .75rem; padding: .24rem .5rem; font-size: .7rem; font-weight: 500; letter-spacing: 0; }
+.report-content h1, .report-content h2, .report-content h3 { color: var(--ink); text-wrap: balance; }
+.report-content h1 { margin: 0 0 1.4rem; padding-bottom: .65rem; border-bottom: 3px solid var(--accent); font-size: clamp(1.8rem, 3.5vw, 2.7rem); line-height: 1.2; letter-spacing: -.035em; }
+.report-content h2 { margin: 0 0 1.2rem; font-size: clamp(1.35rem, 2.3vw, 1.85rem); line-height: 1.28; letter-spacing: -.02em; }
+.report-content h3 { margin: 2rem 0 .75rem; color: var(--accent-strong); font-size: 1.12rem; }
+.report-content h4 { margin: 1.5rem 0 .5rem; }
+.report-content p { margin: .65rem 0 1rem; }
+.report-content strong { color: var(--accent-strong); }
+.report-content blockquote { margin: 1.4rem 0; padding: .9rem 1.15rem; border-left: .28rem solid var(--warm); background: var(--paper-2); color: color-mix(in srgb, var(--ink) 83%, var(--muted)); }
+.report-content ul, .report-content ol { padding-left: 1.35rem; }
+.report-content li { margin: .35rem 0; }
+pre { overflow: auto; padding: 1rem 1.1rem; border-radius: .8rem; background: var(--code); color: #e8f1ed; font: .83rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+code { padding: .12em .32em; border-radius: .28rem; background: var(--paper-2); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .9em; }
+pre code { padding: 0; background: transparent; }
+.table-wrap { max-width: 100%; overflow: auto; margin: 1.35rem 0 1.8rem; border: 1px solid var(--line); border-radius: .85rem; background: var(--paper); }
+.data-table { width: 100%; border-collapse: collapse; font-size: .85rem; line-height: 1.45; }
+.data-table th, .data-table td { min-width: 8rem; padding: .68rem .75rem; border-bottom: 1px solid var(--line); border-right: 1px solid color-mix(in srgb, var(--line) 62%, transparent); vertical-align: top; }
+.data-table th { position: sticky; top: 0; z-index: 1; color: var(--paper); background: var(--accent-strong); text-align: left; cursor: pointer; }
+.data-table tbody tr:nth-child(even) { background: var(--paper-2); }
+.data-table tbody tr:hover { background: var(--accent-soft); }
+.data-table .align-center { text-align: center; }
+.data-table .align-right { text-align: right; font-variant-numeric: tabular-nums; }
+.wide-table { min-width: 64rem; font-size: .78rem; }
+.report-figure { margin: 1.8rem 0 2.2rem; text-align: center; }
+.report-figure img { display: block; width: auto; max-width: 100%; max-height: 78vh; margin: 0 auto; border: 1px solid var(--line); border-radius: .85rem; background: #fff; box-shadow: 0 12px 32px rgba(20, 45, 38, .14); cursor: zoom-in; }
+.report-figure figcaption { margin-top: .6rem; color: var(--muted); font-size: .78rem; }
+.external-image-note { display: inline-block; padding: .35rem .55rem; border: 1px dashed var(--line); border-radius: .45rem; color: var(--muted); font-size: .82rem; }
+.footnote { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .8rem; }
+.no-results { display: none; padding: 3rem; text-align: center; color: var(--muted); }
+.no-results.visible { display: block; }
+dialog { width: min(96vw, 1400px); max-height: 94vh; padding: 0; border: 0; border-radius: 1rem; background: transparent; }
+dialog::backdrop { background: rgba(4, 12, 10, .86); backdrop-filter: blur(6px); }
+.lightbox-inner { position: relative; padding: 2.5rem 1rem 1rem; text-align: center; }
+.lightbox-inner img { max-width: 100%; max-height: 86vh; border-radius: .7rem; background: #fff; }
+.lightbox-close { position: absolute; top: 0; right: .8rem; border: 0; color: #fff; background: transparent; font-size: 1.8rem; cursor: pointer; }
+@media (max-width: 820px) {
+  .toolbar { flex-wrap: wrap; }
+  .toolbar input { flex-basis: 100%; order: 2; }
+  .document { width: min(100% - 1rem, 1180px); margin-top: .5rem; border-radius: .85rem; }
+  .cover { min-height: 21rem; }
+  .report-grid { grid-template-columns: minmax(0, 1fr); }
+  .toc { position: static; max-height: none; padding: 1rem; border: 1px solid var(--line); border-radius: .8rem; background: var(--paper-2); }
+}
+@media print {
+  @page { size: A4; margin: 16mm; }
+  body { background: #fff; }
+  .toolbar, .section-toggle, dialog { display: none !important; }
+  .document { width: 100%; margin: 0; border: 0; border-radius: 0; box-shadow: none; }
+  .cover { min-height: 230mm; break-after: page; }
+  .report-grid { display: block; padding: 0; }
+  .toc { position: static; max-height: none; margin-bottom: 2rem; break-after: page; }
+  .report-section { break-inside: auto; }
+  .report-section.collapsed > :not(h1):not(h2) { display: block; }
+  .table-wrap { overflow: visible; break-inside: avoid; }
+  .wide-table { min-width: 0; font-size: 7pt; }
+  .data-table th, .data-table td { min-width: 0; padding: 4pt; }
+  .report-figure { break-inside: avoid; }
+  a { color: inherit; }
+}
+</style>
+"""
+        '</head>\n<body>\n'
+        '<header class="toolbar" aria-label="보고서 도구">\n'
+        '<button id="theme-toggle" type="button" aria-label="테마 전환">테마</button>\n'
+        '<button id="expand-all" type="button">모두 펼치기</button>\n'
+        '<button id="collapse-all" type="button">모두 접기</button>\n'
+        '<input id="report-search" type="search" placeholder="보고서에서 검색" aria-label="보고서 검색">\n'
+        '<span id="search-count" aria-live="polite"></span>\n'
+        '</header>\n'
+        '<main class="document">\n'
+        '<section class="cover">\n'
+        '<p class="eyebrow">Gemini Deep Research</p>\n'
+        f'<h1>{safe_title}</h1>\n'
+        f'<div class="cover-meta">Agent {safe_agent}<br>{generated_at}</div>\n'
+        '<div class="stat-row">\n'
+        f'<span class="stat">본문 {text_char_count:,}자</span>\n'
+        f'<span class="stat">표 {table_count:,}개</span>\n'
+        f'<span class="stat">시각 자료 {image_count:,}개</span>\n'
+        '</div>\n</section>\n'
+        '<div class="report-grid">\n'
+        f'<nav class="toc" aria-label="목차"><h2>Contents</h2><ol>{toc_html}</ol></nav>\n'
+        f'<article>{body_html}<div id="no-results" class="no-results">검색 결과가 없습니다.</div></article>\n'
+        '</div>\n</main>\n'
+        '<dialog id="lightbox"><div class="lightbox-inner"><button class="lightbox-close" '
+        'type="button" aria-label="닫기">×</button><img alt="확대 이미지"></div></dialog>\n'
+        """<script>
+(() => {
+  const root = document.documentElement;
+  const sections = [...document.querySelectorAll('.report-section')];
+  const search = document.getElementById('report-search');
+  const count = document.getElementById('search-count');
+  const noResults = document.getElementById('no-results');
+
+  try {
+    const saved = localStorage.getItem('deep-research-theme');
+    if (saved) root.dataset.theme = saved;
+  } catch (_) {}
+  document.getElementById('theme-toggle').addEventListener('click', () => {
+    root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem('deep-research-theme', root.dataset.theme); } catch (_) {}
+  });
+
+  sections.forEach((section) => {
+    const heading = section.querySelector(':scope > h1, :scope > h2');
+    if (!heading) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'section-toggle';
+    button.textContent = '접기';
+    button.setAttribute('aria-expanded', 'true');
+    button.addEventListener('click', () => {
+      const collapsed = section.classList.toggle('collapsed');
+      button.textContent = collapsed ? '펼치기' : '접기';
+      button.setAttribute('aria-expanded', String(!collapsed));
+    });
+    heading.prepend(button);
+  });
+
+  const setCollapsed = (collapsed) => sections.forEach((section) => {
+    const button = section.querySelector(':scope > h1 .section-toggle, :scope > h2 .section-toggle');
+    if (!button) return;
+    section.classList.toggle('collapsed', collapsed);
+    button.textContent = collapsed ? '펼치기' : '접기';
+    button.setAttribute('aria-expanded', String(!collapsed));
+  });
+  document.getElementById('expand-all').addEventListener('click', () => setCollapsed(false));
+  document.getElementById('collapse-all').addEventListener('click', () => setCollapsed(true));
+
+  search.addEventListener('input', () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    let visible = 0;
+    sections.forEach((section) => {
+      const matches = !query || section.textContent.toLocaleLowerCase().includes(query);
+      section.hidden = !matches;
+      if (matches) {
+        visible += 1;
+        if (query) section.classList.remove('collapsed');
+      }
+    });
+    count.textContent = query ? `${visible}개 섹션` : '';
+    noResults.classList.toggle('visible', Boolean(query) && visible === 0);
+  });
+
+  document.querySelectorAll('table[data-sortable="true"]').forEach((table) => {
+    table.querySelectorAll('thead th').forEach((header, column) => {
+      header.tabIndex = 0;
+      header.title = '클릭해서 정렬';
+      const sort = () => {
+        const body = table.tBodies[0];
+        if (!body) return;
+        const ascending = header.getAttribute('aria-sort') !== 'ascending';
+        table.querySelectorAll('th[aria-sort]').forEach((item) => item.removeAttribute('aria-sort'));
+        header.setAttribute('aria-sort', ascending ? 'ascending' : 'descending');
+        const rows = [...body.rows];
+        rows.sort((a, b) => {
+          const left = a.cells[column]?.textContent.trim() || '';
+          const right = b.cells[column]?.textContent.trim() || '';
+          return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }) * (ascending ? 1 : -1);
+        });
+        rows.forEach((row) => body.appendChild(row));
+      };
+      header.addEventListener('click', sort);
+      header.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); sort(); }
+      });
+    });
+  });
+
+  const dialog = document.getElementById('lightbox');
+  const dialogImage = dialog.querySelector('img');
+  const openImage = (image) => {
+    dialogImage.src = image.src;
+    dialogImage.alt = image.alt;
+    if (dialog.showModal) dialog.showModal(); else dialog.setAttribute('open', '');
+  };
+  document.querySelectorAll('.report-figure img').forEach((image) => {
+    image.addEventListener('click', () => openImage(image));
+    image.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openImage(image); }
+    });
+  });
+  dialog.querySelector('.lightbox-close').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+
+  if ('IntersectionObserver' in window) {
+    const links = new Map([...document.querySelectorAll('.toc a')].map((link) => [decodeURIComponent(link.hash.slice(1)), link]));
+    const observer = new IntersectionObserver((entries) => {
+      entries.filter((entry) => entry.isIntersecting).forEach((entry) => {
+        links.forEach((link) => link.classList.remove('active'));
+        links.get(entry.target.id)?.classList.add('active');
+      });
+    }, { rootMargin: '-15% 0px -75% 0px' });
+    document.querySelectorAll('.report-content h1, .report-content h2, .report-content h3').forEach((heading) => observer.observe(heading));
+  }
+})();
+</script>
+"""
+        '</body>\n</html>\n'
+    ).encode("utf-8")
 
 
-def build_deep_research_report(interaction, *, agent_id):
+def build_deep_research_report(interaction, *, agent_id, title):
     outputs = collect_interaction_outputs(interaction)
     if not outputs:
         raise RuntimeError("Deep Research outputs가 비어 있습니다.")
-    pdf_bytes = build_deep_research_pdf(outputs, agent_id=agent_id)
     text_preview = "\n\n".join(output["text"] for output in outputs if output["type"] == "text").strip()
     image_count = sum(1 for output in outputs if output["type"] == "image")
+    html_bytes = build_deep_research_html(outputs, agent_id=agent_id, title=title)
     return {
         "kind": "deep_research_report",
-        "pdf_bytes": pdf_bytes,
-        "filename": f"deep_research_{datetime.now(KST).strftime('%Y%m%d_%H%M%S')}.pdf",
+        "html_bytes": html_bytes,
+        "filename": f"deep_research_{datetime.now(KST).strftime('%Y%m%d_%H%M%S')}.html",
         "summary": (
-            f"[Deep Research] 완료했습니다. PDF 레포트를 첨부합니다."
+            f"[Deep Research] 완료했습니다. 오프라인 HTML 보고서를 첨부합니다."
             f"\n텍스트 출력 {len(text_preview):,}자, 이미지 {image_count}개"
         ),
-        "text_preview": text_preview[:MEMORY_EXCERPT_MAX_CHARS],
     }
 
 
@@ -2082,12 +2484,12 @@ async def call_deep_research(research_topic, agent_id):
                 last_status_log_at = now
             if status == "completed":
                 try:
-                    return build_deep_research_report(result, agent_id=agent_id)
+                    return build_deep_research_report(result, agent_id=agent_id, title=research_topic)
                 except Exception as e:
                     text = extract_interaction_text(result)
                     if text:
-                        return f"[ERROR] Deep Research PDF 생성 실패: {e}\n\n{text}"
-                    return f"[ERROR] Deep Research PDF 생성 실패: {e}"
+                        return f"[ERROR] Deep Research HTML 생성 실패: {e}\n\n{text}"
+                    return f"[ERROR] Deep Research HTML 생성 실패: {e}"
             if status in ("failed", "cancelled", "incomplete", "budget_exceeded", "requires_action"):
                 error = getattr(result, "error", None) or (result.get("error") if isinstance(result, dict) else None)
                 detail = f": {error}" if error else ""
@@ -4223,7 +4625,7 @@ async def run_deep_research_command(interaction: discord.Interaction, prompt: st
     target_channel = interaction.channel
     target_channel_id = interaction.channel_id
 
-    async def send_result(content, *, pdf=None, filename=None):
+    async def send_result(content, *, attachment=None, filename=None):
         channel = target_channel
         if channel is None and target_channel_id is not None:
             channel = bot.get_channel(target_channel_id)
@@ -4231,8 +4633,8 @@ async def run_deep_research_command(interaction: discord.Interaction, prompt: st
             channel = await bot.fetch_channel(target_channel_id)
         if channel is None:
             raise RuntimeError("Deep Research 결과를 전송할 채널을 찾지 못했습니다.")
-        if pdf:
-            await channel.send(content, file=discord.File(fp=io.BytesIO(pdf), filename=filename))
+        if attachment:
+            await channel.send(content, file=discord.File(fp=io.BytesIO(attachment), filename=filename))
         else:
             await channel.send(content)
 
@@ -4243,10 +4645,10 @@ async def run_deep_research_command(interaction: discord.Interaction, prompt: st
         if isinstance(result, dict) and result.get("kind") == "deep_research_report":
             await send_result(
                 f"{mention} {result.get('summary') or '[Deep Research] 완료했습니다.'}",
-                pdf=result.get("pdf_bytes"),
-                filename=result.get("filename") or "deep_research_report.pdf",
+                attachment=result.get("html_bytes"),
+                filename=result.get("filename") or "deep_research_report.html",
             )
-            print(f"  [BOT]({agent_id}): [Deep Research PDF]")
+            print(f"  [BOT]({agent_id}): [Deep Research HTML]")
         else:
             text = f"{mention} {result if isinstance(result, str) else str(result)}"
             for chunk in [text[i:i+1900] for i in range(0, len(text), 1900)]:
@@ -4258,7 +4660,7 @@ async def run_deep_research_command(interaction: discord.Interaction, prompt: st
         print("-------")
 
 
-@bot.tree.command(name="deepo", description="Deep Research — 입력한 주제만 단독 리서치 (약 10분, PDF 리포트)")
+@bot.tree.command(name="deepo", description="Deep Research — 입력한 주제만 단독 리서치 (약 10분, 오프라인 HTML)")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(prompt="리서치할 주제/질문 (대화 컨텍스트는 참조하지 않음)")
