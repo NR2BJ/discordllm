@@ -77,7 +77,10 @@ if not discord.opus.is_loaded():
 
 # ================= 1. 설정 및 상수 =================
 DISCORD_TOKEN = os.environ["GEMINI_DISCORD_TOKEN"]
-GOOGLE_API_KEY = os.environ["GEMINI_API_KEY"]
+GOOGLE_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY가 비어 있습니다.")
+GOOGLE_API_KEY_FINGERPRINT = hashlib.sha256(GOOGLE_API_KEY.encode("utf-8")).hexdigest()[:12]
 
 try:
     CLIENT = genai.Client(api_key=GOOGLE_API_KEY)
@@ -85,7 +88,10 @@ except Exception as e:
     print(f"[ERROR] Google Client 초기화 실패: {e}")
     CLIENT = None
 
-print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
+print(
+    f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION} "
+    f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} chars={len(GOOGLE_API_KEY)}"
+)
 
 AVAILABLE_MODELS = {
     # Gemini 3.1 Pro Preview (3 levels: low / medium / high — minimal 미지원)
@@ -151,6 +157,8 @@ DEEP_RESEARCH_AGENTS = {
 }
 DEEP_RESEARCH_POLL_INTERVAL_SECONDS = 10
 DEEP_RESEARCH_STATUS_LOG_INTERVAL_SECONDS = 300
+GEMINI_API_TIMEOUT_SECONDS = 120.0
+GEMINI_API_PROBE_TIMEOUT_SECONDS = 30.0
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
     AVAILABLE_MODELS["flash-lite-minimal"]["text"],
@@ -1296,6 +1304,13 @@ async def maybe_await(value):
     return value
 
 
+def describe_gemini_exception(error, timeout_seconds=GEMINI_API_TIMEOUT_SECONDS):
+    if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+        return f"TimeoutError: Gemini API가 {timeout_seconds:.0f}초 안에 응답하지 않았습니다."
+    message = str(error).strip()
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
 def get_interactions_api():
     if CLIENT is None:
         return None
@@ -1436,6 +1451,7 @@ async def create_model_interaction(
     response_schema=None,
     response_format=None,
     store=False,
+    timeout_seconds=GEMINI_API_TIMEOUT_SECONDS,
 ):
     interactions_api = get_interactions_api()
     if interactions_api is None:
@@ -1454,7 +1470,10 @@ async def create_model_interaction(
         ]
     elif response_format is not None:
         kwargs["response_format"] = response_format
-    return await maybe_await(interactions_api.create(**kwargs))
+    return await asyncio.wait_for(
+        maybe_await(interactions_api.create(**kwargs)),
+        timeout=timeout_seconds,
+    )
 
 
 async def call_interaction_get(interactions_api, interaction_id):
@@ -1642,6 +1661,10 @@ async def create_traced_interaction(
         store=False,
     )
     started = time_module.perf_counter()
+    print(
+        f"[GEMINI] {phase} request start "
+        f"request={json.dumps(request_summary, ensure_ascii=False, default=str, separators=(',', ':'))}"
+    )
     try:
         interaction = await create_model_interaction(
             model=model,
@@ -1651,26 +1674,32 @@ async def create_traced_interaction(
             thinking_level=thinking_level,
         )
     except Exception as e:
+        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
         call_trace["calls"].append(
             {
                 "phase": phase,
-                "elapsed_ms": round((time_module.perf_counter() - started) * 1000),
+                "elapsed_ms": elapsed_ms,
                 "request": request_summary,
             }
         )
         print(
             f"[ERROR] Gemini {phase} interaction failed "
             f"trace={json.dumps(call_trace, ensure_ascii=False, default=str, separators=(',', ':'))} "
-            f"exception={type(e).__name__}: {e}"
+            f"exception={describe_gemini_exception(e)}"
         )
         raise
 
+    elapsed_ms = round((time_module.perf_counter() - started) * 1000)
     call_trace["calls"].append(
         {
             "phase": phase,
-            "elapsed_ms": round((time_module.perf_counter() - started) * 1000),
+            "elapsed_ms": elapsed_ms,
             "request": request_summary,
         }
+    )
+    print(
+        f"[GEMINI] {phase} request complete elapsed_ms={elapsed_ms} "
+        f"status={get_interaction_status(interaction)} id={get_interaction_output_value(interaction, 'id', '-') or '-'}"
     )
     return interaction
 
@@ -2752,6 +2781,36 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
 
     return interaction, token_usage, call_trace
 
+
+async def probe_gemini_api(model):
+    """프로세스 시작 시 실제 Interactions 호출로 키와 모델 접근을 한 번 검증한다."""
+    started = time_module.perf_counter()
+    print(
+        f"[GEMINI] API probe start model={model} "
+        f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
+    )
+    try:
+        interaction = await create_model_interaction(
+            model=model,
+            input_data="Reply with exactly: OK",
+            timeout_seconds=GEMINI_API_PROBE_TIMEOUT_SECONDS,
+        )
+        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+        status = get_interaction_status(interaction)
+        has_text = bool(extract_interaction_text(interaction))
+        level = "OK" if status in {"completed", "incomplete"} and has_text else "WARN"
+        print(
+            f"[{level}] Gemini API probe model={model} status={status} "
+            f"text={has_text} elapsed_ms={elapsed_ms}"
+        )
+    except Exception as e:
+        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+        print(
+            f"[ERROR] Gemini API probe failed model={model} elapsed_ms={elapsed_ms} "
+            f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} "
+            f"exception={describe_gemini_exception(e, GEMINI_API_PROBE_TIMEOUT_SECONDS)}"
+        )
+
 # ================= 4. 봇 메인 로직 =================
 class GeminiBot(commands.Bot):
     def __init__(self):
@@ -2764,6 +2823,8 @@ class GeminiBot(commands.Bot):
         self.voice_disconnected_at = {}
         self.voice_bad_state_counts = {}
         self.loop_monitor_expected = None
+        self.gemini_probe_started = False
+        self.gemini_probe_task = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
         self.sound_files = scan_sound_files()
         global_cfg = self.get_global_config()
@@ -3409,6 +3470,15 @@ async def setup_panel_channels():
 @bot.event
 async def on_ready():
     print(f"[OK] {bot.user} 로그인 완료!")
+    if not bot.gemini_probe_started:
+        bot.gemini_probe_started = True
+        probe_model = TEXT_MODEL
+        for guild in bot.guilds:
+            configured_model = bot.get_config(guild.id).get("text_model")
+            if configured_model:
+                probe_model = configured_model
+                break
+        bot.gemini_probe_task = asyncio.create_task(probe_gemini_api(probe_model))
     try:
         synced = await bot.tree.sync()
         print(f"[OK] {len(synced)}개의 슬래시 커맨드 동기화 완료")
@@ -3583,8 +3653,19 @@ async def on_message(message):
 
     if message.channel.id != config.get("channel_id"): return
 
+    current_display_name = get_server_display_name(message.guild, message.author)
+    log_time = datetime.now().strftime('%H:%M:%S')
     lock = bot.get_channel_lock(message.channel.id)
+    print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
+    print(
+        f"[DISPATCH] msg={message.id} attachments={len(message.attachments)} "
+        f"queued={lock.locked()}"
+    )
+    lock_wait_started = time_module.perf_counter()
     async with lock:
+        lock_wait_ms = round((time_module.perf_counter() - lock_wait_started) * 1000)
+        if lock_wait_ms >= 100:
+            print(f"[DISPATCH] msg={message.id} lock acquired after {lock_wait_ms}ms")
         async with message.channel.typing():
             try:
                 server_text_model = config.get("text_model", TEXT_MODEL)
@@ -3690,7 +3771,6 @@ async def on_message(message):
                     f"image_window={image_history_limit} inline_images={history_inline_images}"
                 )
 
-                current_display_name = get_server_display_name(message.guild, message.author)
                 current_text = message.content.strip()
                 current_parts = [types.Part(text=current_text)] if current_text else []
                 current_ref_images = []
@@ -3841,9 +3921,6 @@ async def on_message(message):
                 if status == "incomplete":
                     print("[WARN] Gemini interaction이 incomplete 상태로 종료되어 부분 응답을 전송합니다.")
 
-                log_time = datetime.now().strftime('%H:%M:%S')
-                print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
-
                 text_reply = extract_interaction_text(response)
                 if not text_reply:
                     error = get_interaction_error_message(response)
@@ -3874,9 +3951,10 @@ async def on_message(message):
                 print("-------")
 
             except Exception as e:
-                print(f"[CRITICAL] Error: {e}")
+                error_detail = describe_gemini_exception(e)
+                print(f"[CRITICAL] Error: {error_detail}")
                 traceback.print_exc()
-                await message.channel.send(f"오류가 발생했습니다: {e}")
+                await message.channel.send(f"오류가 발생했습니다: {error_detail[:1500]}")
 
 # ================= 5. 서버 설정 명령어 =================
 
