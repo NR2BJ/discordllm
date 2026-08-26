@@ -123,19 +123,19 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
-    # Gemini 3.7 Flash (3 levels; minimal 미지원)
+    # Gemini 3.6 Flash
     "flash-low": {
-        "text": "gemini-3.7-flash",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-medium": {
-        "text": "gemini-3.7-flash",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-high": {
-        "text": "gemini-3.7-flash",
+        "text": "gemini-3.6-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
@@ -160,6 +160,9 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
+}
+TEXT_MODEL_MIGRATIONS = {
+    "gemini-3.7-flash": AVAILABLE_MODELS["flash-low"]["text"],
 }
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
@@ -3016,6 +3019,21 @@ class GeminiBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
+        model_config_changed = False
+        for guild_id, guild_config in self.server_configs.items():
+            if guild_id.startswith("_") or not isinstance(guild_config, dict):
+                continue
+            configured_model = guild_config.get("text_model")
+            replacement = TEXT_MODEL_MIGRATIONS.get(configured_model)
+            if replacement:
+                guild_config["text_model"] = replacement
+                model_config_changed = True
+                print(
+                    f"[CONFIG] guild={guild_id} text model migrated: "
+                    f"{configured_model} -> {replacement}"
+                )
+        if model_config_changed:
+            DataManager.save_json(CONFIG_FILE, self.server_configs)
         self.channel_locks = {}
         self.voice_locks = {}
         self.voice_retry_after = {}
