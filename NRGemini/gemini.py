@@ -174,6 +174,7 @@ GEMINI_API_TIMEOUT_SECONDS = 120.0
 GEMINI_API_PROBE_TIMEOUT_SECONDS = 30.0
 GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS = 15.0
 GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions"
+GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
     AVAILABLE_MODELS["flash-lite-minimal"]["text"],
@@ -2821,58 +2822,130 @@ def summarize_google_api_error_payload(payload):
     return str(payload).strip()[:1000] or "empty response body"
 
 
-async def diagnose_gemini_rest_once(model):
-    """SDK timeout 시 재시도 없는 REST 호출로 HTTP/API 실패 영역을 분리한다."""
+def has_generate_content_text(payload):
+    if not isinstance(payload, dict):
+        return False
+    for candidate in payload.get("candidates") or []:
+        for part in (candidate.get("content") or {}).get("parts") or []:
+            if isinstance(part, dict) and str(part.get("text") or "").strip():
+                return True
+    return False
+
+
+async def request_gemini_rest_once(method, url, *, payload=None):
+    """재시도 없이 Gemini REST를 한 번 호출하고 안전한 진단 재료만 반환한다."""
     started = time_module.perf_counter()
-    print(
-        f"[GEMINI] direct REST diagnostic start model={model} "
-        f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
-    )
     timeout = aiohttp.ClientTimeout(
         total=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
         connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
         sock_connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
         sock_read=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
     )
+    headers = {"x-goog-api-key": GOOGLE_API_KEY, "Content-Type": "application/json"}
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(
-                GEMINI_INTERACTIONS_ENDPOINT,
-                headers={
-                    "x-goog-api-key": GOOGLE_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={"model": model, "input": "Reply with exactly: OK", "store": False},
-            ) as response:
+            async with session.request(method, url, headers=headers, json=payload) as response:
                 response_text = await response.text()
                 try:
-                    payload = json.loads(response_text)
+                    response_payload = json.loads(response_text)
                 except json.JSONDecodeError:
-                    payload = response_text
-
+                    response_payload = response_text
                 elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-                if response.status >= 400:
-                    print(
-                        f"[ERROR] Gemini direct REST diagnostic failed model={model} "
-                        f"http_status={response.status} elapsed_ms={elapsed_ms} "
-                        f"error={summarize_google_api_error_payload(payload)}"
-                    )
-                    return
-
-                status = get_interaction_status(payload)
-                has_text = bool(extract_interaction_text(payload))
-                print(
-                    f"[OK] Gemini direct REST diagnostic model={model} "
-                    f"http_status={response.status} status={status} text={has_text} "
-                    f"elapsed_ms={elapsed_ms}"
-                )
+                return response.status, response_payload, elapsed_ms, None
     except Exception as e:
         elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+        return None, None, elapsed_ms, e
+
+
+async def diagnose_gemini_auth_key_once(model):
+    """Auth key 자체와 기존 generateContent 경로를 Interactions와 분리해 검사한다."""
+    status, payload, elapsed_ms, error = await request_gemini_rest_once(
+        "GET", f"{GEMINI_MODELS_ENDPOINT}/{model}"
+    )
+    if error is not None:
+        print(
+            f"[ERROR] Gemini auth key metadata transport failed model={model} "
+            f"elapsed_ms={elapsed_ms} "
+            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+        )
+        return
+    if status >= 400:
+        print(
+            f"[ERROR] Gemini auth key metadata probe failed model={model} "
+            f"http_status={status} elapsed_ms={elapsed_ms} "
+            f"error={summarize_google_api_error_payload(payload)}"
+        )
+        return
+    print(
+        f"[OK] Gemini auth key metadata probe model={model} "
+        f"http_status={status} elapsed_ms={elapsed_ms}"
+    )
+
+    status, payload, elapsed_ms, error = await request_gemini_rest_once(
+        "POST",
+        f"{GEMINI_MODELS_ENDPOINT}/{model}:generateContent",
+        payload={
+            "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}]
+        },
+    )
+    if error is not None:
+        print(
+            f"[ERROR] Gemini generateContent transport failed model={model} "
+            f"elapsed_ms={elapsed_ms} "
+            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+        )
+        return
+    if status >= 400:
+        print(
+            f"[ERROR] Gemini generateContent probe failed model={model} "
+            f"http_status={status} elapsed_ms={elapsed_ms} "
+            f"error={summarize_google_api_error_payload(payload)}"
+        )
+        return
+    print(
+        f"[OK] Gemini generateContent probe model={model} "
+        f"http_status={status} text={has_generate_content_text(payload)} elapsed_ms={elapsed_ms}"
+    )
+    print(
+        "[WARN] Auth key와 generateContent는 정상이나 Interactions만 타임아웃입니다. "
+        "Google Auth key/Interactions 호환 문제로 분류합니다."
+    )
+
+
+async def diagnose_gemini_rest_once(model):
+    """SDK timeout 시 재시도 없는 REST 호출로 HTTP/API 실패 영역을 분리한다."""
+    print(
+        f"[GEMINI] direct REST diagnostic start model={model} "
+        f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
+    )
+    status, payload, elapsed_ms, error = await request_gemini_rest_once(
+        "POST",
+        GEMINI_INTERACTIONS_ENDPOINT,
+        payload={"model": model, "input": "Reply with exactly: OK", "store": False},
+    )
+    if error is not None:
         print(
             f"[ERROR] Gemini direct REST diagnostic transport failed model={model} "
             f"elapsed_ms={elapsed_ms} "
-            f"exception={describe_gemini_exception(e, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
         )
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            await diagnose_gemini_auth_key_once(model)
+        return
+    if status >= 400:
+        print(
+            f"[ERROR] Gemini direct REST diagnostic failed model={model} "
+            f"http_status={status} elapsed_ms={elapsed_ms} "
+            f"error={summarize_google_api_error_payload(payload)}"
+        )
+        return
+    interaction_status = get_interaction_status(payload)
+    has_text = bool(extract_interaction_text(payload))
+    print(
+        f"[OK] Gemini direct REST diagnostic model={model} "
+        f"http_status={status} status={interaction_status} text={has_text} "
+        f"elapsed_ms={elapsed_ms}"
+    )
 
 
 async def probe_gemini_api(model):
