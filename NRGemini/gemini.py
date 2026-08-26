@@ -2835,6 +2835,8 @@ def has_generate_content_text(payload):
 async def request_gemini_rest_once(method, url, *, payload=None):
     """재시도 없이 Gemini REST를 한 번 호출하고 안전한 진단 재료만 반환한다."""
     started = time_module.perf_counter()
+    response_status = None
+    headers_elapsed_ms = None
     timeout = aiohttp.ClientTimeout(
         total=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
         connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
@@ -2845,66 +2847,103 @@ async def request_gemini_rest_once(method, url, *, payload=None):
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.request(method, url, headers=headers, json=payload) as response:
-                response_text = await response.text()
+                response_status = response.status
+                headers_elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+                try:
+                    response_text = await response.text()
+                except Exception as e:
+                    elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+                    return response_status, None, elapsed_ms, headers_elapsed_ms, e
                 try:
                     response_payload = json.loads(response_text)
                 except json.JSONDecodeError:
                     response_payload = response_text
                 elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-                return response.status, response_payload, elapsed_ms, None
+                return response_status, response_payload, elapsed_ms, headers_elapsed_ms, None
     except Exception as e:
         elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-        return None, None, elapsed_ms, e
+        return response_status, None, elapsed_ms, headers_elapsed_ms, e
+
+
+def describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error):
+    headers_summary = (
+        f"headers_ms={headers_elapsed_ms}" if headers_elapsed_ms is not None else "headers_ms=N/A"
+    )
+    if status is None:
+        return (
+            f"transport {headers_summary} "
+            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+        )
+    if status >= 400:
+        detail = f"http_status={status} {headers_summary} error={summarize_google_api_error_payload(payload)}"
+        if error is not None:
+            detail += (
+                " response_body_exception="
+                f"{describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+            )
+        return detail
+    if error is not None:
+        return (
+            f"http_status={status} {headers_summary} response_body_exception="
+            f"{describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+        )
+    return None
 
 
 async def diagnose_gemini_auth_key_once(model):
     """Auth key 자체와 기존 generateContent 경로를 Interactions와 분리해 검사한다."""
-    status, payload, elapsed_ms, error = await request_gemini_rest_once(
+    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
         "GET", f"{GEMINI_MODELS_ENDPOINT}/{model}"
     )
-    if error is not None:
-        print(
-            f"[ERROR] Gemini auth key metadata transport failed model={model} "
-            f"elapsed_ms={elapsed_ms} "
-            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
-        )
-        return
-    if status >= 400:
+    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
+    if failure:
         print(
             f"[ERROR] Gemini auth key metadata probe failed model={model} "
-            f"http_status={status} elapsed_ms={elapsed_ms} "
-            f"error={summarize_google_api_error_payload(payload)}"
+            f"elapsed_ms={elapsed_ms} {failure}"
         )
         return
     print(
         f"[OK] Gemini auth key metadata probe model={model} "
-        f"http_status={status} elapsed_ms={elapsed_ms}"
+        f"http_status={status} headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
     )
 
-    status, payload, elapsed_ms, error = await request_gemini_rest_once(
+    count_payload = {
+        "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}]
+    }
+    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
         "POST",
-        f"{GEMINI_MODELS_ENDPOINT}/{model}:generateContent",
-        payload={
-            "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}]
-        },
+        f"{GEMINI_MODELS_ENDPOINT}/{model}:countTokens",
+        payload=count_payload,
     )
-    if error is not None:
+    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
+    if failure:
         print(
-            f"[ERROR] Gemini generateContent transport failed model={model} "
-            f"elapsed_ms={elapsed_ms} "
-            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+            f"[ERROR] Gemini countTokens probe failed model={model} "
+            f"elapsed_ms={elapsed_ms} {failure}"
         )
         return
-    if status >= 400:
+    total_tokens = payload.get("totalTokens") if isinstance(payload, dict) else None
+    print(
+        f"[OK] Gemini countTokens probe model={model} http_status={status} "
+        f"total_tokens={total_tokens} headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
+    )
+
+    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
+        "POST",
+        f"{GEMINI_MODELS_ENDPOINT}/{model}:generateContent",
+        payload=count_payload,
+    )
+    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
+    if failure:
         print(
             f"[ERROR] Gemini generateContent probe failed model={model} "
-            f"http_status={status} elapsed_ms={elapsed_ms} "
-            f"error={summarize_google_api_error_payload(payload)}"
+            f"elapsed_ms={elapsed_ms} {failure}"
         )
         return
     print(
         f"[OK] Gemini generateContent probe model={model} "
-        f"http_status={status} text={has_generate_content_text(payload)} elapsed_ms={elapsed_ms}"
+        f"http_status={status} text={has_generate_content_text(payload)} "
+        f"headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
     )
     print(
         "[WARN] Auth key와 generateContent는 정상이나 Interactions만 타임아웃입니다. "
@@ -2918,33 +2957,26 @@ async def diagnose_gemini_rest_once(model):
         f"[GEMINI] direct REST diagnostic start model={model} "
         f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
     )
-    status, payload, elapsed_ms, error = await request_gemini_rest_once(
+    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
         "POST",
         GEMINI_INTERACTIONS_ENDPOINT,
         payload={"model": model, "input": "Reply with exactly: OK", "store": False},
     )
-    if error is not None:
-        print(
-            f"[ERROR] Gemini direct REST diagnostic transport failed model={model} "
-            f"elapsed_ms={elapsed_ms} "
-            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
-        )
-        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
-            await diagnose_gemini_auth_key_once(model)
-        return
-    if status >= 400:
+    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
+    if failure:
         print(
             f"[ERROR] Gemini direct REST diagnostic failed model={model} "
-            f"http_status={status} elapsed_ms={elapsed_ms} "
-            f"error={summarize_google_api_error_payload(payload)}"
+            f"elapsed_ms={elapsed_ms} {failure}"
         )
+        if status == 401 or isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            await diagnose_gemini_auth_key_once(model)
         return
     interaction_status = get_interaction_status(payload)
     has_text = bool(extract_interaction_text(payload))
     print(
         f"[OK] Gemini direct REST diagnostic model={model} "
         f"http_status={status} status={interaction_status} text={has_text} "
-        f"elapsed_ms={elapsed_ms}"
+        f"headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
     )
 
 
