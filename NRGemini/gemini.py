@@ -80,31 +80,14 @@ DISCORD_TOKEN = os.environ["GEMINI_DISCORD_TOKEN"]
 GOOGLE_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 if not GOOGLE_API_KEY:
     raise RuntimeError("GEMINI_API_KEY가 비어 있습니다.")
-GOOGLE_API_KEY_FINGERPRINT = hashlib.sha256(GOOGLE_API_KEY.encode("utf-8")).hexdigest()[:12]
-GEMINI_SDK_RETRY_ATTEMPTS = 2
-GEMINI_SDK_RETRY_INITIAL_DELAY_SECONDS = 0.5
-GEMINI_SDK_RETRY_MAX_DELAY_SECONDS = 2.0
 
 try:
-    CLIENT = genai.Client(
-        api_key=GOOGLE_API_KEY,
-        http_options=types.HttpOptions(
-            retry_options=types.HttpRetryOptions(
-                attempts=GEMINI_SDK_RETRY_ATTEMPTS,
-                initial_delay=GEMINI_SDK_RETRY_INITIAL_DELAY_SECONDS,
-                max_delay=GEMINI_SDK_RETRY_MAX_DELAY_SECONDS,
-            )
-        ),
-    )
+    CLIENT = genai.Client(api_key=GOOGLE_API_KEY)
 except Exception as e:
     print(f"[ERROR] Google Client 초기화 실패: {e}")
     CLIENT = None
 
-print(
-    f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION} "
-    f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} chars={len(GOOGLE_API_KEY)} "
-    f"retry_attempts={GEMINI_SDK_RETRY_ATTEMPTS}"
-)
+print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 
 AVAILABLE_MODELS = {
     # Gemini 3.1 Pro Preview (3 levels: low / medium / high — minimal 미지원)
@@ -123,19 +106,19 @@ AVAILABLE_MODELS = {
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
-    # Gemini 3.6 Flash
+    # Gemini 3.7 Flash (3 levels; minimal unsupported)
     "flash-low": {
-        "text": "gemini-3.6-flash",
+        "text": "gemini-3.7-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "low",
     },
     "flash-medium": {
-        "text": "gemini-3.6-flash",
+        "text": "gemini-3.7-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "medium",
     },
     "flash-high": {
-        "text": "gemini-3.6-flash",
+        "text": "gemini-3.7-flash",
         "image": "gemini-3.1-flash-image",
         "thinking_level": "high",
     },
@@ -162,7 +145,7 @@ AVAILABLE_MODELS = {
     },
 }
 TEXT_MODEL_MIGRATIONS = {
-    "gemini-3.7-flash": AVAILABLE_MODELS["flash-low"]["text"],
+    "gemini-3.6-flash": AVAILABLE_MODELS["flash-low"]["text"],
 }
 TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
 IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
@@ -174,10 +157,8 @@ DEEP_RESEARCH_AGENTS = {
 DEEP_RESEARCH_POLL_INTERVAL_SECONDS = 10
 DEEP_RESEARCH_STATUS_LOG_INTERVAL_SECONDS = 300
 GEMINI_API_TIMEOUT_SECONDS = 120.0
-GEMINI_API_PROBE_TIMEOUT_SECONDS = 30.0
-GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS = 15.0
-GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions"
-GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_IMAGE_TIMEOUT_SECONDS = 300.0
+GEMINI_IMAGE_MAX_ATTEMPTS = 2
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
     AVAILABLE_MODELS["flash-lite-minimal"]["text"],
@@ -2722,19 +2703,18 @@ async def call_nano_banana(contents, image_model=None):
     if not CLIENT: return None
     if image_model is None:
         image_model = IMAGE_MODEL
-    max_retries = 5
 
-    for attempt in range(max_retries):
+    for attempt in range(1, GEMINI_IMAGE_MAX_ATTEMPTS + 1):
         try:
             input_blocks = image_generation_inputs_to_blocks(contents)
             if not input_blocks:
                 raise ValueError("이미지 생성 입력이 비어 있습니다.")
-            coro = create_model_interaction(
+            interaction = await create_model_interaction(
                 model=image_model,
                 input_data=input_blocks,
                 response_format={"type": "image"},
+                timeout_seconds=GEMINI_IMAGE_TIMEOUT_SECONDS,
             )
-            interaction = await asyncio.wait_for(coro, timeout=90.0)
             status = get_interaction_status(interaction)
             if status not in {"completed", "incomplete"}:
                 raise Exception(f"Image interaction status: {status}")
@@ -2751,13 +2731,18 @@ async def call_nano_banana(contents, image_model=None):
             raise Exception("No image data found in response")
 
         except Exception as e:
-            error_msg = str(e)
-            if "500" in error_msg or "Payload" in error_msg or "Connection" in error_msg or "400" in error_msg or "Timeout" in error_msg:
-                print(f"[WARN] 이미지 생성 실패 (시도 {attempt+1}/{max_retries}): {error_msg} -> 5초 후 재시도...")
-                await asyncio.sleep(5)
-                if attempt == max_retries - 1: raise e
-            else:
-                raise e
+            error_msg = describe_gemini_exception(e, GEMINI_IMAGE_TIMEOUT_SECONDS)
+            retryable = isinstance(e, (TimeoutError, asyncio.TimeoutError)) or any(
+                marker in error_msg.lower()
+                for marker in ("connection", "429", "500", "502", "503", "504", "unavailable")
+            )
+            if not retryable or attempt == GEMINI_IMAGE_MAX_ATTEMPTS:
+                raise
+            print(
+                f"[WARN] 이미지 생성 실패 (시도 {attempt}/{GEMINI_IMAGE_MAX_ATTEMPTS}): "
+                f"{error_msg} -> 5초 후 재시도..."
+            )
+            await asyncio.sleep(5)
 
 async def call_gemini(history_contents, text_model=None, thinking_level=None):
     if not CLIENT:
@@ -2801,219 +2786,6 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
     return interaction, token_usage, call_trace
 
 
-def summarize_google_api_error_payload(payload):
-    if isinstance(payload, list) and payload:
-        payload = payload[0]
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-            status = error.get("status")
-            message = str(error.get("message") or "").strip()
-            summary = " ".join(
-                part
-                for part in (
-                    f"code={code}" if code is not None else "",
-                    f"status={status}" if status else "",
-                    message,
-                )
-                if part
-            )
-            if summary:
-                return summary[:1000]
-        return json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))[:1000]
-    return str(payload).strip()[:1000] or "empty response body"
-
-
-def has_generate_content_text(payload):
-    if not isinstance(payload, dict):
-        return False
-    for candidate in payload.get("candidates") or []:
-        for part in (candidate.get("content") or {}).get("parts") or []:
-            if isinstance(part, dict) and str(part.get("text") or "").strip():
-                return True
-    return False
-
-
-async def request_gemini_rest_once(method, url, *, payload=None):
-    """재시도 없이 Gemini REST를 한 번 호출하고 안전한 진단 재료만 반환한다."""
-    started = time_module.perf_counter()
-    response_status = None
-    headers_elapsed_ms = None
-    timeout = aiohttp.ClientTimeout(
-        total=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
-        connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
-        sock_connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
-        sock_read=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
-    )
-    headers = {"x-goog-api-key": GOOGLE_API_KEY, "Content-Type": "application/json"}
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.request(method, url, headers=headers, json=payload) as response:
-                response_status = response.status
-                headers_elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-                try:
-                    response_text = await response.text()
-                except Exception as e:
-                    elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-                    return response_status, None, elapsed_ms, headers_elapsed_ms, e
-                try:
-                    response_payload = json.loads(response_text)
-                except json.JSONDecodeError:
-                    response_payload = response_text
-                elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-                return response_status, response_payload, elapsed_ms, headers_elapsed_ms, None
-    except Exception as e:
-        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-        return response_status, None, elapsed_ms, headers_elapsed_ms, e
-
-
-def describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error):
-    headers_summary = (
-        f"headers_ms={headers_elapsed_ms}" if headers_elapsed_ms is not None else "headers_ms=N/A"
-    )
-    if status is None:
-        return (
-            f"transport {headers_summary} "
-            f"exception={describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
-        )
-    if status >= 400:
-        detail = f"http_status={status} {headers_summary} error={summarize_google_api_error_payload(payload)}"
-        if error is not None:
-            detail += (
-                " response_body_exception="
-                f"{describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
-            )
-        return detail
-    if error is not None:
-        return (
-            f"http_status={status} {headers_summary} response_body_exception="
-            f"{describe_gemini_exception(error, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
-        )
-    return None
-
-
-async def diagnose_gemini_auth_key_once(model):
-    """Auth key 자체와 기존 generateContent 경로를 Interactions와 분리해 검사한다."""
-    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
-        "GET", f"{GEMINI_MODELS_ENDPOINT}/{model}"
-    )
-    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
-    if failure:
-        print(
-            f"[ERROR] Gemini auth key metadata probe failed model={model} "
-            f"elapsed_ms={elapsed_ms} {failure}"
-        )
-        return
-    print(
-        f"[OK] Gemini auth key metadata probe model={model} "
-        f"http_status={status} headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
-    )
-
-    count_payload = {
-        "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}]
-    }
-    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
-        "POST",
-        f"{GEMINI_MODELS_ENDPOINT}/{model}:countTokens",
-        payload=count_payload,
-    )
-    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
-    if failure:
-        print(
-            f"[ERROR] Gemini countTokens probe failed model={model} "
-            f"elapsed_ms={elapsed_ms} {failure}"
-        )
-        return
-    total_tokens = payload.get("totalTokens") if isinstance(payload, dict) else None
-    print(
-        f"[OK] Gemini countTokens probe model={model} http_status={status} "
-        f"total_tokens={total_tokens} headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
-    )
-
-    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
-        "POST",
-        f"{GEMINI_MODELS_ENDPOINT}/{model}:generateContent",
-        payload=count_payload,
-    )
-    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
-    if failure:
-        print(
-            f"[ERROR] Gemini generateContent probe failed model={model} "
-            f"elapsed_ms={elapsed_ms} {failure}"
-        )
-        return
-    print(
-        f"[OK] Gemini generateContent probe model={model} "
-        f"http_status={status} text={has_generate_content_text(payload)} "
-        f"headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
-    )
-    print(
-        "[WARN] Auth key와 generateContent는 정상이나 Interactions만 타임아웃입니다. "
-        "Google Auth key/Interactions 호환 문제로 분류합니다."
-    )
-
-
-async def diagnose_gemini_rest_once(model):
-    """SDK timeout 시 재시도 없는 REST 호출로 HTTP/API 실패 영역을 분리한다."""
-    print(
-        f"[GEMINI] direct REST diagnostic start model={model} "
-        f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
-    )
-    status, payload, elapsed_ms, headers_elapsed_ms, error = await request_gemini_rest_once(
-        "POST",
-        GEMINI_INTERACTIONS_ENDPOINT,
-        payload={"model": model, "input": "Reply with exactly: OK", "store": False},
-    )
-    failure = describe_gemini_rest_failure(status, payload, headers_elapsed_ms, error)
-    if failure:
-        print(
-            f"[ERROR] Gemini direct REST diagnostic failed model={model} "
-            f"elapsed_ms={elapsed_ms} {failure}"
-        )
-        if status == 401 or isinstance(error, (TimeoutError, asyncio.TimeoutError)):
-            await diagnose_gemini_auth_key_once(model)
-        return
-    interaction_status = get_interaction_status(payload)
-    has_text = bool(extract_interaction_text(payload))
-    print(
-        f"[OK] Gemini direct REST diagnostic model={model} "
-        f"http_status={status} status={interaction_status} text={has_text} "
-        f"headers_ms={headers_elapsed_ms} elapsed_ms={elapsed_ms}"
-    )
-
-
-async def probe_gemini_api(model):
-    """프로세스 시작 시 실제 Interactions 호출로 키와 모델 접근을 한 번 검증한다."""
-    started = time_module.perf_counter()
-    print(
-        f"[GEMINI] API probe start model={model} "
-        f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
-    )
-    try:
-        interaction = await create_model_interaction(
-            model=model,
-            input_data="Reply with exactly: OK",
-            timeout_seconds=GEMINI_API_PROBE_TIMEOUT_SECONDS,
-        )
-        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-        status = get_interaction_status(interaction)
-        has_text = bool(extract_interaction_text(interaction))
-        level = "OK" if status in {"completed", "incomplete"} and has_text else "WARN"
-        print(
-            f"[{level}] Gemini API probe model={model} status={status} "
-            f"text={has_text} elapsed_ms={elapsed_ms}"
-        )
-    except Exception as e:
-        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
-        print(
-            f"[ERROR] Gemini API probe failed model={model} elapsed_ms={elapsed_ms} "
-            f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} "
-            f"exception={describe_gemini_exception(e, GEMINI_API_PROBE_TIMEOUT_SECONDS)}"
-        )
-        if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
-            await diagnose_gemini_rest_once(model)
-
 # ================= 4. 봇 메인 로직 =================
 class GeminiBot(commands.Bot):
     def __init__(self):
@@ -3041,8 +2813,6 @@ class GeminiBot(commands.Bot):
         self.voice_disconnected_at = {}
         self.voice_bad_state_counts = {}
         self.loop_monitor_expected = None
-        self.gemini_probe_started = False
-        self.gemini_probe_task = None
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
         self.sound_files = scan_sound_files()
         global_cfg = self.get_global_config()
@@ -3688,15 +3458,6 @@ async def setup_panel_channels():
 @bot.event
 async def on_ready():
     print(f"[OK] {bot.user} 로그인 완료!")
-    if not bot.gemini_probe_started:
-        bot.gemini_probe_started = True
-        probe_model = TEXT_MODEL
-        for guild in bot.guilds:
-            configured_model = bot.get_config(guild.id).get("text_model")
-            if configured_model:
-                probe_model = configured_model
-                break
-        bot.gemini_probe_task = asyncio.create_task(probe_gemini_api(probe_model))
     try:
         synced = await bot.tree.sync()
         print(f"[OK] {len(synced)}개의 슬래시 커맨드 동기화 완료")
