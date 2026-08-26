@@ -81,16 +81,29 @@ GOOGLE_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 if not GOOGLE_API_KEY:
     raise RuntimeError("GEMINI_API_KEY가 비어 있습니다.")
 GOOGLE_API_KEY_FINGERPRINT = hashlib.sha256(GOOGLE_API_KEY.encode("utf-8")).hexdigest()[:12]
+GEMINI_SDK_RETRY_ATTEMPTS = 2
+GEMINI_SDK_RETRY_INITIAL_DELAY_SECONDS = 0.5
+GEMINI_SDK_RETRY_MAX_DELAY_SECONDS = 2.0
 
 try:
-    CLIENT = genai.Client(api_key=GOOGLE_API_KEY)
+    CLIENT = genai.Client(
+        api_key=GOOGLE_API_KEY,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(
+                attempts=GEMINI_SDK_RETRY_ATTEMPTS,
+                initial_delay=GEMINI_SDK_RETRY_INITIAL_DELAY_SECONDS,
+                max_delay=GEMINI_SDK_RETRY_MAX_DELAY_SECONDS,
+            )
+        ),
+    )
 except Exception as e:
     print(f"[ERROR] Google Client 초기화 실패: {e}")
     CLIENT = None
 
 print(
     f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION} "
-    f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} chars={len(GOOGLE_API_KEY)}"
+    f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} chars={len(GOOGLE_API_KEY)} "
+    f"retry_attempts={GEMINI_SDK_RETRY_ATTEMPTS}"
 )
 
 AVAILABLE_MODELS = {
@@ -159,6 +172,8 @@ DEEP_RESEARCH_POLL_INTERVAL_SECONDS = 10
 DEEP_RESEARCH_STATUS_LOG_INTERVAL_SECONDS = 300
 GEMINI_API_TIMEOUT_SECONDS = 120.0
 GEMINI_API_PROBE_TIMEOUT_SECONDS = 30.0
+GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS = 15.0
+GEMINI_INTERACTIONS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions"
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
     AVAILABLE_MODELS["flash-lite-minimal"]["text"],
@@ -1471,7 +1486,7 @@ async def create_model_interaction(
     elif response_format is not None:
         kwargs["response_format"] = response_format
     return await asyncio.wait_for(
-        maybe_await(interactions_api.create(**kwargs)),
+        maybe_await(interactions_api.create(timeout=timeout_seconds, **kwargs)),
         timeout=timeout_seconds,
     )
 
@@ -2782,6 +2797,84 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
     return interaction, token_usage, call_trace
 
 
+def summarize_google_api_error_payload(payload):
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            status = error.get("status")
+            message = str(error.get("message") or "").strip()
+            summary = " ".join(
+                part
+                for part in (
+                    f"code={code}" if code is not None else "",
+                    f"status={status}" if status else "",
+                    message,
+                )
+                if part
+            )
+            if summary:
+                return summary[:1000]
+        return json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))[:1000]
+    return str(payload).strip()[:1000] or "empty response body"
+
+
+async def diagnose_gemini_rest_once(model):
+    """SDK timeout 시 재시도 없는 REST 호출로 HTTP/API 실패 영역을 분리한다."""
+    started = time_module.perf_counter()
+    print(
+        f"[GEMINI] direct REST diagnostic start model={model} "
+        f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT}"
+    )
+    timeout = aiohttp.ClientTimeout(
+        total=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
+        connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
+        sock_connect=min(5.0, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS),
+        sock_read=GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS,
+    )
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(
+                GEMINI_INTERACTIONS_ENDPOINT,
+                headers={
+                    "x-goog-api-key": GOOGLE_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "input": "Reply with exactly: OK", "store": False},
+            ) as response:
+                response_text = await response.text()
+                try:
+                    payload = json.loads(response_text)
+                except json.JSONDecodeError:
+                    payload = response_text
+
+                elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+                if response.status >= 400:
+                    print(
+                        f"[ERROR] Gemini direct REST diagnostic failed model={model} "
+                        f"http_status={response.status} elapsed_ms={elapsed_ms} "
+                        f"error={summarize_google_api_error_payload(payload)}"
+                    )
+                    return
+
+                status = get_interaction_status(payload)
+                has_text = bool(extract_interaction_text(payload))
+                print(
+                    f"[OK] Gemini direct REST diagnostic model={model} "
+                    f"http_status={response.status} status={status} text={has_text} "
+                    f"elapsed_ms={elapsed_ms}"
+                )
+    except Exception as e:
+        elapsed_ms = round((time_module.perf_counter() - started) * 1000)
+        print(
+            f"[ERROR] Gemini direct REST diagnostic transport failed model={model} "
+            f"elapsed_ms={elapsed_ms} "
+            f"exception={describe_gemini_exception(e, GEMINI_REST_DIAGNOSTIC_TIMEOUT_SECONDS)}"
+        )
+
+
 async def probe_gemini_api(model):
     """프로세스 시작 시 실제 Interactions 호출로 키와 모델 접근을 한 번 검증한다."""
     started = time_module.perf_counter()
@@ -2810,6 +2903,8 @@ async def probe_gemini_api(model):
             f"api_key=sha256:{GOOGLE_API_KEY_FINGERPRINT} "
             f"exception={describe_gemini_exception(e, GEMINI_API_PROBE_TIMEOUT_SECONDS)}"
         )
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
+            await diagnose_gemini_rest_once(model)
 
 # ================= 4. 봇 메인 로직 =================
 class GeminiBot(commands.Bot):
