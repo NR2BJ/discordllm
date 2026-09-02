@@ -89,66 +89,26 @@ except Exception as e:
 
 print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 
+FLASH_MODEL = "gemini-3.8-flash"
+FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
+IMAGE_MODEL = "gemini-3.1-flash-image"
+MAX_THINKING_LEVEL = "high"
+
 AVAILABLE_MODELS = {
-    # Gemini 3.1 Pro Preview (3 levels: low / medium / high — minimal 미지원)
-    "pro-low": {
-        "text": "gemini-3.1-pro-preview",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "low",
+    "flash-lite": {
+        "display_name": "Flash-Lite 최고 추론 (Gemini 3.5 Flash-Lite)",
+        "text": FLASH_LITE_MODEL,
+        "image": IMAGE_MODEL,
+        "thinking_level": MAX_THINKING_LEVEL,
     },
-    "pro-medium": {
-        "text": "gemini-3.1-pro-preview",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "medium",
-    },
-    "pro-high": {
-        "text": "gemini-3.1-pro-preview",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "high",
-    },
-    # Gemini 3.7 Flash (3 levels; minimal unsupported)
-    "flash-low": {
-        "text": "gemini-3.7-flash",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "low",
-    },
-    "flash-medium": {
-        "text": "gemini-3.7-flash",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "medium",
-    },
-    "flash-high": {
-        "text": "gemini-3.7-flash",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "high",
-    },
-    # Gemini 3.5 Flash-Lite (4 levels)
-    "flash-lite-minimal": {
-        "text": "gemini-3.5-flash-lite",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "minimal",
-    },
-    "flash-lite-low": {
-        "text": "gemini-3.5-flash-lite",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "low",
-    },
-    "flash-lite-medium": {
-        "text": "gemini-3.5-flash-lite",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "medium",
-    },
-    "flash-lite-high": {
-        "text": "gemini-3.5-flash-lite",
-        "image": "gemini-3.1-flash-image",
-        "thinking_level": "high",
+    "flash": {
+        "display_name": "Flash 최고 추론 (Gemini 3.8 Flash)",
+        "text": FLASH_MODEL,
+        "image": IMAGE_MODEL,
+        "thinking_level": MAX_THINKING_LEVEL,
     },
 }
-TEXT_MODEL_MIGRATIONS = {
-    "gemini-3.6-flash": AVAILABLE_MODELS["flash-low"]["text"],
-}
-TEXT_MODEL = AVAILABLE_MODELS["pro-high"]["text"]
-IMAGE_MODEL = AVAILABLE_MODELS["pro-high"]["image"]
+TEXT_MODEL = FLASH_MODEL
 # Deep Research는 모델 선택과 분리된 전용 명령어(/deepo, /deepm)로만 실행
 DEEP_RESEARCH_AGENTS = {
     "deepo": "deep-research-preview-04-2026",
@@ -161,7 +121,7 @@ GEMINI_IMAGE_TIMEOUT_SECONDS = 300.0
 GEMINI_IMAGE_MAX_ATTEMPTS = 2
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
-    AVAILABLE_MODELS["flash-lite-minimal"]["text"],
+    FLASH_LITE_MODEL,
 )
 DEFAULT_ACTION_ROUTER_ENABLED = is_enabled(os.environ.get("GEMINI_ENABLE_ACTION_ROUTER", "1"))
 # VIDEO_GEN_MODEL = "veo-3.1-generate-preview"  # 비용 절감으로 임시 비활성화
@@ -180,9 +140,8 @@ TEXT_ATTACHMENT_EXTENSIONS = (
     ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
 )
 MODEL_HISTORY_LIMITS = {
-    AVAILABLE_MODELS["pro-high"]["text"]: 20,
-    AVAILABLE_MODELS["flash-high"]["text"]: 20,
-    AVAILABLE_MODELS["flash-lite-minimal"]["text"]: 20,
+    FLASH_MODEL: 20,
+    FLASH_LITE_MODEL: 20,
 }
 
 IMAGE_ACTION_NOUN_RE = re.compile(
@@ -2749,6 +2708,8 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
         raise RuntimeError("API Client not initialized")
     if text_model is None:
         text_model = TEXT_MODEL
+    if thinking_level is None:
+        thinking_level = MAX_THINKING_LEVEL
 
     input_data = gemini_contents_to_interaction_steps(history_contents)
     system_instruction = build_gemini_system_prompt()
@@ -2792,18 +2753,24 @@ class GeminiBot(commands.Bot):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         model_config_changed = False
+        supported_text_models = {info["text"] for info in AVAILABLE_MODELS.values()}
         for guild_id, guild_config in self.server_configs.items():
             if guild_id.startswith("_") or not isinstance(guild_config, dict):
                 continue
             configured_model = guild_config.get("text_model")
-            replacement = TEXT_MODEL_MIGRATIONS.get(configured_model)
-            if replacement:
-                guild_config["text_model"] = replacement
+            if configured_model and configured_model not in supported_text_models:
+                guild_config["text_model"] = TEXT_MODEL
+                guild_config["image_model"] = IMAGE_MODEL
+                guild_config["thinking_level"] = MAX_THINKING_LEVEL
                 model_config_changed = True
                 print(
-                    f"[CONFIG] guild={guild_id} text model migrated: "
-                    f"{configured_model} -> {replacement}"
+                    f"[CONFIG] guild={guild_id} unsupported text model reset: "
+                    f"{configured_model} -> {TEXT_MODEL}"
                 )
+            elif configured_model and guild_config.get("thinking_level") != MAX_THINKING_LEVEL:
+                guild_config["thinking_level"] = MAX_THINKING_LEVEL
+                model_config_changed = True
+                print(f"[CONFIG] guild={guild_id} thinking level fixed: {MAX_THINKING_LEVEL}")
         if model_config_changed:
             DataManager.save_json(CONFIG_FILE, self.server_configs)
         self.channel_locks = {}
@@ -2858,10 +2825,16 @@ class GeminiBot(commands.Bot):
             self.server_configs[gid] = {
                 "channel_id": None,
                 "reset_time": None,
+                "text_model": TEXT_MODEL,
+                "image_model": IMAGE_MODEL,
+                "thinking_level": MAX_THINKING_LEVEL,
                 "history_limit": DEFAULT_HISTORY_LIMIT,
                 "image_history_limit": DEFAULT_IMAGE_HISTORY_LIMIT,
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
             }
+        self.server_configs[gid].setdefault("text_model", TEXT_MODEL)
+        self.server_configs[gid].setdefault("image_model", IMAGE_MODEL)
+        self.server_configs[gid]["thinking_level"] = MAX_THINKING_LEVEL
         self.server_configs[gid].setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("image_history_limit", DEFAULT_IMAGE_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("action_router", DEFAULT_ACTION_ROUTER_ENABLED)
@@ -4055,6 +4028,7 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
             input_data=gemini_contents_to_interaction_steps(contents),
             system_instruction=CHAT_SYSTEM_PROMPT,
             tools=[GOOGLE_SEARCH_TOOL],
+            thinking_level=MAX_THINKING_LEVEL,
         )
         token_usage = get_interaction_usage(response)
 
@@ -4139,6 +4113,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
             input_data=user_message,
             system_instruction=IMAGE_SYSTEM_PROMPT,
             response_schema=IMAGE_PROMPT_SCHEMA,
+            thinking_level=MAX_THINKING_LEVEL,
         )
 
         status = get_interaction_status(response)
@@ -4739,6 +4714,10 @@ async def deepm_command(interaction: discord.Interaction, prompt: str):
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(name="모델 선택")
+@app_commands.choices(name=[
+    app_commands.Choice(name=info["display_name"], value=key)
+    for key, info in AVAILABLE_MODELS.items()
+])
 async def switch_model(interaction: discord.Interaction, name: str = None):
     global TEXT_MODEL, IMAGE_MODEL
     if name is None:
@@ -4763,36 +4742,22 @@ async def switch_model(interaction: discord.Interaction, name: str = None):
         return
     TEXT_MODEL = AVAILABLE_MODELS[name]["text"]
     IMAGE_MODEL = AVAILABLE_MODELS[name]["image"]
-    thinking_level = AVAILABLE_MODELS[name].get("thinking_level")  # None이면 모델 default
+    thinking_level = AVAILABLE_MODELS[name]["thinking_level"]
     if interaction.guild:
         cfg = bot.get_config(interaction.guild_id)
         cfg["text_model"] = TEXT_MODEL
         cfg["image_model"] = IMAGE_MODEL
-        if thinking_level is None:
-            cfg.pop("thinking_level", None)
-        else:
-            cfg["thinking_level"] = thinking_level
+        cfg["thinking_level"] = thinking_level
         bot.save_config()
     history_limit = get_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_HISTORY_LIMIT
     image_history_limit = get_image_history_limit(bot.get_config(interaction.guild_id)) if interaction.guild else DEFAULT_IMAGE_HISTORY_LIMIT
     actor_name = get_server_display_name(interaction.guild, interaction.user)
-    thinking_label = f"`{thinking_level}`" if thinking_level else "모델 기본값"
+    thinking_label = f"`{thinking_level}`"
     await interaction.response.send_message(
         f"모델 변경됨: **{name}** by {actor_name}\n"
         f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n"
         f"사고 수준: {thinking_label}\n히스토리 참조: 텍스트 {history_limit}개 / 이미지 {image_history_limit}개"
     )
-
-@switch_model.autocomplete('name')
-async def model_autocomplete(interaction: discord.Interaction, current: str):
-    return [
-        app_commands.Choice(
-            name=key,
-            value=key
-        )
-        for key, info in AVAILABLE_MODELS.items()
-        if current.lower() in key.lower() or current.lower() in info['text'].lower()
-    ][:25]
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
