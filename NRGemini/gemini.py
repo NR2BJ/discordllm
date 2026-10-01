@@ -176,7 +176,9 @@ _COMMON_RULES = """## General Rules
 - Analyze attached files (images/video/audio) when supported.
 - Keep responses concise and Discord-appropriate."""
 
-GOOGLE_SEARCH_TOOL = {"type": "google_search", "search_types": ["web_search"]}
+# search_types를 넣으면 Interactions API가 검색을 서버에서 실행하지 않고 클라이언트 function_call
+# ('google:search', status=requires_action)로 넘겨 봇이 답을 못 받는다. 모델·store 설정과 무관하게 재현됨.
+GOOGLE_SEARCH_TOOL = {"type": "google_search"}
 RAW_CITATION_MARKER_RE = re.compile(
     r"(?:[ \t]*\[cite:\s*[^\]\r\n]+\])+",
     re.IGNORECASE,
