@@ -49,10 +49,11 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
-TAVILY_MAX_RESULTS = 5
-TAVILY_RESULT_CHARS = 800  # 결과 하나당 본문 최대 길이 (토큰 절약)
-WEB_SEARCH_MAX_ROUNDS = 3  # 한 메시지에서 모델이 도구 호출 후 다시 생성하는 왕복 수 상한
+TAVILY_MAX_RESULTS = 5  # 모델이 결과 수를 정하지 않았을 때와 사전 검색에서 쓰는 값
+TAVILY_MAX_RESULTS_CAP = 10  # 모델이 고를 수 있는 결과 수 상한 (토큰 안전장치)
+TAVILY_RESULT_CHARS = 2000  # 결과 하나당 본문 최대 길이 (토큰 안전장치, 실측 최대 약 1,600자)
 WEB_SEARCH_MAX_CALLS = 5  # 한 메시지에서 Tavily 검색 호출 총 상한 (크레딧 상한)
+WEB_SEARCH_MAX_ROUNDS = WEB_SEARCH_MAX_CALLS  # 한 번에 하나씩 검색해도 한도를 다 쓸 수 있게 왕복 수를 맞춘다
 
 
 def is_enabled(value):
@@ -1116,34 +1117,76 @@ async def scrap_webpage(url):
 
 
 # ----------------- Tavily 웹 검색 / 링크 본문 추출 -----------------
+# 검색 방법(검색어·언어·출처·기간·깊이·횟수)은 모델이 정한다. 설명에는 각 옵션이 하는 일과 비용만 적는다.
+TAVILY_TOPICS = ("general", "news")
+TAVILY_TIME_RANGES = ("day", "week", "month", "year")
+TAVILY_SEARCH_DEPTHS = ("basic", "advanced", "fast", "ultra-fast")
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
         "description": (
-            "Search the web for current or factual information. Use it for recent events, news, "
-            "prices, exchange rates, product specs or releases, schedules, or anything you are not "
-            "sure about. Do not use it for casual chat or things you can answer reliably."
+            "Search the web (Tavily). Each result has a title, URL, published date when known, and relevant "
+            f"text from the page. You decide how to search. Up to {WEB_SEARCH_MAX_CALLS} searches per message."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Search keywords. Use the language most likely to find good sources. Do not add a year "
-                        "or date unless the user asked about a specific time; use time_range for freshness."
-                    ),
-                },
+                "query": {"type": "string", "description": "Search query."},
                 "topic": {
                     "type": "string",
-                    "enum": ["general", "news", "finance"],
-                    "description": "news for recent news, finance for markets and prices, general otherwise.",
+                    "enum": list(TAVILY_TOPICS),
+                    "description": "general (default): any web page. news: news articles.",
                 },
                 "time_range": {
                     "type": "string",
-                    "enum": ["day", "week", "month", "year"],
-                    "description": "Only return results from this recent period when freshness matters.",
+                    "enum": list(TAVILY_TIME_RANGES),
+                    "description": (
+                        "Only results published within this period before now. "
+                        "Cannot be combined with start_date/end_date."
+                    ),
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Only results published on or after this date (YYYY-MM-DD).",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Only results published on or before this date (YYYY-MM-DD).",
+                },
+                "search_depth": {
+                    "type": "string",
+                    "enum": list(TAVILY_SEARCH_DEPTHS),
+                    "description": (
+                        "basic (default): balanced relevance and speed. advanced: highest relevance, slower, "
+                        "costs 2 credits instead of 1. fast: lower latency. ultra-fast: lowest latency, "
+                        "one summary per page."
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": TAVILY_MAX_RESULTS_CAP,
+                    "description": f"Number of results (default {TAVILY_MAX_RESULTS}).",
+                },
+                "country": {
+                    "type": "string",
+                    "description": (
+                        "Boost results from this country, as a lowercase English country name such as "
+                        "'south korea', 'united states', 'japan'. Applies to topic general."
+                    ),
+                },
+                "include_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only return results from these domains.",
+                },
+                "exclude_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Never return results from these domains.",
                 },
             },
             "required": ["query"],
@@ -1170,20 +1213,50 @@ async def _tavily_post(url, body, timeout_seconds):
         return None, f"{type(e).__name__}: {e}"
 
 
-async def tavily_search(query, *, topic="general", time_range=None):
-    """Tavily 검색. 반환: {"ok": bool, "results": [...], "credits": int|None, "error": str|None}"""
-    body = {
-        "query": query,
-        "search_depth": "basic",
-        "max_results": TAVILY_MAX_RESULTS,
-        "topic": topic if topic in ("general", "news", "finance") else "general",
-        "include_usage": True,
-    }
-    if time_range in ("day", "week", "month", "year"):
-        body["time_range"] = time_range
-    data, error = await _tavily_post(TAVILY_SEARCH_URL, body, timeout_seconds=30)
+def tavily_search_options(options):
+    """모델이 고른 검색 옵션 중 형식이 맞는 것만 Tavily 요청 필드로 옮긴다.
+
+    옵션 조합은 판단하지 않는다. 잘못된 조합(예: time_range + start_date)이나 없는 국가명은
+    Tavily가 400으로 이유를 돌려주고, 그 문구가 모델에게 그대로 가서 모델이 고쳐 다시 검색할 수 있다.
+    """
+    options = options or {}
+    picked = {}
+    if options.get("topic") in TAVILY_TOPICS:
+        picked["topic"] = options["topic"]
+    if options.get("time_range") in TAVILY_TIME_RANGES:
+        picked["time_range"] = options["time_range"]
+    for key in ("start_date", "end_date"):
+        value = str(options.get(key) or "").strip()
+        if ISO_DATE_RE.match(value):
+            picked[key] = value
+    if options.get("search_depth") in TAVILY_SEARCH_DEPTHS:
+        picked["search_depth"] = options["search_depth"]
+    try:
+        max_results = int(options.get("max_results") or TAVILY_MAX_RESULTS)
+    except (TypeError, ValueError):
+        max_results = TAVILY_MAX_RESULTS
+    picked["max_results"] = min(max(max_results, 1), TAVILY_MAX_RESULTS_CAP)
+    country = str(options.get("country") or "").strip().lower()
+    if country:
+        picked["country"] = country
+    for key in ("include_domains", "exclude_domains"):
+        domains = options.get(key)
+        if isinstance(domains, str):
+            domains = [domains]
+        if isinstance(domains, list):
+            cleaned = [str(d).strip() for d in domains if str(d).strip()][:20]
+            if cleaned:
+                picked[key] = cleaned
+    return picked
+
+
+async def tavily_search(query, options=None):
+    """Tavily 검색. 반환: {"ok", "results", "credits", "error", "options"(실제로 보낸 검색 옵션)}"""
+    picked = tavily_search_options(options)
+    body = {"query": query, **picked, "include_published_date": True, "include_usage": True}
+    data, error = await _tavily_post(TAVILY_SEARCH_URL, body, timeout_seconds=40)
     if error:
-        return {"ok": False, "results": [], "credits": None, "error": error}
+        return {"ok": False, "results": [], "credits": None, "error": error, "options": picked}
     results = [
         {
             "title": item.get("title") or "",
@@ -1194,7 +1267,8 @@ async def tavily_search(query, *, topic="general", time_range=None):
         for item in data.get("results") or []
         if item.get("url")
     ]
-    return {"ok": True, "results": results, "credits": (data.get("usage") or {}).get("credits"), "error": None}
+    credits = (data.get("usage") or {}).get("credits")
+    return {"ok": True, "results": results, "credits": credits, "error": None, "options": picked}
 
 
 def format_search_results(query, outcome):
@@ -1206,7 +1280,7 @@ def format_search_results(query, outcome):
     if not outcome.get("ok"):
         return (
             f"[web_search 실패] query={query!r}: {outcome.get('error')}\n"
-            "검색 없이 답하되, 최신 정보가 필요한 부분은 확인이 필요하다고 밝혀라."
+            "옵션을 고쳐 다시 검색해도 된다. 검색 없이 답한다면 최신 정보가 필요한 부분은 확인이 필요하다고 밝혀라."
         )
     if not outcome.get("results"):
         return f"[web_search 결과 없음] query={query!r}"
@@ -1223,17 +1297,20 @@ def make_web_search_handler(max_calls=WEB_SEARCH_MAX_CALLS):
     state = {"calls": 0}
 
     async def handler(args):
-        query = str((args or {}).get("query") or "").strip()
+        args = args or {}
+        query = str(args.get("query") or "").strip()
         if not query:
             return "[web_search 실패] 검색어가 비어 있습니다."
         if state["calls"] >= max_calls:
             return f"[web_search 중단] 이번 메시지의 검색 한도({max_calls}회)에 도달했습니다. 지금까지 찾은 결과로 답하세요."
         state["calls"] += 1
-        topic = args.get("topic") or "general"
-        outcome = await tavily_search(query, topic=topic, time_range=args.get("time_range"))
+        outcome = await tavily_search(query, args)
         count = len(outcome.get("results") or [])
         detail = f"credits={outcome.get('credits')}" if outcome.get("ok") else f"error={outcome.get('error')}"
-        print(f"[SEARCH] #{state['calls']} query={query!r} topic={topic} ok={outcome.get('ok')} results={count} {detail}")
+        print(
+            f"[SEARCH] #{state['calls']} query={query!r} opts={outcome.get('options')} "
+            f"ok={outcome.get('ok')} results={count} {detail}"
+        )
         return format_search_results(query, outcome)
 
     return handler
