@@ -1255,8 +1255,23 @@ def should_call_action_router(
     return False
 
 
+def with_current_datetime(prompt):
+    """시스템 프롬프트 끝에 현재 시각(KST)을 붙인다.
+
+    모델이 학습 시점을 오늘로 믿고 검색어에 옛 날짜를 넣는 문제가 LLM 봇에서 실측돼(worklog 2026-10-01)
+    두 봇에 같은 문구로 넣는다. 날짜만 적으면 모델이 연도를 2024로 고쳐 검색해, 실제 현재 날짜라는 문장을 덧붙였다.
+    매 분 바뀌는 줄이라 맨 끝에 둬서 앞쪽 고정 프롬프트의 캐시 접두는 유지한다.
+    """
+    now = datetime.now(KST)
+    return (
+        f"{prompt.rstrip()}\n- Current date and time: {now.strftime('%Y-%m-%d (%a) %H:%M KST')}. "
+        f"This is the real current date. Your training data is older, so do not assume it is an earlier year "
+        f"than {now.year}."
+    )
+
+
 def build_gemini_system_prompt():
-    return SYSTEM_PROMPT
+    return with_current_datetime(SYSTEM_PROMPT)
 
 
 async def maybe_await(value):
@@ -4028,7 +4043,7 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
         response = await create_model_interaction(
             model=TEXT_MODEL,
             input_data=gemini_contents_to_interaction_steps(contents),
-            system_instruction=CHAT_SYSTEM_PROMPT,
+            system_instruction=with_current_datetime(CHAT_SYSTEM_PROMPT),
             tools=[GOOGLE_SEARCH_TOOL],
             thinking_level=MAX_THINKING_LEVEL,
         )

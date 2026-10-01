@@ -129,6 +129,22 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
 
+
+def with_current_datetime(prompt):
+    """시스템 프롬프트 끝에 현재 시각(KST)을 붙인다.
+
+    모델이 학습 시점을 오늘로 믿고 검색어에 옛 날짜를 넣는 문제가 실측됐다 (gemini-3-flash-preview가
+    오늘을 2024-05-23으로 믿고 2024년 뉴스를 검색). 검색 도구 설명에 넣은 날짜는 2026→2024로 고쳐 검색했고,
+    날짜만 적은 줄도 첫 검색어 연도가 0/4로 2024였다. "실제 현재 날짜이고 학습 데이터가 더 오래됐다"를
+    덧붙이자 4/4 2026으로 검색했다. 매 분 바뀌는 줄이라 맨 끝에 둬서 앞쪽 고정 프롬프트의 캐시 접두는 유지한다.
+    """
+    now = datetime.now(KST)
+    return (
+        f"{prompt.rstrip()}\n- Current date and time: {now.strftime('%Y-%m-%d (%a) %H:%M KST')}. "
+        f"This is the real current date. Your training data is older, so do not assume it is an earlier year "
+        f"than {now.year}."
+    )
+
 # ================= 2. 데이터 관리자 =================
 class DataManager:
     @staticmethod
@@ -2023,7 +2039,7 @@ async def on_message(message):
                 if capability_hints:
                     sys_prompt += "\n" + "\n".join(f"- {hint}" for hint in capability_hints)
 
-                messages = [{"role": "system", "content": sys_prompt}]
+                messages = [{"role": "system", "content": with_current_datetime(sys_prompt)}]
 
                 reset_dt = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
                 reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
