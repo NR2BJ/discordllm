@@ -45,6 +45,14 @@ else:
 # ================= 1. 설정 및 상수 =================
 DISCORD_TOKEN = os.environ["LLM_DISCORD_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+# 웹 검색·링크 본문 추출은 OpenRouter 서버 도구(유료) 대신 Tavily를 직접 호출한다.
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+TAVILY_MAX_RESULTS = 5
+TAVILY_RESULT_CHARS = 800  # 결과 하나당 본문 최대 길이 (토큰 절약)
+WEB_SEARCH_MAX_ROUNDS = 3  # 한 메시지에서 모델이 도구 호출 후 다시 생성하는 왕복 수 상한
+WEB_SEARCH_MAX_CALLS = 5  # 한 메시지에서 Tavily 검색 호출 총 상한 (크레딧 상한)
 
 
 def is_enabled(value):
@@ -504,29 +512,6 @@ class OpenRouterClient:
         }
         self.models_list = []
         self.models_source = "unknown"
-        # web_search server tool 호출이 실패한 provider를 일정 시간 차단하는 in-memory 캐시
-        # {provider_name_lower: expiry_unix_ts}. 봇 재시작 시 휘발 (의도된 동작)
-        self.web_search_blocked_providers = {}
-        self.web_search_block_seconds = 3600  # 1시간 후 자동 만료 → 재시도 가능
-
-    def _active_web_search_blocked_providers(self):
-        """만료 안 된 차단 provider name 리스트 반환 + 만료된 항목 정리."""
-        now = time.time()
-        expired = [k for k, exp in self.web_search_blocked_providers.items() if exp <= now]
-        for k in expired:
-            del self.web_search_blocked_providers[k]
-        return list(self.web_search_blocked_providers.keys())
-
-    def _block_provider_for_web_search(self, provider_name):
-        """provider를 web_search 호출에서 일정 시간 차단."""
-        if not provider_name:
-            return
-        key = provider_name.strip().lower()
-        if not key:
-            return
-        self.web_search_blocked_providers[key] = time.time() + self.web_search_block_seconds
-        minutes = self.web_search_block_seconds // 60
-        print(f"[WARN] provider '{provider_name}' web_search 차단 ({minutes}분) — 후속 web_search 호출에서 ignore")
 
     async def fetch_models_metadata(self):
         try:
@@ -740,6 +725,10 @@ class OpenRouterClient:
         else:
             final_content = str(raw_content)
 
+        # 도구 호출 응답은 content가 비어 있는 게 정상이다. tool_calls 처리는 호출자(도구 루프)가 맡는다.
+        if message.get("tool_calls"):
+            return final_content, usage, images, data
+
         if not final_content.strip() and not images:
             finish_reason = choice.get("finish_reason") or data.get("finish_reason") or "unknown"
             has_reasoning = bool(message.get("reasoning") or message.get("reasoning_details"))
@@ -788,14 +777,12 @@ class OpenRouterClient:
         model,
         messages,
         capabilities=None,
-        enable_web_search=False,
         image_config=None,
         *,
         tools=None,
         plugins=None,
         response_format=None,
         provider=None,
-        require_parameter_support=False,
         cache_control=None,
     ):
         payload = {
@@ -803,13 +790,8 @@ class OpenRouterClient:
             "messages": messages,
         }
 
-        tool_list = []
-        if enable_web_search:
-            tool_list.append({"type": "openrouter:web_search"})
         if tools:
-            tool_list.extend(copy.deepcopy(tools))
-        if tool_list:
-            payload["tools"] = tool_list
+            payload["tools"] = copy.deepcopy(tools)
             payload["tool_choice"] = "auto"
 
         plugin_list = []
@@ -832,37 +814,19 @@ class OpenRouterClient:
             payload["response_format"] = response_format
         if provider:
             payload["provider"] = copy.deepcopy(provider)
-            if require_parameter_support:
-                payload["provider"]["require_parameters"] = True
         if cache_control:
             payload["cache_control"] = cache_control
 
         # 추론형 모델: 토큰 수를 직접 박지 않고 effort로 reasoning 예산을 자동 스케일한다.
         # effort="high"는 모델별 한도의 약 0.8 비율로 OpenRouter가 변환하므로, 토큰 수를
         # 하드코딩하지 않고도 "허용 최대선에서 자동 조절(과도 제한 없음)"에 해당한다.
-        # 주의: require_parameter_support(=provider.require_parameters)가 켜진 경우엔 주입하지 않는다.
-        #   reasoning은 best-effort 옵션인데, require_parameters와 함께 보내면 OpenRouter가
-        #   "reasoning까지 지원하는 endpoint"로만 라우팅을 좁혀(특히 web_fetch tool 동반 시)
-        #   reasoning 가능 모델에서도 endpoint가 0개가 될 수 있다.
+        # reasoning은 best-effort 옵션이라 provider.require_parameters와 함께 보내지 않는다
+        # (함께 보내면 라우팅이 "reasoning 지원 endpoint"로 좁혀져 endpoint가 0개가 될 수 있다).
         # reasoning 미지원 모델에도 주입하지 않아 불필요한 endpoint 필터링을 피한다.
-        if not require_parameter_support:
-            model_meta = self.get_model_info(model)
-            supported = (model_meta or {}).get("supported_parameters") or []
-            if isinstance(supported, list) and any(str(s).lower() == "reasoning" for s in supported):
-                payload.setdefault("reasoning", {"effort": "high"})
-
-        # web_search 켜졌고 차단 캐시에 provider 있으면 ignore 리스트로 주입
-        if enable_web_search:
-            blocked_now = self._active_web_search_blocked_providers()
-            if blocked_now:
-                prov = dict(payload.get("provider") or {})
-                existing = list(prov.get("ignore") or [])
-                existing_lower = {x.lower() for x in existing if isinstance(x, str)}
-                added = [b for b in blocked_now if b not in existing_lower]
-                if added:
-                    prov["ignore"] = existing + added
-                    payload["provider"] = prov
-                    print(f"[INFO] web_search 차단 캐시 적용: ignore={added}")
+        model_meta = self.get_model_info(model)
+        supported = (model_meta or {}).get("supported_parameters") or []
+        if isinstance(supported, list) and any(str(s).lower() == "reasoning" for s in supported):
+            payload.setdefault("reasoning", {"effort": "high"})
 
         async with aiohttp.ClientSession() as session:
             async def _post_completion(request_payload):
@@ -902,109 +866,9 @@ class OpenRouterClient:
                             pass
                     raise APIStatusError(resp.status, error_text, provider=provider_used)
 
-            def _has_web_search_tool(p):
-                return any(
-                    isinstance(t, dict) and t.get("type") == "openrouter:web_search"
-                    for t in (p.get("tools") or [])
-                )
-
-            def _strip_web_search(p):
-                """payload에서 web_search tool만 제거하고, 다른 tool 없으면 tools 키 자체 제거.
-                또한 system 메시지에 검색 비활성 안내 한 줄 추가해 모델이 거짓으로 검색했다고 답하지 않게 함."""
-                stripped = copy.deepcopy(p)
-                remaining = [
-                    t for t in stripped.get("tools", [])
-                    if not (isinstance(t, dict) and t.get("type") == "openrouter:web_search")
-                ]
-                if remaining:
-                    stripped["tools"] = remaining
-                else:
-                    stripped.pop("tools", None)
-                    stripped.pop("tool_choice", None)
-                # provider.require_parameters도 web_search 때문에 켰을 수 있어 안전하게 해제
-                if isinstance(stripped.get("provider"), dict):
-                    stripped["provider"].pop("require_parameters", None)
-                # system 메시지에 검색 비활성 안내 주입
-                notice = (
-                    "\n\n[Notice] Web search is currently unavailable for this request. "
-                    "Answer using only your training knowledge. "
-                    "Do NOT claim or imply that you searched the web for this answer."
-                )
-                injected = False
-                for msg in stripped.get("messages", []):
-                    if msg.get("role") != "system":
-                        continue
-                    content = msg.get("content")
-                    if isinstance(content, str):
-                        msg["content"] = content + notice
-                        injected = True
-                        break
-                    if isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                part["text"] = (part.get("text") or "") + notice
-                                injected = True
-                                break
-                        if injected:
-                            break
-                if not injected:
-                    # system 메시지가 아예 없으면 맨 앞에 추가
-                    stripped.setdefault("messages", []).insert(0, {"role": "system", "content": notice.strip()})
-                return stripped
-
-            MAX_PROVIDER_RETRIES = 3  # web_search 5xx 시 provider 갈아끼우며 재시도 회수
             try:
                 return await _post_completion(payload)
             except APIStatusError as api_err:
-                # web_search tool 포함이고 5xx면:
-                # 1) 실패한 provider 차단 캐시에 추가 + ignore 리스트로 재시도 (다른 provider 시도)
-                # 2) MAX_PROVIDER_RETRIES 회 모두 실패 → web_search tool 제거 후 최종 재시도
-                if api_err.status >= 500 and _has_web_search_tool(payload):
-                    print(
-                        f"[WARN] web_search 호출 실패: model={model} status={api_err.status} "
-                        f"provider={api_err.provider or '?'} "
-                        f"(원본 에러 요약: {api_err.body[:200]}{'...' if len(api_err.body) > 200 else ''})"
-                    )
-                    current_err = api_err
-                    retry_payload = payload
-                    for attempt in range(1, MAX_PROVIDER_RETRIES + 1):
-                        if not current_err.provider:
-                            print(f"[WARN] 응답에 provider 정보 없음 → provider 차단 재시도 중단")
-                            break
-                        self._block_provider_for_web_search(current_err.provider)
-                        # 갱신된 ignore list로 페이로드 재구성
-                        blocked_all = self._active_web_search_blocked_providers()
-                        retry_payload = copy.deepcopy(retry_payload)
-                        prov = dict(retry_payload.get("provider") or {})
-                        existing = list(prov.get("ignore") or [])
-                        existing_lower = {x.lower() for x in existing if isinstance(x, str)}
-                        for b in blocked_all:
-                            if b not in existing_lower:
-                                existing.append(b)
-                        prov["ignore"] = existing
-                        retry_payload["provider"] = prov
-                        print(f"[WARN] web_search 재시도 #{attempt}/{MAX_PROVIDER_RETRIES}: ignore={existing}")
-                        try:
-                            result = await _post_completion(retry_payload)
-                            print(f"[INFO] web_search 재시도 #{attempt} 성공 (다른 provider 매칭됨)")
-                            return result
-                        except APIStatusError as next_err:
-                            if next_err.status < 500:
-                                # 5xx 아닌 에러는 web_search 무관 가능성 → 일반 에러로 raise
-                                raise Exception(f"API Error ({next_err.status}): {next_err.body}") from next_err
-                            current_err = next_err
-                            continue
-                    # 모든 provider 재시도 실패 → web_search tool 제거 후 최종 재시도
-                    print(f"[WARN] provider 재시도 모두 소진 → web_search tool 제거 후 최종 fallback")
-                    fallback_payload = _strip_web_search(payload)
-                    try:
-                        result = await _post_completion(fallback_payload)
-                        print(f"[WARN] web_search 최종 fallback 성공: model={model} (검색 없이 답변 반환)")
-                        return result
-                    except APIStatusError as final_err:
-                        print(f"[ERROR] 최종 fallback도 실패: model={model} status={final_err.status}")
-                        raise Exception(f"API Error ({final_err.status}): {final_err.body}") from final_err
-                # web_search 무관 5xx 또는 일반 에러는 그대로 raise (기존 형식 유지)
                 raise Exception(f"API Error ({api_err.status}): {api_err.body}") from api_err
             except CompletionContentError as first_error:
                 if not first_error.retryable:
@@ -1013,7 +877,7 @@ class OpenRouterClient:
                     raise
                 # 빈 content / reasoning-only 응답은 같은 provider로 재시도하면 동일하게 실패하는 경우가 잦다.
                 # → (1) content 강조 지시문 주입 + (2) 직전 실패 provider를 ignore에 추가해 다른 provider로 회전.
-                # web_search는 답변 신선도에 직결되므로 절대 제거하지 않고 그대로 유지한다.
+                # 도구 정의(tools)는 그대로 유지한다.
                 print(
                     "[WARN] completion content empty; retrying with provider rotation "
                     f"(model={model}, reasoning_only={first_error.reasoning_only}, "
@@ -1065,7 +929,7 @@ class OpenRouterClient:
                         continue
                     except APIStatusError as api_retry_err:
                         # 4xx 등은 즉시 깔끔한 에러. 5xx + provider면 그 provider도 ignore에 넣고
-                        # search를 유지한 채 회전을 계속한다(web_search는 절대 제거하지 않음).
+                        # 도구 정의는 유지한 채 회전을 계속한다.
                         if api_retry_err.status < 500 or not api_retry_err.provider:
                             raise Exception(f"API Error ({api_retry_err.status}): {api_retry_err.body}") from api_retry_err
                         last_api_err = api_retry_err
@@ -1080,6 +944,79 @@ class OpenRouterClient:
                     finish_reason=last_content_err.finish_reason,
                     provider=last_content_err.provider,
                 ) from last_content_err
+
+    async def chat_completion_with_tools(
+        self,
+        model,
+        messages,
+        *,
+        tools,
+        tool_handlers,
+        max_rounds=WEB_SEARCH_MAX_ROUNDS,
+        **kwargs,
+    ):
+        """모델이 도구를 호출하면 봇이 실행해 결과를 돌려주고, 최종 답변이 나올 때까지 반복한다.
+
+        assistant의 tool_calls 메시지는 reasoning_details까지 받은 그대로 되돌려야 한다.
+        추론 블록이 빠지면 DeepSeek V4 thinking, Gemini thought signature 등은 다음 요청을 거부한다(OpenRouter 문서 요구).
+        max_rounds번 도구를 쓰고도 더 호출하려 하면, 도구 대화를 걷어내고 모은 결과를 마지막 user 메시지에
+        텍스트로 붙여 도구 없이 답을 받는다. Gemini는 도구 대화가 이미 있으면 tool_choice="none"을 무시한다.
+        """
+        convo = list(messages)
+        tool_outputs = []
+        total_tokens = 0
+
+        def finish(content, usage, images, data):
+            if not (content or "").strip() and not images:
+                raise CompletionContentError(
+                    "모델이 도구 호출 뒤 최종 답변을 만들지 못했습니다. 다시 시도해 주세요.",
+                    finish_reason="tool_loop_no_answer",
+                )
+            merged_usage = dict(usage) if isinstance(usage, dict) else {}
+            if total_tokens:
+                merged_usage["total_tokens"] = total_tokens
+            return content, merged_usage, images, data
+
+        for _ in range(max_rounds):
+            content, usage, images, data = await self.chat_completion(model, convo, tools=tools, **kwargs)
+            if isinstance(usage, dict):
+                total_tokens += usage.get("total_tokens") or 0
+            choices = (data or {}).get("choices") or [{}]
+            message = (choices[0] or {}).get("message") or {}
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                return finish(content, usage, images, data)
+
+            assistant_msg = {"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls}
+            if message.get("reasoning_details") is not None:
+                assistant_msg["reasoning_details"] = message["reasoning_details"]
+            elif message.get("reasoning") is not None:
+                assistant_msg["reasoning"] = message["reasoning"]
+            convo.append(assistant_msg)
+
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                except (ValueError, TypeError):
+                    args = {}
+                handler = tool_handlers.get(name)
+                result = await handler(args) if handler else f"[오류] 알 수 없는 도구: {name}"
+                tool_outputs.append(result)
+                convo.append({"role": "tool", "tool_call_id": call.get("id"), "content": result})
+
+        print(f"[SEARCH] 도구 왕복 한도({max_rounds}회) 도달 → 모은 결과로 도구 없이 최종 답변 요청")
+        final_messages = copy.deepcopy(messages)
+        append_to_last_user_text(
+            final_messages,
+            "\n\n".join(tool_outputs) + "\n\n(System: 검색 한도에 도달했다. 더 검색하지 말고 위 결과만으로 지금 답하라.)",
+        )
+        content, usage, images, data = await self.chat_completion(model, final_messages, **kwargs)
+        if isinstance(usage, dict):
+            total_tokens += usage.get("total_tokens") or 0
+        return finish(content, usage, images, data)
 
 # ================= 4. 봇 클래스 =================
 class OpenRouterBot(commands.Bot):
@@ -1176,6 +1113,238 @@ async def scrap_webpage(url):
     except Exception as e:
         print(f"[WARN] URL 읽기 실패: {e}")
     return None
+
+
+# ----------------- Tavily 웹 검색 / 링크 본문 추출 -----------------
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the web for current or factual information. Use it for recent events, news, "
+            "prices, exchange rates, product specs or releases, schedules, or anything you are not "
+            "sure about. Do not use it for casual chat or things you can answer reliably."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Search keywords. Use the language most likely to find good sources. Do not add a year "
+                        "or date unless the user asked about a specific time; use time_range for freshness."
+                    ),
+                },
+                "topic": {
+                    "type": "string",
+                    "enum": ["general", "news", "finance"],
+                    "description": "news for recent news, finance for markets and prices, general otherwise.",
+                },
+                "time_range": {
+                    "type": "string",
+                    "enum": ["day", "week", "month", "year"],
+                    "description": "Only return results from this recent period when freshness matters.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+async def _tavily_post(url, body, timeout_seconds):
+    """Tavily API POST. 성공 시 (data, None), 실패 시 (None, 오류 문자열)."""
+    if not TAVILY_API_KEY:
+        return None, "TAVILY_API_KEY가 설정되지 않았습니다."
+    headers = {"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=timeout_seconds)
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return None, f"HTTP {resp.status}: {text[:300]}"
+                return json.loads(text), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+async def tavily_search(query, *, topic="general", time_range=None):
+    """Tavily 검색. 반환: {"ok": bool, "results": [...], "credits": int|None, "error": str|None}"""
+    body = {
+        "query": query,
+        "search_depth": "basic",
+        "max_results": TAVILY_MAX_RESULTS,
+        "topic": topic if topic in ("general", "news", "finance") else "general",
+        "include_usage": True,
+    }
+    if time_range in ("day", "week", "month", "year"):
+        body["time_range"] = time_range
+    data, error = await _tavily_post(TAVILY_SEARCH_URL, body, timeout_seconds=30)
+    if error:
+        return {"ok": False, "results": [], "credits": None, "error": error}
+    results = [
+        {
+            "title": item.get("title") or "",
+            "url": item["url"],
+            "content": (item.get("content") or "")[:TAVILY_RESULT_CHARS],
+            "published_date": item.get("published_date"),
+        }
+        for item in data.get("results") or []
+        if item.get("url")
+    ]
+    return {"ok": True, "results": results, "credits": (data.get("usage") or {}).get("credits"), "error": None}
+
+
+def format_search_results(query, outcome):
+    """모델에게 넘길 검색 결과 텍스트. 실패도 숨기지 않고 그대로 알린다.
+
+    검색 시각을 같이 적는다. 모델이 학습 시점을 현재로 착각해 최신 결과를 '미래 날짜라 이상하다'며
+    버리는 일이 실측됐다(DeepSeek V4: "2026-10-01 기준이라 현재 시점(2025년)과 맞지 않습니다").
+    """
+    if not outcome.get("ok"):
+        return (
+            f"[web_search 실패] query={query!r}: {outcome.get('error')}\n"
+            "검색 없이 답하되, 최신 정보가 필요한 부분은 확인이 필요하다고 밝혀라."
+        )
+    if not outcome.get("results"):
+        return f"[web_search 결과 없음] query={query!r}"
+    searched_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+    lines = [f"[web_search 결과] query={query!r} (검색 시각: {searched_at})"]
+    for i, item in enumerate(outcome["results"], start=1):
+        date = f" ({item['published_date']})" if item.get("published_date") else ""
+        lines.append(f"{i}. {item['title']}{date}\n   URL: {item['url']}\n   {item['content']}")
+    return "\n".join(lines)
+
+
+def make_web_search_handler(max_calls=WEB_SEARCH_MAX_CALLS):
+    """메시지 하나 동안 쓰는 web_search 실행기. Tavily 호출 횟수를 max_calls로 제한한다."""
+    state = {"calls": 0}
+
+    async def handler(args):
+        query = str((args or {}).get("query") or "").strip()
+        if not query:
+            return "[web_search 실패] 검색어가 비어 있습니다."
+        if state["calls"] >= max_calls:
+            return f"[web_search 중단] 이번 메시지의 검색 한도({max_calls}회)에 도달했습니다. 지금까지 찾은 결과로 답하세요."
+        state["calls"] += 1
+        topic = args.get("topic") or "general"
+        outcome = await tavily_search(query, topic=topic, time_range=args.get("time_range"))
+        count = len(outcome.get("results") or [])
+        detail = f"credits={outcome.get('credits')}" if outcome.get("ok") else f"error={outcome.get('error')}"
+        print(f"[SEARCH] #{state['calls']} query={query!r} topic={topic} ok={outcome.get('ok')} results={count} {detail}")
+        return format_search_results(query, outcome)
+
+    return handler
+
+
+async def tavily_extract(urls):
+    """Tavily Extract로 URL 본문을 읽는다. 반환: ({url: 본문}, {url: 오류})"""
+    urls = [u for u in urls if u][:20]
+    if not urls:
+        return {}, {}
+    data, error = await _tavily_post(
+        TAVILY_EXTRACT_URL,
+        {"urls": urls, "extract_depth": "basic", "format": "markdown", "include_usage": True},
+        timeout_seconds=60,
+    )
+    if error:
+        print(f"[WEB] Tavily Extract 실패 urls={len(urls)} error={error}")
+        return {}, {u: error for u in urls}
+    contents = {
+        item["url"]: item["raw_content"]
+        for item in data.get("results") or []
+        if item.get("url") and (item.get("raw_content") or "").strip()
+    }
+    failed = {
+        item["url"]: item.get("error") or "추출 실패"
+        for item in data.get("failed_results") or []
+        if item.get("url")
+    }
+    credits = (data.get("usage") or {}).get("credits")
+    print(f"[WEB] Tavily Extract urls={len(urls)} ok={len(contents)} failed={len(failed)} credits={credits}")
+    return contents, failed
+
+
+def select_search_mode(config, model_info):
+    """검색 방식: off / tools(모델이 필요할 때 web_search 호출) / presearch(도구 미지원 모델용 사전 검색)."""
+    if not config.get("search"):
+        return "off"
+    if not TAVILY_API_KEY:
+        print("[SEARCH] TAVILY_API_KEY 미설정 → 검색 비활성")
+        return "off"
+    supported = (model_info or {}).get("supported_parameters")
+    if isinstance(supported, list) and supported and not any(str(s).lower() == "tools" for s in supported):
+        return "presearch"
+    return "tools"
+
+
+def describe_search_mode(config, model_info):
+    """대시보드·/search 표시용 검색 상태 문구."""
+    if not config.get("search"):
+        return "OFF"
+    if not TAVILY_API_KEY:
+        return "ON (TAVILY_API_KEY 미설정 → 동작 안 함)"
+    if select_search_mode(config, model_info) == "presearch":
+        return "ON (Tavily · 매 메시지 사전 검색 — 도구 미지원 모델)"
+    return "ON (Tavily · 모델이 필요할 때 검색)"
+
+
+def append_to_last_user_text(messages, block):
+    """마지막 user 메시지의 텍스트 끝에 block을 덧붙인다."""
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = f"{content}\n\n{block}"
+        elif isinstance(content, list):
+            for part in reversed(content):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = f"{part.get('text') or ''}\n\n{block}"
+                    break
+            else:
+                content.append({"type": "text", "text": block})
+        return
+
+
+async def apply_presearch(messages, query):
+    """도구 미지원 모델용: 현재 메시지로 한 번 검색해 결과를 마지막 user 메시지에 붙인다."""
+    query = (query or "").strip()[:400]
+    if not query:
+        return
+    outcome = await tavily_search(query)
+    count = len(outcome.get("results") or [])
+    detail = f"credits={outcome.get('credits')}" if outcome.get("ok") else f"error={outcome.get('error')}"
+    print(f"[SEARCH] 사전 검색 query={query!r} ok={outcome.get('ok')} results={count} {detail}")
+    append_to_last_user_text(messages, format_search_results(query, outcome))
+
+
+def is_tool_unsupported_error(error):
+    text = str(error).lower()
+    return "tool" in text and ("no endpoints found" in text or "does not support" in text)
+
+
+async def run_chat(model, messages, *, search_mode, search_query, **chat_kwargs):
+    """검색 방식에 맞춰 채팅 호출. tools 방식에서 도구 미지원 오류가 나면 사전 검색으로 전환한다."""
+    if search_mode != "tools":
+        return await bot.or_client.chat_completion(model, messages, **chat_kwargs)
+    try:
+        return await bot.or_client.chat_completion_with_tools(
+            model,
+            messages,
+            tools=[WEB_SEARCH_TOOL],
+            tool_handlers={"web_search": make_web_search_handler()},
+            **chat_kwargs,
+        )
+    except Exception as e:
+        if not is_tool_unsupported_error(e):
+            raise
+        print(f"[SEARCH] {model}: 도구 호출 미지원 응답 → 사전 검색으로 전환 ({str(e)[:150]})")
+        await apply_presearch(messages, search_query)
+        return await bot.or_client.chat_completion(model, messages, **chat_kwargs)
+
 
 async def encode_image(url):
     try:
@@ -1382,7 +1551,7 @@ def normalize_provider_privacy(value):
     return privacy if privacy in PROVIDER_PRIVACY_MODES else "allow"
 
 
-def build_provider_preferences(config, *, strict=False):
+def build_provider_preferences(config):
     provider_order = normalize_provider_order(config.get("provider_order"))
     privacy = normalize_provider_privacy(config.get("provider_privacy"))
     provider = {}
@@ -1391,8 +1560,6 @@ def build_provider_preferences(config, *, strict=False):
         provider["allow_fallbacks"] = False
     if privacy == "deny":
         provider["data_collection"] = "deny"
-    if strict:
-        provider["require_parameters"] = True
     return provider or None
 
 
@@ -1736,7 +1903,8 @@ async def on_message(message):
                 can_see_audio = "audio" in caps["input"]
                 can_gen_image = "image" in caps["output"]
                 current_display_name = get_server_display_name(message.guild, message.author)
-                print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']}")
+                search_mode = select_search_mode(config, base_model_info)
+                print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']} search={search_mode}")
                 timing_mark("caps")
 
                 sys_prompt = SYSTEM_PROMPT
@@ -1747,13 +1915,20 @@ async def on_message(message):
                     capability_hints.append("You can analyze video files attached by users.")
                 if can_see_audio:
                     capability_hints.append("You can analyze audio files attached by users.")
-                if config.get("search"):
+                if search_mode == "tools":
                     capability_hints.append(
-                        "Web search is enabled. For anything time-sensitive — recent events, news, "
-                        "product/model releases, version numbers, prices, or facts that may have changed "
-                        "after your training cutoff — you MUST search the web before answering instead of "
-                        "relying on possibly-outdated training knowledge. Prefer the freshest sources and "
-                        "base your answer on what you actually found rather than guessing."
+                        "You have a `web_search` tool. For anything time-sensitive — recent events, news, "
+                        "product/model releases, version numbers, prices, exchange rates, or facts that may have "
+                        "changed after your training cutoff — call web_search before answering instead of relying "
+                        "on possibly-outdated training knowledge. Base your answer on what you actually found and "
+                        "cite sources inline as Markdown links. Do not search for casual chat."
+                    )
+                elif search_mode == "presearch":
+                    capability_hints.append(
+                        "Web search results for the user's current message are attached at the end of that "
+                        "message as [web_search 결과]. For time-sensitive facts, rely on those results over your "
+                        "training knowledge and cite sources inline as Markdown links. Ignore results that are "
+                        "irrelevant to the question."
                     )
                 capability_hints.append("Image generation is only available via the `/image` slash command, not in chat.")
 
@@ -1938,7 +2113,21 @@ async def on_message(message):
                     else:
                         unresolved_urls.append(url)
                 if unresolved_urls:
-                    user_text += "\n\n[Use web fetch if needed]\n" + "\n".join(unresolved_urls)
+                    # PDF와 직접 긁기에 실패한 링크는 Tavily Extract로 읽는다. 못 읽은 링크는 모델에게 그대로 알린다.
+                    extracted, extract_failed = await tavily_extract(unresolved_urls)
+                    extracted_by_url = {u.rstrip("/"): text for u, text in extracted.items()}
+                    failed_by_url = {u.rstrip("/"): reason for u, reason in extract_failed.items()}
+                    for url in unresolved_urls:
+                        web_content = extracted.get(url) or extracted_by_url.get(url.rstrip("/"))
+                        if web_content:
+                            doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
+                            print(f"[CACHE] webpage 저장: {doc_id} ({url})")
+                            user_text += f"\n\n[Webpage Content: {url}]\n```\n{trim_document_text(web_content)}\n```"
+                            print(f"[WEB] Tavily Extract로 읽음: {url}")
+                        else:
+                            reason = extract_failed.get(url) or failed_by_url.get(url.rstrip("/")) or "본문 없음"
+                            print(f"[WEB] 링크 읽기 실패: {url} ({reason})")
+                            user_text += f"\n\n(System: 이 링크의 본문을 읽지 못했습니다: {url} — 내용을 추측하지 말 것)"
 
                 has_media = False
                 if message.attachments:
@@ -2001,20 +2190,11 @@ async def on_message(message):
                 current_content.append({"type": "text", "text": prepend_user_identity(user_text, message.guild, message.author, kind="current")})
                 messages.append({"role": "user", "content": current_content})
 
-                chat_tools = []
-                if unresolved_urls:
-                    chat_tools.append(
-                        {
-                            "type": "openrouter:web_fetch",
-                            "parameters": {
-                                "engine": "auto",
-                                "max_uses": min(10, len(unresolved_urls)),
-                                "max_content_tokens": 12000,
-                            },
-                        }
-                    )
+                if search_mode == "presearch":
+                    await apply_presearch(messages, message.content)
+                    timing_mark("presearch")
 
-                provider_prefs = build_provider_preferences(config, strict=bool(chat_tools))
+                provider_prefs = build_provider_preferences(config)
                 cache_control = build_prompt_cache_control(current_model, messages)
                 timing_mark(
                     f"pre_chat chars={estimate_message_text_chars(messages)} "
@@ -2023,14 +2203,13 @@ async def on_message(message):
                 )
 
                 try:
-                    response, usage, images, full_data = await bot.or_client.chat_completion(
+                    response, usage, images, full_data = await run_chat(
                         current_model,
                         messages,
+                        search_mode=search_mode,
+                        search_query=message.content,
                         capabilities=caps,
-                        enable_web_search=config.get("search", False),
-                        tools=chat_tools or None,
                         provider=provider_prefs,
-                        require_parameter_support=bool(chat_tools),
                         cache_control=cache_control,
                     )
                     provider_name = full_data.get("provider") if isinstance(full_data, dict) else None
@@ -2087,13 +2266,12 @@ async def on_message(message):
                             if part.get("type") == "text":
                                 part["text"] += "\n(System: 미디어 첨부가 있었으나 이 모델이 처리하지 못했습니다.)"
                                 break
-                    response, usage, images, full_data = await bot.or_client.chat_completion(
+                    response, usage, images, full_data = await run_chat(
                         current_model,
                         messages,
-                        enable_web_search=config.get("search", False),
-                        tools=chat_tools or None,
+                        search_mode=search_mode,
+                        search_query=message.content,
                         provider=provider_prefs,
-                        require_parameter_support=bool(chat_tools),
                         cache_control=cache_control,
                     )
 
@@ -2462,7 +2640,7 @@ async def dashboard(interaction: discord.Interaction):
     image_model_status = config.get("fallback_model") or DEFAULT_IMAGE_MODEL or "(none)"
 
     helpers = [
-        f"• **Search:** {'ON (server tool)' if config.get('search') else 'OFF'}",
+        f"• **Search:** {describe_search_mode(config, model_meta)}",
         f"• **/image — image model:** `{image_model_status}`",
         f"• **/image — prompt refiner:** `{image_prompt_model_status}`",
         f"• **Image Models discovered:** {count_image_generation_models()}",
@@ -2498,9 +2676,13 @@ async def toggle_search(interaction: discord.Interaction):
     config["search"] = not config.get("search", False)
     bot.save_config()
     state = "ON 🔍" if config["search"] else "OFF"
-    await interaction.response.send_message(
-        f"✅ 웹 검색: **{state}**\n방식: `openrouter:web_search` server tool\n기본 모델: `{config['model']}`"
-    )
+    lines = [f"✅ 웹 검색: **{state}**"]
+    if config["search"]:
+        lines.append(f"방식: {describe_search_mode(config, bot.or_client.get_model_info(config['model']))}")
+        if not TAVILY_API_KEY:
+            lines.append("⚠️ 서버에 `TAVILY_API_KEY`가 없어 실제로는 검색하지 않습니다.")
+    lines.append(f"기본 모델: `{config['model']}`")
+    await interaction.response.send_message("\n".join(lines))
 
 
 @bot.tree.command(name="image", description="이미지 생성 (prompt → 텍스트 모델로 다듬은 후 이미지 모델 호출)")
