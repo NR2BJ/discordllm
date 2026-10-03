@@ -7,6 +7,7 @@ import os
 import aiohttp
 import asyncio
 import base64
+import bisect
 import copy
 import io
 import re
@@ -62,14 +63,19 @@ def is_enabled(value):
     return bool(value)
 
 # 🔢 [수치 조절 구역]
+# 히스토리는 블록 단위로 자른다: 창이 HISTORY_LIMIT개에서 시작해 HISTORY_LIMIT + 블록 - 1개까지 뒤로만 늘고,
+# 그다음 메시지에서 오래된 블록 하나를 한 번에 버린다. 블록 동안 앞부분이 그대로라 프롬프트 캐시가 맞는다.
 HISTORY_LIMIT = 20
 MIN_HISTORY_LIMIT = 1
 MAX_HISTORY_LIMIT = 100
+HISTORY_BLOCK = 20
+MIN_HISTORY_BLOCK = 1
+MAX_HISTORY_BLOCK = 100
+# 창 안 미디어(이미지·영상·오디오)는 전부 다시 보낸다. 이 개수를 넘으면 블록을 일찍 교체한다 (0이면 히스토리 미디어 끔).
 IMAGE_HISTORY_LIMIT = int(os.environ.get("LLM_IMAGE_HISTORY_LIMIT", "10"))
 MIN_IMAGE_HISTORY_LIMIT = 0
 MAX_IMAGE_HISTORY_LIMIT = 50
-VIDEO_HISTORY_LIMIT = 1
-AUDIO_HISTORY_LIMIT = 1
+HISTORY_MEDIA_BYTES_CAP = 14 * 1024 * 1024  # 히스토리로 다시 보내는 미디어 원본 합계 상한 (요청 크기 한도 대비)
 MAX_MEDIA_BASE64_MB = 20
 MAX_DOC_CHARS = 12000
 MEMORY_EXCERPT_MAX_CHARS = 5000
@@ -82,7 +88,6 @@ SUPPORTED_EXTENSIONS = ('.txt', '.py', '.c', '.cpp', '.java', '.js', '.html',
 DEFAULT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_IMAGE_MODEL = os.environ.get("LLM_DEFAULT_IMAGE_MODEL")
 DEFAULT_IMAGE_PROMPT_MODEL = os.environ.get("LLM_IMAGE_PROMPT_MODEL") or os.environ.get("LLM_ROUTE_MODEL") or os.environ.get("LLM_MEMORY_MODEL")
-DOC_CACHE_AUTO_REPLAY_WINDOW = 2
 DEFAULT_PROVIDER_PRIVACY = os.environ.get("LLM_PROVIDER_PRIVACY", "allow")
 MEMORY_UPDATE_WINDOW = 8
 # Conservative token-ish guardrail for very large prompts only. Set to 0 to disable compression entirely.
@@ -108,6 +113,7 @@ You are an AI member of this Discord server.
 ## User Identification
 - Each historical user message starts with `[from display_name (id:numeric_id)]`.
 - The CURRENT message you should respond to starts with `[CURRENT MESSAGE from display_name (id:numeric_id)]` — focus your reply on this user.
+- Before that marker, the bot automatically inserts a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The user did not write it. It is the real current date and time; your training data is older, so do not assume an earlier year.
 - Past bot replies start with `[Bot replied to display_name (id:numeric_id)]`, indicating which user that reply addressed.
 - The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
 - NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
@@ -130,19 +136,18 @@ KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
 
 
-def with_current_datetime(prompt):
-    """시스템 프롬프트 끝에 현재 시각(KST)을 붙인다.
+def format_current_time_marker():
+    """현재 메시지 맨 앞에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
 
     모델이 학습 시점을 오늘로 믿고 검색어에 옛 날짜를 넣는 문제가 실측됐다 (gemini-3-flash-preview가
-    오늘을 2024-05-23으로 믿고 2024년 뉴스를 검색). 검색 도구 설명에 넣은 날짜는 2026→2024로 고쳐 검색했고,
-    날짜만 적은 줄도 첫 검색어 연도가 0/4로 2024였다. "실제 현재 날짜이고 학습 데이터가 더 오래됐다"를
-    덧붙이자 4/4 2026으로 검색했다. 매 분 바뀌는 줄이라 맨 끝에 둬서 앞쪽 고정 프롬프트의 캐시 접두는 유지한다.
+    오늘을 2024-05-23으로 믿고 2024년 뉴스를 검색). 매 분 바뀌는 값이라 시스템 프롬프트(히스토리 앞)에 두면
+    히스토리 캐시가 깨져서, 매번 새로 바뀌는 현재 메시지에 붙인다. 이 줄의 뜻은 시스템 프롬프트가 설명한다.
+    "실제 현재 날짜" 문장을 줄 안에 같이 둬야 검색어 연도가 맞았다 (날짜만: 첫 검색어 2026 1/4, 문장 포함: 4/4).
     """
     now = datetime.now(KST)
     return (
-        f"{prompt.rstrip()}\n- Current date and time: {now.strftime('%Y-%m-%d (%a) %H:%M KST')}. "
-        f"This is the real current date. Your training data is older, so do not assume it is an earlier year "
-        f"than {now.year}."
+        f"[System time: {now.strftime('%Y-%m-%d (%a) %H:%M KST')} — this is the real current date, "
+        f"so do not assume an earlier year than {now.year}]"
     )
 
 # ================= 2. 데이터 관리자 =================
@@ -276,7 +281,7 @@ class DocumentCache:
                 if content is None:
                     continue
                 title = "Cached Webpage Content" if doc.get("type") == "webpage" else "Cached File Content"
-                blocks.append(f"[{title}: {doc_id} | {label}]\n```\n{content}\n```")
+                blocks.append(f"[{title}: {doc_id} | {label}]\n```\n{trim_document_text(content)}\n```")
             else:
                 title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
                 blocks.append(f"[{title}: {doc_id} | {label}]")
@@ -424,6 +429,104 @@ def get_image_history_limit(config):
     return clamp_image_history_limit((config or {}).get("image_history_limit", IMAGE_HISTORY_LIMIT))
 
 
+def clamp_history_block(value):
+    try:
+        block = int(value)
+    except (TypeError, ValueError):
+        block = HISTORY_BLOCK
+    return max(MIN_HISTORY_BLOCK, min(MAX_HISTORY_BLOCK, block))
+
+
+def get_history_block(config):
+    return clamp_history_block((config or {}).get("history_block", HISTORY_BLOCK))
+
+
+def select_history_window(
+    message_ids,
+    *,
+    anchor_id,
+    covered,
+    base,
+    block,
+    media_counts,
+    media_bytes,
+    media_cap,
+    media_bytes_cap,
+):
+    """블록 단위 히스토리 창의 시작 위치를 고른다. 반환: (시작 인덱스, 이유)
+
+    message_ids: 히스토리 후보 ID (오래된 → 최신, 현재 메시지 제외)
+    anchor_id: 이 채널의 현재 블록 시작 메시지 ID (봇 재시작 직후 등은 None)
+    covered: 후보 목록이 anchor까지 거슬러 올라갔는지 (아니면 블록을 새로 시작)
+    창 길이는 base ~ base + block - 1 사이를 오간다. 미디어 개수·용량이 상한을 넘으면
+    블록을 일찍 교체해 최근 base개로 줄인다. 최근 base개만으로도 상한을 넘으면 교체해도 소용없고
+    메시지마다 교체가 반복돼 캐시만 깨지므로 그때는 교체하지 않는다.
+    이유: keep(블록 유지) | new(새 블록) | rollover(정기 교체) | media(미디어 때문에 조기 교체)
+    """
+    total = len(message_ids)
+    if total == 0:
+        return 0, "new"
+    if anchor_id is not None and covered:
+        start = bisect.bisect_left(message_ids, anchor_id)
+        reason = "keep"
+    else:
+        start = max(0, total - base)
+        reason = "new"
+    if total - start < base and start > 0:
+        start, reason = max(0, total - base), "new"
+    window = total - start
+    if window >= base + block:
+        start += ((window - base) // block) * block
+        reason = "rollover"
+    if media_cap > 0:
+        early_start = max(start, total - base)
+        over_now = sum(media_counts[start:]) > media_cap or sum(media_bytes[start:]) > media_bytes_cap
+        fits_after = (
+            sum(media_counts[early_start:]) <= media_cap and sum(media_bytes[early_start:]) <= media_bytes_cap
+        )
+        if over_now and early_start > start and fits_after:
+            start, reason = early_start, "media"
+    return start, reason
+
+
+def plan_history_media(msg, *, is_bot, enabled, can_see_image, can_see_video, can_see_audio):
+    """히스토리 메시지에서 다시 보낼 미디어 첨부 목록 (다운로드 전, 첨부 메타데이터만 본다).
+
+    LLM 봇은 봇이 보낸 이미지는 다시 보내지 않고 텍스트 표시만 남긴다.
+    """
+    if not enabled or is_bot:
+        return []
+    planned = []
+    for att in msg.attachments:
+        if (att.size or 0) > MAX_MEDIA_BASE64_MB * 1024 * 1024:
+            continue
+        ct = att.content_type or ""
+        if is_image_attachment(att):
+            if can_see_image:
+                planned.append(att)
+        elif ct.startswith("video"):
+            if can_see_video:
+                planned.append(att)
+        elif ct.startswith("audio"):
+            if can_see_audio:
+                planned.append(att)
+    return planned
+
+
+def fit_history_media_to_budget(media_plans, bytes_cap):
+    """창 안 미디어 원본 합계가 상한을 넘으면 최신부터 담고, 넘치는 오래된 미디어는 뺀다."""
+    fitted = [[] for _ in media_plans]
+    used = 0
+    for index in range(len(media_plans) - 1, -1, -1):
+        for att in media_plans[index]:
+            size = att.size or 0
+            if used + size > bytes_cap:
+                continue
+            used += size
+            fitted[index].append(att)
+    return fitted
+
+
 def get_bot_display_name():
     user = getattr(bot, "user", None)
     return getattr(user, "display_name", None) or getattr(user, "name", None) or "Bot"
@@ -482,6 +585,7 @@ def clean_assistant_response_text(text):
     if not isinstance(text, str):
         return text
     # 신규 형식: 모델이 마커를 모방해 응답 첫 줄에 붙인 경우 제거
+    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*\[CURRENT MESSAGE from [^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*\[Bot replied to [^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*\[from [^\]\n]+\]\s*", "", text)
@@ -801,11 +905,15 @@ class OpenRouterClient:
         response_format=None,
         provider=None,
         cache_control=None,
+        session_id=None,
     ):
         payload = {
             "model": model,
             "messages": messages,
         }
+        # 같은 세션(채널) 요청을 같은 provider로 보내 그쪽 프롬프트 캐시를 이어 쓰게 한다 (OpenRouter sticky routing).
+        if session_id:
+            payload["session_id"] = session_id
 
         if tools:
             payload["tools"] = copy.deepcopy(tools)
@@ -981,7 +1089,16 @@ class OpenRouterClient:
         """
         convo = list(messages)
         tool_outputs = []
-        total_tokens = 0
+        totals = {"total_tokens": 0, "prompt_tokens": 0, "cached_tokens": 0}
+
+        def add_usage(usage):
+            if not isinstance(usage, dict):
+                return
+            totals["total_tokens"] += usage.get("total_tokens") or 0
+            totals["prompt_tokens"] += usage.get("prompt_tokens") or 0
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                totals["cached_tokens"] += details.get("cached_tokens") or 0
 
         def finish(content, usage, images, data):
             if not (content or "").strip() and not images:
@@ -989,15 +1106,20 @@ class OpenRouterClient:
                     "모델이 도구 호출 뒤 최종 답변을 만들지 못했습니다. 다시 시도해 주세요.",
                     finish_reason="tool_loop_no_answer",
                 )
+            # 왕복마다 받은 사용량을 합쳐 돌려준다 (입력·캐시 토큰 로그용)
             merged_usage = dict(usage) if isinstance(usage, dict) else {}
-            if total_tokens:
-                merged_usage["total_tokens"] = total_tokens
+            merged_usage["total_tokens"] = totals["total_tokens"]
+            merged_usage["prompt_tokens"] = totals["prompt_tokens"]
+            details = merged_usage.get("prompt_tokens_details")
+            merged_usage["prompt_tokens_details"] = {
+                **(details if isinstance(details, dict) else {}),
+                "cached_tokens": totals["cached_tokens"],
+            }
             return content, merged_usage, images, data
 
         for _ in range(max_rounds):
             content, usage, images, data = await self.chat_completion(model, convo, tools=tools, **kwargs)
-            if isinstance(usage, dict):
-                total_tokens += usage.get("total_tokens") or 0
+            add_usage(usage)
             choices = (data or {}).get("choices") or [{}]
             message = (choices[0] or {}).get("message") or {}
             tool_calls = message.get("tool_calls") or []
@@ -1031,8 +1153,7 @@ class OpenRouterClient:
             "\n\n".join(tool_outputs) + "\n\n(System: 검색 한도에 도달했다. 더 검색하지 말고 위 결과만으로 지금 답하라.)",
         )
         content, usage, images, data = await self.chat_completion(model, final_messages, **kwargs)
-        if isinstance(usage, dict):
-            total_tokens += usage.get("total_tokens") or 0
+        add_usage(usage)
         return finish(content, usage, images, data)
 
 # ================= 4. 봇 클래스 =================
@@ -1044,6 +1165,7 @@ class OpenRouterBot(commands.Bot):
         self.or_client = OpenRouterClient(OPENROUTER_API_KEY)
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
+        self.history_anchors = {}  # 채널별 현재 히스토리 블록의 시작 메시지 ID (재시작하면 새 블록부터)
         self.doc_cache = DocumentCache(DOC_CACHE_DIR)
         self._migrate_legacy_router_keys()
 
@@ -1085,6 +1207,7 @@ class OpenRouterBot(commands.Bot):
                 "provider_privacy": DEFAULT_PROVIDER_PRIVACY,
                 "provider_order": [],
                 "history_limit": HISTORY_LIMIT,
+                "history_block": HISTORY_BLOCK,
                 "image_history_limit": IMAGE_HISTORY_LIMIT,
                 "image_prompt_model": DEFAULT_IMAGE_PROMPT_MODEL,
             }
@@ -1092,6 +1215,7 @@ class OpenRouterBot(commands.Bot):
         self.server_configs[gid].setdefault("provider_privacy", DEFAULT_PROVIDER_PRIVACY)
         self.server_configs[gid].setdefault("provider_order", [])
         self.server_configs[gid].setdefault("history_limit", HISTORY_LIMIT)
+        self.server_configs[gid].setdefault("history_block", HISTORY_BLOCK)
         self.server_configs[gid].setdefault("image_history_limit", IMAGE_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("image_prompt_model", DEFAULT_IMAGE_PROMPT_MODEL)
         self.server_configs[gid].pop("provider_policy", None)
@@ -2039,129 +2163,148 @@ async def on_message(message):
                 if capability_hints:
                     sys_prompt += "\n" + "\n".join(f"- {hint}" for hint in capability_hints)
 
-                messages = [{"role": "system", "content": with_current_datetime(sys_prompt)}]
+                messages = [{"role": "system", "content": sys_prompt}]
 
                 reset_dt = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
-                reply_target_id = message.reference.message_id if message.reference and message.reference.message_id else None
-
-                vid_count = 0
-                aud_count = 0
-                history_buffer = []
-                history_position = 0
                 history_limit = get_history_limit(config)
-                image_history_limit = get_image_history_limit(config)
-                history_scan_limit = max(history_limit, image_history_limit)
-                history_inline_images = 0
+                history_block = get_history_block(config)
+                media_cap = get_image_history_limit(config)
 
-                async for msg in message.channel.history(limit=history_scan_limit + 10):
+                # 1) 히스토리 후보를 모은다 (최신 → 과거). 창 범위를 먼저 정하고 나서 내용을 만든다.
+                candidates = []
+                scan_limit = history_limit + history_block + 20
+                scanned = 0
+                oldest_scanned_id = None
+                hit_reset = False
+                async for msg in message.channel.history(limit=scan_limit):
+                    scanned += 1
+                    oldest_scanned_id = msg.id
                     if msg.id == message.id:
                         continue
                     if msg.id > message.id and msg.author != bot.user:
                         continue
                     if reset_dt and msg.created_at < reset_dt:
+                        hit_reset = True
                         break
                     if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
                         continue
+                    if msg.author == bot.user and not (msg.content or "").strip() and not msg.attachments:
+                        continue
+                    candidates.append(msg)
+                candidates.reverse()
 
+                # 2) 블록 창을 고른다. 블록 동안 시작점이 고정돼 앞부분이 요청마다 같게 유지된다.
+                media_plans = [
+                    plan_history_media(
+                        msg,
+                        is_bot=msg.author == bot.user,
+                        enabled=media_cap > 0,
+                        can_see_image=can_see_image,
+                        can_see_video=can_see_video,
+                        can_see_audio=can_see_audio,
+                    )
+                    for msg in candidates
+                ]
+                anchor_id = bot.history_anchors.get(message.channel.id)
+                covered = hit_reset or scanned < scan_limit or (
+                    anchor_id is not None and oldest_scanned_id is not None and oldest_scanned_id <= anchor_id
+                )
+                window_start, window_reason = select_history_window(
+                    [msg.id for msg in candidates],
+                    anchor_id=anchor_id,
+                    covered=covered,
+                    base=history_limit,
+                    block=history_block,
+                    media_counts=[len(plan) for plan in media_plans],
+                    media_bytes=[sum(att.size or 0 for att in plan) for plan in media_plans],
+                    media_cap=media_cap,
+                    media_bytes_cap=HISTORY_MEDIA_BYTES_CAP,
+                )
+                window = candidates[window_start:]
+                window_media = fit_history_media_to_budget(media_plans[window_start:], HISTORY_MEDIA_BYTES_CAP)
+                bot.history_anchors[message.channel.id] = window[0].id if window else None
+
+                # 3) 창 안 메시지는 위치와 상관없이 같은 모양으로 넣는다: 미디어 전부, 문서는 캐시 기준 전문.
+                history_buffer = []
+                history_inline_media = 0
+                for msg, planned in zip(window, window_media):
                     is_bot = msg.author == bot.user
                     role = "assistant" if is_bot else "user"
+                    planned_ids = {att.id for att in planned}
                     content_list = []
-                    image_inputs = []
-                    within_text_history = history_position < history_limit
-                    within_image_history = history_position < image_history_limit
-                    cached_doc_blocks = []
-                    if within_text_history and not is_bot:
-                        replay_full_docs = (reply_target_id == msg.id) or (history_position < DOC_CACHE_AUTO_REPLAY_WINDOW)
-                        cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=replay_full_docs)
-
-                    text_content = ""
                     if is_bot:
-                        clean_content = msg.content if within_text_history else ""
-                        if within_text_history and ":" in clean_content[:20]:
-                            parts = clean_content.split(": ", 1)
+                        text_content = msg.content or ""
+                        if ":" in text_content[:20]:
+                            parts = text_content.split(": ", 1)
                             if len(parts) > 1 and parts[0] in [get_bot_display_name(), get_bot_username(), "Bot", "Model"]:
-                                clean_content = parts[1]
-                        text_content = clean_content
+                                text_content = parts[1]
                         for att in msg.attachments:
                             ct = att.content_type or ""
                             if is_image_attachment(att):
                                 text_content += f"\n(Bot sent an image: {att.filename})"
-                            elif within_text_history and ct.startswith("video"):
+                            elif ct.startswith("video"):
                                 text_content += "\n(Bot generated a video here)"
                     else:
-                        text_content = msg.content if (within_text_history or within_image_history) else ""
+                        text_content = msg.content or ""
                         for att in msg.attachments:
                             ct = att.content_type or ""
-                            file_size = att.size or 0
-                            too_large = file_size > MAX_MEDIA_BASE64_MB * 1024 * 1024
-
+                            too_large = (att.size or 0) > MAX_MEDIA_BASE64_MB * 1024 * 1024
                             if is_image_attachment(att):
                                 text_content += f"\n(User attached an image: {att.filename})"
-                                if within_image_history and can_see_image and not too_large:
+                                if att.id in planned_ids:
                                     raw, mime = await download_binary(att.url)
                                     if raw:
                                         mime = infer_attachment_mime(att, mime)
                                         b64 = base64.b64encode(raw).decode("utf-8")
-                                        image_part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                                        image_inputs.append(image_part)
-                                        history_inline_images += 1
+                                        content_list.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                                        history_inline_media += 1
                                     else:
                                         text_content += " (image download failed)"
-                            elif within_text_history and ct.startswith("video") and can_see_video and vid_count < VIDEO_HISTORY_LIMIT and not too_large:
-                                b64, mime = await encode_image(att.url)
-                                if b64:
-                                    content_list.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
-                                    vid_count += 1
-                                else:
-                                    text_content += f"\n(User attached a video: {att.filename})"
-                            elif within_text_history and ct.startswith("audio") and can_see_audio and aud_count < AUDIO_HISTORY_LIMIT and not too_large:
-                                b64, _ = await encode_image(att.url)
-                                if b64:
-                                    fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
-                                    content_list.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
-                                    aud_count += 1
-                                else:
-                                    text_content += f"\n(User attached an audio file: {att.filename})"
-                            elif within_text_history:
+                            elif ct.startswith("video") or ct.startswith("audio"):
+                                is_video = ct.startswith("video")
+                                inlined = False
+                                if att.id in planned_ids:
+                                    b64, mime = await encode_image(att.url)
+                                    if b64:
+                                        if is_video:
+                                            content_list.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
+                                        else:
+                                            fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
+                                            content_list.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
+                                        history_inline_media += 1
+                                        inlined = True
+                                if not inlined:
+                                    label = "a video" if is_video else "an audio file"
+                                    text_content += f"\n(User attached {label}: {att.filename})"
+                            elif not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
+                                # 문서는 캐시에 저장만 하고, 아래에서 캐시 기준으로 넣어 요청마다 같은 모양이 되게 한다
                                 extracted_text, doc_type = await extract_attachment_text(att)
-                                if extracted_text and not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
+                                if extracted_text:
                                     bot.doc_cache.store_document("text_file", att.filename, extracted_text, msg.id, msg.channel.id)
-                                    text_content += f"\n\n[Attached File Content: {att.filename}]\n```\n{extracted_text}\n```"
                                 elif too_large:
                                     media_type = attachment_media_type(att)
                                     text_content += f"\n(User attached a {media_type} file: {att.filename}, but it was too large to inline.)"
-                                elif is_image_attachment(att):
-                                    text_content += f"\n(User attached an image: {att.filename})"
-                                elif ct.startswith("video"):
-                                    text_content += f"\n(User attached a video: {att.filename})"
-                                elif ct.startswith("audio"):
-                                    text_content += f"\n(User attached an audio file: {att.filename})"
                                 elif doc_type:
                                     text_content += f"\n(User attached a {doc_type} file: {att.filename})"
-
-                    if cached_doc_blocks:
-                        text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
-
-                    if not is_bot:
+                        cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=True)
+                        if cached_doc_blocks:
+                            text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
                         text_content = prepend_user_identity(text_content, message.guild, msg.author, kind="history")
 
-                    content_list.extend(image_inputs)
                     if text_content.strip():
                         content_list.append({"type": "text", "text": text_content})
-                    if len(content_list) == 0:
-                        history_position += 1
-                        if history_position >= history_scan_limit:
-                            break
+                    if not content_list:
                         continue
                     # author 메타: 봇 응답에 응답 대상 마커를 붙이기 위한 후처리용
                     item_meta = {
                         "is_bot": is_bot,
                         "user_info": (None if is_bot else (get_server_display_name(message.guild, msg.author), str(msg.author.id))),
                     }
-                    history_buffer.insert(0, {"role": role, "content": content_list, "_meta": item_meta})
-                    history_position += 1
-                    if history_position >= history_scan_limit:
-                        break
+                    history_buffer.append({"role": role, "content": content_list, "_meta": item_meta})
+                print(
+                    f"[HISTORY] window={len(window)} (base {history_limit} + block {history_block}) "
+                    f"reason={window_reason} media={history_inline_media}/{media_cap}"
+                )
 
                 # 봇 응답에 [Bot replied to ...] 마커 prefix 추가
                 # history_buffer는 시간순(oldest → newest). 직전(과거) user 메시지를 그 대상으로 추정
@@ -2182,10 +2325,7 @@ async def on_message(message):
                     item.pop("_meta", None)
 
                 messages.extend(history_buffer)
-                timing_mark(
-                    f"history count={len(history_buffer)} image_window={image_history_limit} "
-                    f"inline_images={history_inline_images}"
-                )
+                timing_mark(f"history count={len(history_buffer)} inline_media={history_inline_media}")
 
                 current_content = []
                 current_image_inputs = []
@@ -2280,7 +2420,8 @@ async def on_message(message):
                     )
                     return
 
-                current_content.append({"type": "text", "text": prepend_user_identity(user_text, message.guild, message.author, kind="current")})
+                current_text = prepend_user_identity(user_text, message.guild, message.author, kind="current")
+                current_content.append({"type": "text", "text": f"{format_current_time_marker()}\n{current_text}"})
                 messages.append({"role": "user", "content": current_content})
 
                 if search_mode == "presearch":
@@ -2295,6 +2436,7 @@ async def on_message(message):
                     f"plugins={'compression' if should_use_context_compression(messages) else 'none'}"
                 )
 
+                session_id = f"discord-channel-{message.channel.id}"
                 try:
                     response, usage, images, full_data = await run_chat(
                         current_model,
@@ -2304,6 +2446,7 @@ async def on_message(message):
                         capabilities=caps,
                         provider=provider_prefs,
                         cache_control=cache_control,
+                        session_id=session_id,
                     )
                     provider_name = full_data.get("provider") if isinstance(full_data, dict) else None
                     routed_model = full_data.get("model") if isinstance(full_data, dict) else None
@@ -2366,6 +2509,7 @@ async def on_message(message):
                         search_query=message.content,
                         provider=provider_prefs,
                         cache_control=cache_control,
+                        session_id=session_id,
                     )
 
                 bot_display_name = get_bot_display_name()
@@ -2374,12 +2518,17 @@ async def on_message(message):
                 response = clean_assistant_response_text(response)
 
                 total_tokens = usage.get("total_tokens", "N/A")
+                prompt_tokens = usage.get("prompt_tokens") or 0
                 prompt_details = usage.get("prompt_tokens_details", {}) if isinstance(usage, dict) else {}
-                cached_tokens = prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
+                cached_tokens = (prompt_details.get("cached_tokens") or 0) if isinstance(prompt_details, dict) else 0
+                cache_rate = f" ({cached_tokens * 100 // prompt_tokens}%)" if prompt_tokens else ""
                 log_time = datetime.now().strftime("%H:%M:%S")
 
                 print(f"[{log_time}] [{message.guild.name}] {current_display_name}: {message.content}")
-                print(f"봇({current_model}): {response} (Tokens: {total_tokens}, Cached: {cached_tokens})")
+                print(
+                    f"봇({current_model}): {response} "
+                    f"(Tokens: {total_tokens}, In: {prompt_tokens}, Cached: {cached_tokens}{cache_rate})"
+                )
                 if images:
                     print(f"  [이미지 생성]: {len(images)}장")
                 if isinstance(full_data, dict) and full_data.get("provider"):
@@ -2646,22 +2795,26 @@ async def set_provider_routing(
     await interaction.followup.send(embed=embed)
 
 
-@model_group.command(name="history", description="대화/이미지 히스토리 참조 개수 설정")
+@model_group.command(name="history", description="히스토리 개수·블록 크기·미디어 상한 설정")
 @app_commands.describe(
-    count=f"텍스트로 참고할 최근 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)",
-    image_count=f"이미지를 실제 재첨부할 최근 메시지 개수 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)",
+    count=f"항상 남기는 최소 히스토리 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)",
+    block=f"블록 크기: 히스토리가 count+block개가 되면 오래된 block개를 한 번에 버림 ({MIN_HISTORY_BLOCK}~{MAX_HISTORY_BLOCK})",
+    image_count=f"히스토리 속 미디어(이미지·영상·오디오) 상한, 넘으면 블록을 일찍 교체 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)",
 )
 async def set_history_limit(
     interaction: discord.Interaction,
     count: int | None = None,
+    block: int | None = None,
     image_count: int | None = None,
 ):
     config = bot.get_config(interaction.guild_id)
-    if count is None and image_count is None:
+    if count is None and block is None and image_count is None:
+        base = get_history_limit(config)
+        block_size = get_history_block(config)
         await interaction.response.send_message(
-            f"현재 원문 히스토리 참조: **{get_history_limit(config)}개** "
-            f"(범위 {MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)\n"
-            f"현재 이미지 히스토리 재첨부: **{get_image_history_limit(config)}개** "
+            f"현재 히스토리: 최소 **{base}개**, 블록 **{block_size}개** → {base}~{base + block_size - 1}개 사이를 오감 "
+            f"(사용자+봇 합산)\n"
+            f"현재 히스토리 미디어 상한: **{get_image_history_limit(config)}개** "
             f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)"
         )
         return
@@ -2670,12 +2823,17 @@ async def set_history_limit(
         limit = clamp_history_limit(count)
         config["history_limit"] = limit
         suffix = "" if limit == count else f" (요청값 {count}에서 허용 범위로 보정)"
-        changed.append(f"원문 히스토리 **{limit}개**{suffix}")
+        changed.append(f"최소 히스토리 **{limit}개**{suffix}")
+    if block is not None:
+        block_size = clamp_history_block(block)
+        config["history_block"] = block_size
+        suffix = "" if block_size == block else f" (요청값 {block}에서 허용 범위로 보정)"
+        changed.append(f"블록 **{block_size}개**{suffix}")
     if image_count is not None:
         image_limit = clamp_image_history_limit(image_count)
         config["image_history_limit"] = image_limit
         suffix = "" if image_limit == image_count else f" (요청값 {image_count}에서 허용 범위로 보정)"
-        changed.append(f"이미지 히스토리 **{image_limit}개**{suffix}")
+        changed.append(f"히스토리 미디어 상한 **{image_limit}개**{suffix}")
     bot.save_config()
     actor_name = get_server_display_name(interaction.guild, interaction.user)
     await interaction.response.send_message(
@@ -2738,7 +2896,8 @@ async def dashboard(interaction: discord.Interaction):
         f"• **/image — prompt refiner:** `{image_prompt_model_status}`",
         f"• **Image Models discovered:** {count_image_generation_models()}",
         f"• **Provider:** {format_provider_mode(config)}",
-        f"• **History:** {get_history_limit(config)} text / {get_image_history_limit(config)} image messages",
+        f"• **History:** {get_history_limit(config)}~{get_history_limit(config) + get_history_block(config) - 1} messages "
+        f"(block {get_history_block(config)}) / media cap {get_image_history_limit(config)}",
     ]
     embed.add_field(name="🧩 Helpers", value="\n".join(helpers), inline=False)
     if endpoints is not None:
