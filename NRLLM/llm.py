@@ -14,7 +14,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from bs4 import BeautifulSoup
 
 try:
@@ -97,27 +97,25 @@ PROVIDER_PRIVACY_MODES = ("allow", "deny")
 
 IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
+# 시스템 프롬프트·대화 기록 모양은 Gemini 봇(NRGemini/gemini.py)과 같게 유지한다 (말투가 같도록).
+# LLM 봇 구조상 필요한 안내(검색 도구, /image, 모델이 못 보는 첨부)만 on_message에서 덧붙인다.
 _COMMON_RULES = """## General Rules
-- Output response content directly. No prefixes like 'Bot:' or 'Model:'.
 - Respond in the user's language and mirror their tone (casual, formal, vulgar — match them).
 - If the user sets up a specific roleplay scenario (character, world, setting), maintain it consistently within that conversation. Do NOT treat casual chat as "established context" that must persist.
-- If you see `[System Error]` or `[Error]` in history, YOUR previous action failed.
-- When a URL is in the message, the system fetches it and attaches `[Webpage Content]` — use that content directly.
 - Analyze attached files (images/video/audio) when supported.
-- Keep responses concise and Discord-appropriate.
-- If web search is enabled for the request, use the available search tool for up-to-date information when needed. Otherwise rely on your training knowledge."""
+- Keep responses concise and Discord-appropriate."""
+
+CURRENT_TIME_RULE = (
+    "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
+    "automatically; the user did not write it. It is the real current date and time; your training data is older, "
+    "so do not assume an earlier year."
+)
 
 SYSTEM_PROMPT = f"""
 You are an AI member of this Discord server.
 
-## User Identification
-- Each historical user message starts with `[from display_name (id:numeric_id)]`.
-- The CURRENT message you should respond to starts with `[CURRENT MESSAGE from display_name (id:numeric_id)]` — focus your reply on this user.
-- Before that marker, the bot automatically inserts a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The user did not write it. It is the real current date and time; your training data is older, so do not assume an earlier year.
-- Past bot replies start with `[Bot replied to display_name (id:numeric_id)]`, indicating which user that reply addressed.
-- The numeric ID is a UNIQUE identifier. Two users with similar-looking names are ALWAYS different people if their IDs differ.
-- NEVER merge or conflate messages from different IDs, even if topics are similar or names look alike.
-- Track each user's statements separately. What User A said is not what User B said.
+## Current Time
+{CURRENT_TIME_RULE}
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -272,19 +270,16 @@ class DocumentCache:
             return None
 
     def render_blocks(self, message_id, full_content=False):
+        """메시지에 딸린 문서·웹페이지 본문 (Gemini 봇과 같은 `Attached file "이름":` 형식)."""
         blocks = []
+        if not full_content:
+            return blocks
         for doc in self.get_docs_for_message(message_id):
-            doc_id = doc["id"]
-            label = doc.get("source_label", "")
-            if full_content:
-                content = self.get_content(doc_id)
-                if content is None:
-                    continue
-                title = "Cached Webpage Content" if doc.get("type") == "webpage" else "Cached File Content"
-                blocks.append(f"[{title}: {doc_id} | {label}]\n```\n{trim_document_text(content)}\n```")
-            else:
-                title = "Cached Webpage" if doc.get("type") == "webpage" else "Cached File"
-                blocks.append(f"[{title}: {doc_id} | {label}]")
+            content = self.get_content(doc["id"])
+            if content is None:
+                continue
+            source = "Webpage" if doc.get("type") == "webpage" else "Attached file"
+            blocks.append(f'{source} "{doc.get("source_label", "")}":\n\n{trim_document_text(content)}')
         return blocks
 
 
@@ -489,12 +484,12 @@ def select_history_window(
     return start, reason
 
 
-def plan_history_media(msg, *, is_bot, enabled, can_see_image, can_see_video, can_see_audio):
+def plan_history_media(msg, *, enabled, can_see_image, can_see_video, can_see_audio):
     """히스토리 메시지에서 다시 보낼 미디어 첨부 목록 (다운로드 전, 첨부 메타데이터만 본다).
 
-    LLM 봇은 봇이 보낸 이미지는 다시 보내지 않고 텍스트 표시만 남긴다.
+    Gemini 봇처럼 봇이 보낸 이미지(/image 결과 포함)도 다시 보낸다. 넣는 위치는 on_message가 정한다.
     """
-    if not enabled or is_bot:
+    if not enabled:
         return []
     planned = []
     for att in msg.attachments:
@@ -511,6 +506,30 @@ def plan_history_media(msg, *, is_bot, enabled, can_see_image, can_see_video, ca
             if can_see_audio:
                 planned.append(att)
     return planned
+
+
+# 봇이 보낸 이미지는 OpenAI 형식상 봇(assistant) 칸에 넣을 수 없다. 실측(2026-10-03): 봇 칸에 넣으면
+# Gemini는 조용히 버리고 지어냈고, GPT-5 mini는 빈 답, Claude는 "못 본다", Qwen VL은 400.
+# 바로 뒤 user 칸에 이 문구와 함께 넣으면 네 모델 모두 이미지를 정확히 읽었다.
+BOT_MEDIA_NOTE = "(봇이 보낸 이미지)"
+
+
+async def load_history_media_part(att):
+    """히스토리 미디어 첨부를 요청용 content part로 만든다. 실패하면 None (Gemini 봇처럼 설명 없이 생략)."""
+    ct = att.content_type or ""
+    if is_image_attachment(att):
+        raw, mime = await download_binary(att.url)
+        if not raw:
+            return None
+        mime = infer_attachment_mime(att, mime)
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(raw).decode('utf-8')}"}}
+    b64, mime = await encode_image(att.url)
+    if not b64:
+        return None
+    if ct.startswith("video"):
+        return {"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}}
+    fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
+    return {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}
 
 
 def fit_history_media_to_budget(media_plans, bytes_cap):
@@ -549,36 +568,26 @@ def get_server_display_name(guild, user):
     return getattr(user, "display_name", None) or getattr(user, "name", None) or str(user_id or "unknown")
 
 
-def format_user_identity(guild, user, kind="history"):
-    """사용자 식별 마커 생성. kind: 'history' | 'current'"""
-    name = get_server_display_name(guild, user)
-    uid = str(getattr(user, "id", "unknown"))
-    if kind == "current":
-        return f"[CURRENT MESSAGE from {name} (id:{uid})]"
-    return f"[from {name} (id:{uid})]"
+def build_speaker_labels(speakers):
+    """단톡방처럼 `표시명:`으로 쓸 사용자 라벨 (Gemini 봇 label_discord_user_contents와 같은 규칙).
 
-
-def format_bot_target_marker(display_name, user_id):
-    """봇 응답이 어떤 사용자에게 답한 것인지 표시하는 prefix 마커."""
-    return f"[Bot replied to {display_name} (id:{user_id})]"
-
-
-def prepend_user_identity(text, guild, user, kind="history"):
-    """사용자 메시지 본문 앞에 식별 마커를 prefix로 붙임."""
-    body = (text or "").lstrip()
-    marker = format_user_identity(guild, user, kind=kind)
-    if not body:
-        return marker
-    return f"{marker}\n{body}"
-
-
-def prepend_bot_target(text, display_name, user_id):
-    """봇 응답 본문 앞에 응답 대상 사용자 마커를 prefix로 붙임."""
-    body = (text or "").lstrip()
-    marker = format_bot_target_marker(display_name, user_id)
-    if not body:
-        return marker
-    return f"{marker}\n{body}"
+    speakers: 대화 순서대로 (user_id, display_name). 같은 ID는 가장 최근 표시명으로 통일하고,
+    표시명이 같은 서로 다른 사람은 처음 나온 순서대로 (1), (2)를 붙인다. 숫자 ID는 모델 입력에 넣지 않는다.
+    """
+    ordered_ids = []
+    names = {}
+    for user_id, display_name in speakers:
+        if user_id not in names:
+            ordered_ids.append(user_id)
+        names[user_id] = (display_name or str(user_id)).strip()
+    ids_by_name = {}
+    for user_id in ordered_ids:
+        ids_by_name.setdefault(names[user_id], []).append(user_id)
+    labels = {}
+    for name, user_ids in ids_by_name.items():
+        for index, user_id in enumerate(user_ids, start=1):
+            labels[user_id] = name if len(user_ids) == 1 else f"{name} ({index})"
+    return labels
 
 
 def clean_assistant_response_text(text):
@@ -1203,7 +1212,6 @@ class OpenRouterBot(commands.Bot):
                 "model": DEFAULT_MODEL,
                 "fallback_model": DEFAULT_IMAGE_MODEL,
                 "reset_time": None,
-                "search": False,
                 "provider_privacy": DEFAULT_PROVIDER_PRIVACY,
                 "provider_order": [],
                 "history_limit": HISTORY_LIMIT,
@@ -1223,6 +1231,8 @@ class OpenRouterBot(commands.Bot):
         # 옛 라우터 키 정리 (재진입 시 대비)
         self.server_configs[gid].pop("route_model", None)
         self.server_configs[gid].pop("action_router", None)
+        # 검색 토글 제거 (검색은 항상 켜짐)
+        self.server_configs[gid].pop("search", None)
         return self.server_configs[gid]
 
     def get_channel_lock(self, channel_id):
@@ -1432,8 +1442,11 @@ def format_search_results(query, outcome):
     return "\n".join(lines)
 
 
-def make_web_search_handler(max_calls=WEB_SEARCH_MAX_CALLS):
-    """메시지 하나 동안 쓰는 web_search 실행기. Tavily 호출 횟수를 max_calls로 제한한다."""
+def make_web_search_handler(max_calls=WEB_SEARCH_MAX_CALLS, sources=None):
+    """메시지 하나 동안 쓰는 web_search 실행기. Tavily 호출 횟수를 max_calls로 제한한다.
+
+    sources에 리스트를 주면 검색 결과(제목·URL)를 모아, 답장 끝 출처 목록에 쓴다.
+    """
     state = {"calls": 0}
 
     async def handler(args):
@@ -1451,9 +1464,29 @@ def make_web_search_handler(max_calls=WEB_SEARCH_MAX_CALLS):
             f"[SEARCH] #{state['calls']} query={query!r} opts={outcome.get('options')} "
             f"ok={outcome.get('ok')} results={count} {detail}"
         )
+        if sources is not None:
+            sources.extend(outcome.get("results") or [])
         return format_search_results(query, outcome)
 
     return handler
+
+
+def format_search_sources(sources, response_text, limit=5):
+    """검색 결과 출처를 Gemini 봇과 같은 `**출처:**` 번호 목록으로. 본문에 이미 있는 URL·중복은 뺀다."""
+    seen = set()
+    lines = []
+    for item in sources or []:
+        url = (item.get("url") or "").strip()
+        if not url or url in seen or url in (response_text or ""):
+            continue
+        seen.add(url)
+        title = urlsplit(url).netloc.removeprefix("www.") or url
+        safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        safe_url = url.replace("\\", "%5C").replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+        lines.append(f"{len(lines) + 1}. [{safe_title}]({safe_url})")
+        if len(lines) >= limit:
+            break
+    return "**출처:**\n" + "\n".join(lines) if lines else ""
 
 
 async def tavily_extract(urls):
@@ -1484,10 +1517,11 @@ async def tavily_extract(urls):
     return contents, failed
 
 
-def select_search_mode(config, model_info):
-    """검색 방식: off / tools(모델이 필요할 때 web_search 호출) / presearch(도구 미지원 모델용 사전 검색)."""
-    if not config.get("search"):
-        return "off"
+def select_search_mode(model_info):
+    """검색 방식: tools(모델이 필요할 때 web_search 호출) / presearch(도구 미지원 모델용 사전 검색) / off(키 없음).
+
+    검색은 항상 켜져 있다 (Gemini 봇의 구글 검색처럼). Tavily 키가 없을 때만 꺼진다.
+    """
     if not TAVILY_API_KEY:
         print("[SEARCH] TAVILY_API_KEY 미설정 → 검색 비활성")
         return "off"
@@ -1497,13 +1531,11 @@ def select_search_mode(config, model_info):
     return "tools"
 
 
-def describe_search_mode(config, model_info):
-    """대시보드·/search 표시용 검색 상태 문구."""
-    if not config.get("search"):
-        return "OFF"
+def describe_search_mode(model_info):
+    """대시보드 표시용 검색 상태 문구."""
     if not TAVILY_API_KEY:
-        return "ON (TAVILY_API_KEY 미설정 → 동작 안 함)"
-    if select_search_mode(config, model_info) == "presearch":
+        return "OFF (TAVILY_API_KEY 미설정)"
+    if select_search_mode(model_info) == "presearch":
         return "ON (Tavily · 매 메시지 사전 검색 — 도구 미지원 모델)"
     return "ON (Tavily · 모델이 필요할 때 검색)"
 
@@ -1526,7 +1558,7 @@ def append_to_last_user_text(messages, block):
         return
 
 
-async def apply_presearch(messages, query):
+async def apply_presearch(messages, query, sources=None):
     """도구 미지원 모델용: 현재 메시지로 한 번 검색해 결과를 마지막 user 메시지에 붙인다."""
     query = (query or "").strip()[:400]
     if not query:
@@ -1535,6 +1567,8 @@ async def apply_presearch(messages, query):
     count = len(outcome.get("results") or [])
     detail = f"credits={outcome.get('credits')}" if outcome.get("ok") else f"error={outcome.get('error')}"
     print(f"[SEARCH] 사전 검색 query={query!r} ok={outcome.get('ok')} results={count} {detail}")
+    if sources is not None:
+        sources.extend(outcome.get("results") or [])
     append_to_last_user_text(messages, format_search_results(query, outcome))
 
 
@@ -1543,8 +1577,11 @@ def is_tool_unsupported_error(error):
     return "tool" in text and ("no endpoints found" in text or "does not support" in text)
 
 
-async def run_chat(model, messages, *, search_mode, search_query, **chat_kwargs):
-    """검색 방식에 맞춰 채팅 호출. tools 방식에서 도구 미지원 오류가 나면 사전 검색으로 전환한다."""
+async def run_chat(model, messages, *, search_mode, search_query, sources=None, **chat_kwargs):
+    """검색 방식에 맞춰 채팅 호출. tools 방식에서 도구 미지원 오류가 나면 사전 검색으로 전환한다.
+
+    sources에 리스트를 주면 이번 답장에 쓰인 검색 결과가 모인다 (답장 끝 출처 목록용).
+    """
     if search_mode != "tools":
         return await bot.or_client.chat_completion(model, messages, **chat_kwargs)
     try:
@@ -1552,14 +1589,14 @@ async def run_chat(model, messages, *, search_mode, search_query, **chat_kwargs)
             model,
             messages,
             tools=[WEB_SEARCH_TOOL],
-            tool_handlers={"web_search": make_web_search_handler()},
+            tool_handlers={"web_search": make_web_search_handler(sources=sources)},
             **chat_kwargs,
         )
     except Exception as e:
         if not is_tool_unsupported_error(e):
             raise
         print(f"[SEARCH] {model}: 도구 호출 미지원 응답 → 사전 검색으로 전환 ({str(e)[:150]})")
-        await apply_presearch(messages, search_query)
+        await apply_presearch(messages, search_query, sources=sources)
         return await bot.or_client.chat_completion(model, messages, **chat_kwargs)
 
 
@@ -2120,35 +2157,26 @@ async def on_message(message):
                 can_see_audio = "audio" in caps["input"]
                 can_gen_image = "image" in caps["output"]
                 current_display_name = get_server_display_name(message.guild, message.author)
-                search_mode = select_search_mode(config, base_model_info)
+                search_mode = select_search_mode(base_model_info)
                 print(f"[CAPS] {current_model}: in={caps['input']} out={caps['output']} search={search_mode}")
                 timing_mark("caps")
 
-                sys_prompt = SYSTEM_PROMPT
-                capability_hints = []
-                if can_see_image:
-                    capability_hints.append("You can analyze images attached by users.")
-                if can_see_video:
-                    capability_hints.append("You can analyze video files attached by users.")
-                if can_see_audio:
-                    capability_hints.append("You can analyze audio files attached by users.")
+                # Gemini 봇과 같은 시스템 프롬프트에 LLM 봇 구조상 필요한 안내만 덧붙인다:
+                # 검색은 Tavily 도구(Gemini는 구글 검색 내장), 이미지 생성은 /image로만, 모델이 못 보는 첨부.
+                # 출처는 모델에게 본문에 달게 하지 않고, Gemini 봇처럼 봇이 답장 끝에 목록으로 붙인다.
+                extra_rules = []
                 if search_mode == "tools":
-                    capability_hints.append(
-                        "You have a `web_search` tool. For anything time-sensitive — recent events, news, "
-                        "product/model releases, version numbers, prices, exchange rates, or facts that may have "
-                        "changed after your training cutoff — call web_search before answering instead of relying "
-                        "on possibly-outdated training knowledge. Base your answer on what you actually found and "
-                        "cite sources inline as Markdown links. Do not search for casual chat."
+                    extra_rules.append(
+                        "You have a `web_search` tool. Use it for anything time-sensitive or that may have changed "
+                        "after your training (news, prices, releases, schedules) instead of guessing. "
+                        "Don't search for casual chat."
                     )
                 elif search_mode == "presearch":
-                    capability_hints.append(
-                        "Web search results for the user's current message are attached at the end of that "
-                        "message as [web_search 결과]. For time-sensitive facts, rely on those results over your "
-                        "training knowledge and cite sources inline as Markdown links. Ignore results that are "
-                        "irrelevant to the question."
+                    extra_rules.append(
+                        "Web search results for the latest message are attached at its end. Use them for "
+                        "time-sensitive facts and ignore them if irrelevant."
                     )
-                capability_hints.append("Image generation is only available via the `/image` slash command, not in chat.")
-
+                extra_rules.append("Image generation is only available via the `/image` slash command, not in chat.")
                 cannot_hints = []
                 if not can_see_image:
                     cannot_hints.append("analyze images")
@@ -2157,11 +2185,8 @@ async def on_message(message):
                 if not can_see_audio:
                     cannot_hints.append("analyze audio")
                 if cannot_hints:
-                    capability_hints.append(
-                        f"You CANNOT {', '.join(cannot_hints)}. If asked, politely explain the limitation and point the user to the relevant slash command if helpful."
-                    )
-                if capability_hints:
-                    sys_prompt += "\n" + "\n".join(f"- {hint}" for hint in capability_hints)
+                    extra_rules.append(f"You cannot {', '.join(cannot_hints)} with this model. If asked, say so.")
+                sys_prompt = SYSTEM_PROMPT.rstrip() + "\n" + "\n".join(f"- {rule}" for rule in extra_rules) + "\n"
 
                 messages = [{"role": "system", "content": sys_prompt}]
 
@@ -2186,9 +2211,11 @@ async def on_message(message):
                     if reset_dt and msg.created_at < reset_dt:
                         hit_reset = True
                         break
-                    if msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None:
+                    # 슬래시 명령 결과는 빼되, /image처럼 이미지가 붙은 결과는 Gemini 봇처럼 남긴다
+                    interaction_output = msg.author == bot.user and getattr(msg, "interaction_metadata", None) is not None
+                    if interaction_output and not any(is_image_attachment(att) for att in msg.attachments):
                         continue
-                    if msg.author == bot.user and not (msg.content or "").strip() and not msg.attachments:
+                    if not (msg.content or "").strip() and not msg.attachments and not bot.doc_cache.get_docs_for_message(msg.id):
                         continue
                     candidates.append(msg)
                 candidates.reverse()
@@ -2197,7 +2224,6 @@ async def on_message(message):
                 media_plans = [
                     plan_history_media(
                         msg,
-                        is_bot=msg.author == bot.user,
                         enabled=media_cap > 0,
                         can_see_image=can_see_image,
                         can_see_video=can_see_video,
@@ -2224,105 +2250,56 @@ async def on_message(message):
                 window_media = fit_history_media_to_budget(media_plans[window_start:], HISTORY_MEDIA_BYTES_CAP)
                 bot.history_anchors[message.channel.id] = window[0].id if window else None
 
-                # 3) 창 안 메시지는 위치와 상관없이 같은 모양으로 넣는다: 미디어 전부, 문서는 캐시 기준 전문.
+                # 3) 창 안 메시지를 Gemini 봇과 같은 모양으로 만든다 (위치와 상관없이 늘 같은 모양 → 캐시 유지).
+                #    사용자 메시지는 단톡방처럼 `표시명:` + 본문 + 문서 전문 + 미디어, 봇 답장은 본문 그대로.
+                #    첨부 설명 문구는 넣지 않고, 못 넣은 미디어는 Gemini 봇처럼 그냥 생략한다.
+                speaker_labels = build_speaker_labels(
+                    [(msg.author.id, get_server_display_name(message.guild, msg.author)) for msg in window if msg.author != bot.user]
+                    + [(message.author.id, current_display_name)]
+                )
                 history_buffer = []
                 history_inline_media = 0
                 for msg, planned in zip(window, window_media):
                     is_bot = msg.author == bot.user
-                    role = "assistant" if is_bot else "user"
                     planned_ids = {att.id for att in planned}
-                    content_list = []
+                    text_content = msg.content or ""
+                    media_parts = []
+                    for att in msg.attachments:
+                        ct = att.content_type or ""
+                        if att.id in planned_ids:
+                            part = await load_history_media_part(att)
+                            if part:
+                                media_parts.append(part)
+                                history_inline_media += 1
+                        elif (
+                            not is_bot
+                            and not is_image_attachment(att)
+                            and not ct.startswith(("video", "audio"))
+                            and not bot.doc_cache.has_source(msg.id, "text_file", att.filename)
+                        ):
+                            # 문서는 캐시에 저장만 하고, 아래에서 캐시 기준으로 넣어 요청마다 같은 모양이 되게 한다
+                            extracted_text, _doc_type = await extract_attachment_text(att)
+                            if extracted_text:
+                                bot.doc_cache.store_document("text_file", att.filename, extracted_text, msg.id, msg.channel.id)
                     if is_bot:
-                        text_content = msg.content or ""
                         if ":" in text_content[:20]:
                             parts = text_content.split(": ", 1)
                             if len(parts) > 1 and parts[0] in [get_bot_display_name(), get_bot_username(), "Bot", "Model"]:
                                 text_content = parts[1]
-                        for att in msg.attachments:
-                            ct = att.content_type or ""
-                            if is_image_attachment(att):
-                                text_content += f"\n(Bot sent an image: {att.filename})"
-                            elif ct.startswith("video"):
-                                text_content += "\n(Bot generated a video here)"
-                    else:
-                        text_content = msg.content or ""
-                        for att in msg.attachments:
-                            ct = att.content_type or ""
-                            too_large = (att.size or 0) > MAX_MEDIA_BASE64_MB * 1024 * 1024
-                            if is_image_attachment(att):
-                                text_content += f"\n(User attached an image: {att.filename})"
-                                if att.id in planned_ids:
-                                    raw, mime = await download_binary(att.url)
-                                    if raw:
-                                        mime = infer_attachment_mime(att, mime)
-                                        b64 = base64.b64encode(raw).decode("utf-8")
-                                        content_list.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-                                        history_inline_media += 1
-                                    else:
-                                        text_content += " (image download failed)"
-                            elif ct.startswith("video") or ct.startswith("audio"):
-                                is_video = ct.startswith("video")
-                                inlined = False
-                                if att.id in planned_ids:
-                                    b64, mime = await encode_image(att.url)
-                                    if b64:
-                                        if is_video:
-                                            content_list.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
-                                        else:
-                                            fmt = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else "mp3"
-                                            content_list.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
-                                        history_inline_media += 1
-                                        inlined = True
-                                if not inlined:
-                                    label = "a video" if is_video else "an audio file"
-                                    text_content += f"\n(User attached {label}: {att.filename})"
-                            elif not bot.doc_cache.has_source(msg.id, "text_file", att.filename):
-                                # 문서는 캐시에 저장만 하고, 아래에서 캐시 기준으로 넣어 요청마다 같은 모양이 되게 한다
-                                extracted_text, doc_type = await extract_attachment_text(att)
-                                if extracted_text:
-                                    bot.doc_cache.store_document("text_file", att.filename, extracted_text, msg.id, msg.channel.id)
-                                elif too_large:
-                                    media_type = attachment_media_type(att)
-                                    text_content += f"\n(User attached a {media_type} file: {att.filename}, but it was too large to inline.)"
-                                elif doc_type:
-                                    text_content += f"\n(User attached a {doc_type} file: {att.filename})"
-                        cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=True)
-                        if cached_doc_blocks:
-                            text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
-                        text_content = prepend_user_identity(text_content, message.guild, msg.author, kind="history")
-
-                    if text_content.strip():
-                        content_list.append({"type": "text", "text": text_content})
-                    if not content_list:
+                        if text_content.strip():
+                            history_buffer.append({"role": "assistant", "content": text_content})
+                        if media_parts:
+                            history_buffer.append({"role": "user", "content": [{"type": "text", "text": BOT_MEDIA_NOTE}, *media_parts]})
                         continue
-                    # author 메타: 봇 응답에 응답 대상 마커를 붙이기 위한 후처리용
-                    item_meta = {
-                        "is_bot": is_bot,
-                        "user_info": (None if is_bot else (get_server_display_name(message.guild, msg.author), str(msg.author.id))),
-                    }
-                    history_buffer.append({"role": role, "content": content_list, "_meta": item_meta})
+                    cached_doc_blocks = bot.doc_cache.render_blocks(msg.id, full_content=True)
+                    if cached_doc_blocks:
+                        text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
+                    label = speaker_labels.get(msg.author.id) or get_server_display_name(message.guild, msg.author)
+                    history_buffer.append({"role": "user", "content": [{"type": "text", "text": f"{label}:\n{text_content}"}, *media_parts]})
                 print(
                     f"[HISTORY] window={len(window)} (base {history_limit} + block {history_block}) "
                     f"reason={window_reason} media={history_inline_media}/{media_cap}"
                 )
-
-                # 봇 응답에 [Bot replied to ...] 마커 prefix 추가
-                # history_buffer는 시간순(oldest → newest). 직전(과거) user 메시지를 그 대상으로 추정
-                last_user_info = None
-                for item in history_buffer:
-                    meta = item.get("_meta", {})
-                    if meta.get("is_bot"):
-                        if last_user_info:
-                            for part in item["content"]:
-                                if part.get("type") == "text":
-                                    part["text"] = prepend_bot_target(part["text"], *last_user_info)
-                                    break
-                    else:
-                        if meta.get("user_info"):
-                            last_user_info = meta["user_info"]
-                # _meta는 OpenAI API에 보낼 필요 없으니 제거
-                for item in history_buffer:
-                    item.pop("_meta", None)
 
                 messages.extend(history_buffer)
                 timing_mark(f"history count={len(history_buffer)} inline_media={history_inline_media}")
@@ -2341,7 +2318,7 @@ async def on_message(message):
                     if web_content:
                         doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
                         print(f"[CACHE] webpage 저장: {doc_id} ({url})")
-                        user_text += f"\n\n[Webpage Content: {url}]\n```\n{trim_document_text(web_content)}\n```"
+                        user_text += f'\n\nWebpage "{url}":\n\n{trim_document_text(web_content)}'
                         print(f"[WEB] 웹사이트 내용 읽음: {url}")
                     else:
                         unresolved_urls.append(url)
@@ -2355,7 +2332,7 @@ async def on_message(message):
                         if web_content:
                             doc_id = bot.doc_cache.store_document("webpage", url, web_content, message.id, message.channel.id)
                             print(f"[CACHE] webpage 저장: {doc_id} ({url})")
-                            user_text += f"\n\n[Webpage Content: {url}]\n```\n{trim_document_text(web_content)}\n```"
+                            user_text += f'\n\nWebpage "{url}":\n\n{trim_document_text(web_content)}'
                             print(f"[WEB] Tavily Extract로 읽음: {url}")
                         else:
                             reason = extract_failed.get(url) or failed_by_url.get(url.rstrip("/")) or "본문 없음"
@@ -2405,7 +2382,7 @@ async def on_message(message):
                             if extracted_text:
                                 doc_id = bot.doc_cache.store_document("text_file", att.filename, extracted_text, message.id, message.channel.id)
                                 print(f"[CACHE] {doc_type or 'text'} file 저장: {doc_id} ({att.filename})")
-                                user_text += f"\n\n[Attached File Content: {att.filename}]\n```\n{extracted_text}\n```"
+                                user_text += f'\n\nAttached file "{att.filename}":\n\n{extracted_text}'
                             elif too_large:
                                 media_type = attachment_media_type(att)
                                 user_text += f"\n(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024 * 1024)}MB)"
@@ -2420,12 +2397,14 @@ async def on_message(message):
                     )
                     return
 
-                current_text = prepend_user_identity(user_text, message.guild, message.author, kind="current")
-                current_content.append({"type": "text", "text": f"{format_current_time_marker()}\n{current_text}"})
+                # Gemini 봇과 같은 순서: 시각 줄 → `표시명:` → 본문(웹페이지·문서 포함) → 미디어
+                current_label = speaker_labels.get(message.author.id) or current_display_name
+                current_content.insert(0, {"type": "text", "text": f"{format_current_time_marker()}\n{current_label}:\n{user_text}"})
                 messages.append({"role": "user", "content": current_content})
 
+                search_sources = []  # 이번 답장에 쓰인 검색 결과 → 답장 끝 출처 목록
                 if search_mode == "presearch":
-                    await apply_presearch(messages, message.content)
+                    await apply_presearch(messages, message.content, sources=search_sources)
                     timing_mark("presearch")
 
                 provider_prefs = build_provider_preferences(config)
@@ -2443,6 +2422,7 @@ async def on_message(message):
                         messages,
                         search_mode=search_mode,
                         search_query=message.content,
+                        sources=search_sources,
                         capabilities=caps,
                         provider=provider_prefs,
                         cache_control=cache_control,
@@ -2507,6 +2487,7 @@ async def on_message(message):
                         messages,
                         search_mode=search_mode,
                         search_query=message.content,
+                        sources=search_sources,
                         provider=provider_prefs,
                         cache_control=cache_control,
                         session_id=session_id,
@@ -2516,6 +2497,15 @@ async def on_message(message):
                 if response.startswith(f"{bot_display_name}:"):
                     response = response.replace(f"{bot_display_name}:", "", 1).strip()
                 response = clean_assistant_response_text(response)
+                # 일부 모델(DeepSeek 등)이 대화 기록의 `표시명:` 라벨을 흉내 내 답장 앞에 붙이면 지운다
+                for speaker_label in speaker_labels.values():
+                    if response.startswith(f"{speaker_label}:"):
+                        response = response[len(speaker_label) + 1:].lstrip()
+                        break
+                # Gemini 봇처럼 검색했으면 답장 끝에 출처 목록을 붙인다
+                sources_block = format_search_sources(search_sources, response)
+                if response and sources_block:
+                    response = f"{response}\n\n{sources_block}"
 
                 total_tokens = usage.get("total_tokens", "N/A")
                 prompt_tokens = usage.get("prompt_tokens") or 0
@@ -2542,7 +2532,7 @@ async def on_message(message):
 
             except Exception as e:
                 print(f"❌ 오류: {str(e)}")
-                await message.channel.send(f"❌ 오류: {str(e)}")
+                await message.channel.send(f"오류가 발생했습니다: {str(e)[:1500]}")
 
 # ================= 7. 명령어 =================
 
@@ -2891,7 +2881,7 @@ async def dashboard(interaction: discord.Interaction):
     image_model_status = config.get("fallback_model") or DEFAULT_IMAGE_MODEL or "(none)"
 
     helpers = [
-        f"• **Search:** {describe_search_mode(config, model_meta)}",
+        f"• **Search:** {describe_search_mode(model_meta)}",
         f"• **/image — image model:** `{image_model_status}`",
         f"• **/image — prompt refiner:** `{image_prompt_model_status}`",
         f"• **Image Models discovered:** {count_image_generation_models()}",
@@ -2921,21 +2911,6 @@ async def set_channel(interaction: discord.Interaction):
     config["channel_id"] = interaction.channel_id
     bot.save_config()
     await interaction.response.send_message(f"✅ 활성 채널: {interaction.channel.name}")
-
-@bot.tree.command(name="search", description="웹 검색 기능 ON/OFF")
-async def toggle_search(interaction: discord.Interaction):
-    config = bot.get_config(interaction.guild_id)
-    config["search"] = not config.get("search", False)
-    bot.save_config()
-    state = "ON 🔍" if config["search"] else "OFF"
-    lines = [f"✅ 웹 검색: **{state}**"]
-    if config["search"]:
-        lines.append(f"방식: {describe_search_mode(config, bot.or_client.get_model_info(config['model']))}")
-        if not TAVILY_API_KEY:
-            lines.append("⚠️ 서버에 `TAVILY_API_KEY`가 없어 실제로는 검색하지 않습니다.")
-    lines.append(f"기본 모델: `{config['model']}`")
-    await interaction.response.send_message("\n".join(lines))
-
 
 @bot.tree.command(name="image", description="이미지 생성 (prompt → 텍스트 모델로 다듬은 후 이미지 모델 호출)")
 @app_commands.describe(
