@@ -30,7 +30,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/nr2bj/discord-llmatest
+            ghcr.io/nr2bj/discord-llm:latest
             ghcr.io/nr2bj/discord-llm:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}

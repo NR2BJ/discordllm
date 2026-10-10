@@ -30,7 +30,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/nr2bj/discord-geminiatest
+            ghcr.io/nr2bj/discord-gemini:latest
             ghcr.io/nr2bj/discord-gemini:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
