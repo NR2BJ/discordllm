@@ -17,10 +17,3 @@ NRLLM/llm_doc_cache/
 NRLLM/llm_memory.json
 NRGemini/gemini_recent_images/
 NRLLM/llm_recent_images/
-
-# Node 로컬 의존성
-NRStayVC/node_modules/
-
-# .NET 빌드 산출물
-NRBaekSu/bin/
-NRBaekSu/obj/

@@ -1,3 +1,5 @@
+# Portainer 스택 Web editor에 그대로 붙여넣는 compose.
+# 이미지는 GitHub Actions가 빌드해 ghcr에 올린다(.github/workflows). 되돌리려면 스택 env에 GEMINI_TAG/LLM_TAG=<커밋 해시>.
 services:
   lavalink:
     image: ghcr.io/lavalink-devs/lavalink
@@ -19,11 +21,8 @@ services:
       - /mnt/storage/docker/discord/sb:/opt/lavalink/sb:ro
 
   gemini:
-    build:
-      context: ./NRGemini
-      args:
-        PUID: ${PUID:-1000}
-        PGID: ${PGID:-1000}
+    image: ghcr.io/nr2bj/discord-gemini:${GEMINI_TAG:-latest}
+    pull_policy: always
     user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
     depends_on:
@@ -44,11 +43,8 @@ services:
       - /mnt/storage/docker/discord/sb:/app/sb
 
   llm:
-    build:
-      context: ./NRLLM
-      args:
-        PUID: ${PUID:-1000}
-        PGID: ${PGID:-1000}
+    image: ghcr.io/nr2bj/discord-llm:${LLM_TAG:-latest}
+    pull_policy: always
     user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
     environment:
