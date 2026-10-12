@@ -1540,6 +1540,7 @@ async def create_model_interaction(
     system_instruction=None,
     tools=None,
     thinking_level=None,
+    tool_choice=None,
     response_schema=None,
     response_format=None,
     store=False,
@@ -1554,8 +1555,13 @@ async def create_model_interaction(
         kwargs["system_instruction"] = system_instruction
     if tools:
         kwargs["tools"] = tools
+    generation_config = {}
     if thinking_level is not None:
-        kwargs["generation_config"] = {"thinking_level": thinking_level}
+        generation_config["thinking_level"] = thinking_level
+    if tool_choice is not None:
+        generation_config["tool_choice"] = tool_choice
+    if generation_config:
+        kwargs["generation_config"] = generation_config
     if response_schema is not None:
         kwargs["response_format"] = [
             {"type": "text", "mime_type": "application/json", "schema": response_schema}
@@ -1757,6 +1763,7 @@ async def create_traced_interaction(
     system_instruction,
     thinking_level,
     tools=None,
+    tool_choice=None,
 ):
     request_summary = summarize_interaction_request(
         input_data,
@@ -1778,6 +1785,7 @@ async def create_traced_interaction(
             system_instruction=system_instruction,
             tools=tools,
             thinking_level=thinking_level,
+            tool_choice=tool_choice,
         )
     except Exception as e:
         elapsed_ms = round((time_module.perf_counter() - started) * 1000)
@@ -2850,28 +2858,296 @@ async def call_nano_banana(contents, image_model=None):
             )
             await asyncio.sleep(5)
 
-async def call_gemini(history_contents, text_model=None, thinking_level=None):
-    if not CLIENT:
-        raise RuntimeError("API Client not initialized")
-    if text_model is None:
-        text_model = TEXT_MODEL
-    if thinking_level is None:
-        thinking_level = MAX_THINKING_LEVEL
+# ----------------- 웹 검색: 구글 그라운딩 / Tavily (/search로 선택) -----------------
+# google: Interactions API의 google_search 도구 (기본). tavily: Tavily 검색을 함수 도구로 붙이고 봇이 실행한다.
+# Tavily 키·크레딧·서버 문제면 TAVILY_OUTAGE_COOLDOWN 동안 구글 그라운딩으로 대신한다. 도구 스키마는 LLM·Claude 봇과 같다.
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+SEARCH_MODES = ("google", "tavily")
+DEFAULT_SEARCH_MODE = "google"
+TAVILY_MAX_RESULTS = 5  # 모델이 결과 수를 정하지 않았을 때 쓰는 값
+TAVILY_MAX_RESULTS_CAP = 10  # 모델이 고를 수 있는 결과 수 상한 (토큰 안전장치)
+TAVILY_RESULT_CHARS = 2000  # 결과 하나당 본문 최대 길이 (토큰 안전장치)
+TAVILY_OUTAGE_COOLDOWN = 600
+WEB_SEARCH_MAX_CALLS = 5  # 한 메시지에서 Tavily 검색 호출 총 상한 (크레딧 상한)
+WEB_SEARCH_MAX_ROUNDS = WEB_SEARCH_MAX_CALLS
+TAVILY_TOPICS = ("general", "news")
+TAVILY_TIME_RANGES = ("day", "week", "month", "year")
+TAVILY_SEARCH_DEPTHS = ("basic", "advanced", "fast", "ultra-fast")
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 구글 그라운딩은 모델이 알아서 검색하지만 함수 도구는 언제 쓰는지 알려줘야 한다 (LLM·Claude 봇과 같은 문구)
+TAVILY_SEARCH_RULE = (
+    "- You have a `web_search` tool. Use it for anything time-sensitive or that may have changed after your training "
+    "(news, prices, releases, schedules) instead of guessing. Don't search for casual chat."
+)
 
-    input_data = gemini_contents_to_interaction_steps(history_contents)
-    system_instruction = build_gemini_system_prompt()
-    call_trace = {"sdk_version": GENAI_SDK_VERSION, "calls": []}
+TAVILY_SEARCH_TOOL = {
+    "type": "function",
+    "name": "web_search",
+    "description": (
+        "Search the web (Tavily). Each result has a title, URL, published date when known, and relevant "
+        f"text from the page. You decide how to search. Up to {WEB_SEARCH_MAX_CALLS} searches per message."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query."},
+            "topic": {
+                "type": "string",
+                "enum": list(TAVILY_TOPICS),
+                "description": "general (default): any web page. news: news articles.",
+            },
+            "time_range": {
+                "type": "string",
+                "enum": list(TAVILY_TIME_RANGES),
+                "description": (
+                    "Only results published within this period before now. "
+                    "Cannot be combined with start_date/end_date."
+                ),
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Only results published on or after this date (YYYY-MM-DD).",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Only results published on or before this date (YYYY-MM-DD).",
+            },
+            "search_depth": {
+                "type": "string",
+                "enum": list(TAVILY_SEARCH_DEPTHS),
+                "description": (
+                    "basic (default): balanced relevance and speed. advanced: highest relevance, slower, "
+                    "costs 2 credits instead of 1. fast: lower latency. ultra-fast: lowest latency, "
+                    "one summary per page."
+                ),
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": TAVILY_MAX_RESULTS_CAP,
+                "description": f"Number of results (default {TAVILY_MAX_RESULTS}).",
+            },
+            "country": {
+                "type": "string",
+                "description": (
+                    "Boost results from this country, as a lowercase English country name such as "
+                    "'south korea', 'united states', 'japan'. Applies to topic general."
+                ),
+            },
+            "include_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only return results from these domains.",
+            },
+            "exclude_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Never return results from these domains.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+TAVILY_STATE = {"down_until": 0.0, "reason": None}
+
+
+class TavilyOutage(Exception):
+    """키·크레딧·서버 문제처럼 모델이 옵션을 고쳐도 풀리지 않는 Tavily 실패."""
+
+
+def is_tavily_outage(status):
+    # 400은 모델이 고른 옵션 문제라 모델에게 돌려준다. 401 키, 429 속도, 432/433 크레딧·한도, 5xx·네트워크는 장애로 본다.
+    return status is None or status in (401, 403, 429, 432, 433) or status >= 500
+
+
+def tavily_available():
+    return bool(TAVILY_API_KEY) and time_module.time() >= TAVILY_STATE["down_until"]
+
+
+def mark_tavily_down(reason):
+    TAVILY_STATE["down_until"] = time_module.time() + TAVILY_OUTAGE_COOLDOWN
+    TAVILY_STATE["reason"] = str(reason)[:200]
+    print(f"[SEARCH] Tavily 사용 불가 → {TAVILY_OUTAGE_COOLDOWN // 60}분 동안 구글 그라운딩 사용 ({reason})")
+
+
+def get_search_mode():
+    mode = bot.get_global_config().get("search_mode", DEFAULT_SEARCH_MODE)
+    return mode if mode in SEARCH_MODES else DEFAULT_SEARCH_MODE
+
+
+def describe_search_mode():
+    mode = get_search_mode()
+    if mode == "google":
+        return "구글 그라운딩"
+    if not TAVILY_API_KEY:
+        return "Tavily (TAVILY_API_KEY 없음 → 구글 그라운딩으로 대신)"
+    if not tavily_available():
+        until = datetime.fromtimestamp(TAVILY_STATE["down_until"], KST).strftime("%H:%M")
+        return f"Tavily (장애로 ~{until} KST까지 구글 그라운딩으로 대신: {TAVILY_STATE['reason']})"
+    return "Tavily (모델이 필요할 때 검색)"
+
+
+async def _tavily_post(url, body, timeout_seconds):
+    """Tavily API POST. 반환: (data, 오류 문자열, HTTP 상태 — 네트워크 오류면 None)"""
+    if not TAVILY_API_KEY:
+        return None, "TAVILY_API_KEY가 설정되지 않았습니다.", None
+    headers = {"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=timeout_seconds)
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return None, f"HTTP {resp.status}: {text[:300]}", resp.status
+                return json.loads(text), None, resp.status
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}", None
+
+
+def tavily_search_options(options):
+    """모델이 고른 검색 옵션 중 형식이 맞는 것만 Tavily 요청 필드로 옮긴다.
+
+    옵션 조합은 판단하지 않는다. 잘못된 조합이나 없는 국가명은 Tavily가 400으로 이유를 돌려주고,
+    그 문구가 모델에게 그대로 가서 모델이 고쳐 다시 검색할 수 있다.
+    """
+    options = options or {}
+    picked = {}
+    if options.get("topic") in TAVILY_TOPICS:
+        picked["topic"] = options["topic"]
+    if options.get("time_range") in TAVILY_TIME_RANGES:
+        picked["time_range"] = options["time_range"]
+    for key in ("start_date", "end_date"):
+        value = str(options.get(key) or "").strip()
+        if ISO_DATE_RE.match(value):
+            picked[key] = value
+    if options.get("search_depth") in TAVILY_SEARCH_DEPTHS:
+        picked["search_depth"] = options["search_depth"]
+    try:
+        max_results = int(options.get("max_results") or TAVILY_MAX_RESULTS)
+    except (TypeError, ValueError):
+        max_results = TAVILY_MAX_RESULTS
+    picked["max_results"] = min(max(max_results, 1), TAVILY_MAX_RESULTS_CAP)
+    country = str(options.get("country") or "").strip().lower()
+    if country:
+        picked["country"] = country
+    for key in ("include_domains", "exclude_domains"):
+        domains = options.get(key)
+        if isinstance(domains, str):
+            domains = [domains]
+        if isinstance(domains, list):
+            cleaned = [str(d).strip() for d in domains if str(d).strip()][:20]
+            if cleaned:
+                picked[key] = cleaned
+    return picked
+
+
+async def tavily_search(query, options=None):
+    """Tavily 검색. 반환: {"ok", "results", "credits", "error", "status", "options"(실제로 보낸 검색 옵션)}"""
+    picked = tavily_search_options(options)
+    body = {"query": query, **picked, "include_published_date": True, "include_usage": True}
+    data, error, status = await _tavily_post(TAVILY_SEARCH_URL, body, timeout_seconds=40)
+    if error:
+        return {"ok": False, "results": [], "credits": None, "error": error, "status": status, "options": picked}
+    results = [
+        {
+            "title": item.get("title") or "",
+            "url": item["url"],
+            "content": (item.get("content") or "")[:TAVILY_RESULT_CHARS],
+            "published_date": item.get("published_date"),
+        }
+        for item in data.get("results") or []
+        if item.get("url")
+    ]
+    credits = (data.get("usage") or {}).get("credits")
+    return {"ok": True, "results": results, "credits": credits, "error": None, "status": status, "options": picked}
+
+
+def format_search_results(query, outcome):
+    """모델에게 넘길 검색 결과 텍스트. 실패도 숨기지 않고 그대로 알린다. 검색 시각을 같이 적는다."""
+    if not outcome.get("ok"):
+        return (
+            f"[web_search 실패] query={query!r}: {outcome.get('error')}\n"
+            "옵션을 고쳐 다시 검색해도 된다. 검색 없이 답한다면 최신 정보가 필요한 부분은 확인이 필요하다고 밝혀라."
+        )
+    if not outcome.get("results"):
+        return f"[web_search 결과 없음] query={query!r}"
+    searched_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+    lines = [f"[web_search 결과] query={query!r} (검색 시각: {searched_at})"]
+    for i, item in enumerate(outcome["results"], start=1):
+        date = f" ({item['published_date']})" if item.get("published_date") else ""
+        lines.append(f"{i}. {item['title']}{date}\n   URL: {item['url']}\n   {item['content']}")
+    return "\n".join(lines)
+
+
+def make_web_search_handler(sources, max_calls=WEB_SEARCH_MAX_CALLS):
+    """메시지 하나 동안 쓰는 Tavily web_search 실행기. 반환값: (함수 결과 텍스트, 오류 여부)
+
+    sources에는 검색 결과의 URL·제목만 모은다 (답장 끝 출처 목록용). Tavily 장애는 TavilyOutage로 올린다.
+    """
+    state = {"calls": 0}
+
+    async def handler(args):
+        args = args or {}
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "[web_search 실패] 검색어가 비어 있습니다.", True
+        if state["calls"] >= max_calls:
+            return f"[web_search 중단] 이번 메시지의 검색 한도({max_calls}회)에 도달했습니다. 지금까지 찾은 결과로 답하세요.", True
+        state["calls"] += 1
+        outcome = await tavily_search(query, args)
+        count = len(outcome.get("results") or [])
+        detail = f"credits={outcome.get('credits')}" if outcome.get("ok") else f"error={outcome.get('error')}"
+        print(
+            f"[SEARCH] #{state['calls']} query={query!r} opts={outcome.get('options')} "
+            f"ok={outcome.get('ok')} results={count} {detail}"
+        )
+        if not outcome.get("ok") and is_tavily_outage(outcome.get("status")):
+            raise TavilyOutage(outcome.get("error"))
+        sources.extend({"url": item["url"], "title": item["title"]} for item in outcome.get("results") or [])
+        return format_search_results(query, outcome), not outcome.get("ok")
+
+    return handler
+
+
+def append_search_sources(text, sources, limit=5):
+    """Tavily 검색 출처를 구글 그라운딩과 같은 `**출처:**` 목록으로 붙인다. 본문에 이미 있는 URL·중복은 뺀다."""
+    if not text or not sources or "**출처:**" in text:
+        return text
+    seen = set()
+    citations = []
+    for item in sources:
+        url = (item.get("url") or "").strip()
+        if not url or url in seen or url in text:
+            continue
+        seen.add(url)
+        citations.append({"title": urlsplit(url).netloc.removeprefix("www.") or url, "url": url})
+        if len(citations) >= limit:
+            break
+    return f"{text}\n\n{format_interaction_citations(citations)}" if citations else text
+
+
+def add_call_usage(call_trace, interaction):
+    usage = summarize_interaction_usage(interaction)
+    previous = call_trace.get("usage") or {}
+    call_trace["usage"] = {key: previous.get(key, 0) + value for key, value in usage.items()}
+
+
+async def run_google_search_interaction(call_trace, *, model, input_data, system_instruction, thinking_level):
+    """구글 그라운딩. 검색 결과 뒤 최종 출력이 비면 같은 검색 결과로 한 번 더 생성한다."""
     interaction = await create_traced_interaction(
         call_trace,
         phase="initial",
-        model=text_model,
+        model=model,
         input_data=input_data,
         system_instruction=system_instruction,
         tools=[GOOGLE_SEARCH_TOOL],
         thinking_level=thinking_level,
     )
     token_usage = get_interaction_usage(interaction)
-    call_trace["usage"] = summarize_interaction_usage(interaction)
+    add_call_usage(call_trace, interaction)
 
     if not extract_interaction_text(interaction):
         continuation_steps = collect_search_continuation_steps(interaction)
@@ -2885,17 +3161,100 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
             interaction = await create_traced_interaction(
                 call_trace,
                 phase="search_continuation",
-                model=text_model,
+                model=model,
                 input_data=continuation_input,
                 system_instruction=system_instruction,
                 thinking_level=thinking_level,
             )
             token_usage += get_interaction_usage(interaction)
-            continuation_usage = summarize_interaction_usage(interaction)
-            call_trace["usage"] = {
-                key: call_trace["usage"].get(key, 0) + value for key, value in continuation_usage.items()
-            }
+            add_call_usage(call_trace, interaction)
+    return interaction, token_usage
 
+
+async def run_tavily_search_interaction(call_trace, sources, *, model, input_data, system_instruction, thinking_level):
+    """Tavily 함수 도구 루프. 무상태라 매 왕복마다 이전 입력 + 모델이 낸 단계(thought·function_call 그대로) +
+    function_result를 다시 보낸다. 마지막 왕복은 tool_choice none으로 답만 받는다."""
+    handler = make_web_search_handler(sources)
+    history = list(input_data)
+    system_instruction = f"{system_instruction.rstrip()}\n{TAVILY_SEARCH_RULE}\n"
+    token_usage = 0
+    rounds = 0
+    while True:
+        interaction = await create_traced_interaction(
+            call_trace,
+            phase=f"tavily_{rounds}",
+            model=model,
+            input_data=history,
+            system_instruction=system_instruction,
+            tools=[TAVILY_SEARCH_TOOL],
+            thinking_level=thinking_level,
+            tool_choice="none" if rounds >= WEB_SEARCH_MAX_ROUNDS else None,
+        )
+        token_usage += get_interaction_usage(interaction)
+        add_call_usage(call_trace, interaction)
+        steps = get_interaction_output_value(interaction, "steps", None) or []
+        calls = [step for step in steps if get_interaction_output_value(step, "type", "") == "function_call"]
+        if not calls:
+            return interaction, token_usage
+        rounds += 1
+        history.extend(serialized for serialized in (interaction_step_to_dict(step) for step in steps) if serialized)
+        for call in calls:
+            name = get_interaction_output_value(call, "name", "")
+            if name == "web_search":
+                result, is_error = await handler(get_interaction_output_value(call, "arguments", None) or {})
+            else:
+                result, is_error = f"알 수 없는 도구: {name}", True
+            step = {"type": "function_result", "call_id": get_interaction_output_value(call, "id", ""), "name": name, "result": result}
+            if is_error:
+                step["is_error"] = True
+            history.append(step)
+
+
+async def run_search_interaction(call_trace, sources, *, model, input_data, system_instruction, thinking_level):
+    """/search 설정대로 검색 도구를 붙여 생성한다. 반환: (interaction, token_usage). Tavily 출처는 sources에 모인다."""
+    mode = get_search_mode()
+    if mode == "tavily" and not tavily_available():
+        print(f"[SEARCH] Tavily를 쓸 수 없어 구글 그라운딩 사용 ({'키 없음' if not TAVILY_API_KEY else TAVILY_STATE['reason']})")
+        mode = "google"
+    call_trace["search"] = mode
+    if mode == "tavily":
+        try:
+            return await run_tavily_search_interaction(
+                call_trace, sources, model=model, input_data=input_data,
+                system_instruction=system_instruction, thinking_level=thinking_level,
+            )
+        except TavilyOutage as e:
+            mark_tavily_down(e)
+            sources.clear()
+            call_trace["search"] = "google(fallback)"
+    return await run_google_search_interaction(
+        call_trace, model=model, input_data=input_data,
+        system_instruction=system_instruction, thinking_level=thinking_level,
+    )
+
+
+async def call_gemini(history_contents, text_model=None, thinking_level=None):
+    """반환: (interaction, token_usage, call_trace). Tavily 검색 출처는 call_trace["search_sources"]."""
+    if not CLIENT:
+        raise RuntimeError("API Client not initialized")
+    if text_model is None:
+        text_model = TEXT_MODEL
+    if thinking_level is None:
+        thinking_level = MAX_THINKING_LEVEL
+
+    input_data = gemini_contents_to_interaction_steps(history_contents)
+    system_instruction = build_gemini_system_prompt()
+    call_trace = {"sdk_version": GENAI_SDK_VERSION, "calls": []}
+    sources = []
+    interaction, token_usage = await run_search_interaction(
+        call_trace,
+        sources,
+        model=text_model,
+        input_data=input_data,
+        system_instruction=system_instruction,
+        thinking_level=thinking_level,
+    )
+    call_trace["search_sources"] = sources
     return interaction, token_usage, call_trace
 
 
@@ -4041,7 +4400,10 @@ async def on_message(message):
                 if status == "incomplete":
                     print("[WARN] Gemini interaction이 incomplete 상태로 종료되어 부분 응답을 전송합니다.")
 
-                text_reply = strip_time_marker_echo(extract_interaction_text(response))
+                text_reply = append_search_sources(
+                    strip_time_marker_echo(extract_interaction_text(response)),
+                    call_trace.get("search_sources"),
+                )
                 if not text_reply:
                     error = get_interaction_error_message(response)
                     failure_context = {
@@ -4069,7 +4431,8 @@ async def on_message(message):
                 cache_rate = f" ({cached_tokens * 100 // input_tokens}%)" if input_tokens else ""
                 print(
                     f"[BOT]({server_text_model}): {text_reply} "
-                    f"(Tokens: {token_usage}, In: {input_tokens}, Cached: {cached_tokens}{cache_rate}, Status: {status})"
+                    f"(Tokens: {token_usage}, In: {input_tokens}, Cached: {cached_tokens}{cache_rate}, Status: {status}, "
+                    f"Search: {call_trace.get('search')})"
                 )
                 await send_long_message(message.channel, text_reply)
 
@@ -4147,6 +4510,25 @@ async def set_history(
         f"[OK] {actor_name}님이 Gemini " + ", ".join(changed) + "로 설정했습니다."
     )
 
+@bot.tree.command(name="search", description="웹 검색 방식 선택: 구글 그라운딩 / Tavily (비우면 현재 설정)")
+@app_commands.describe(mode="google: 구글 그라운딩 (기본) / tavily: Tavily 검색 (장애 시 구글로 대신)")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="구글 그라운딩", value="google"),
+    app_commands.Choice(name="Tavily", value="tavily"),
+])
+async def set_search_mode(interaction: discord.Interaction, mode: str = None):
+    if mode is None:
+        await interaction.response.send_message(f"현재 웹 검색: **{describe_search_mode()}**")
+        return
+    if mode == "tavily" and not TAVILY_API_KEY:
+        await temp_reply(interaction, "[ERROR] TAVILY_API_KEY가 설정되지 않아 Tavily를 쓸 수 없습니다.")
+        return
+    bot.get_global_config()["search_mode"] = mode
+    bot.save_config()
+    actor_name = get_server_display_name(interaction.guild, interaction.user)
+    await interaction.response.send_message(f"[OK] {actor_name}님이 웹 검색을 **{describe_search_mode()}**(으)로 바꿨습니다.")
+
+
 @bot.tree.command(name="reset", description="히스토리 초기화")
 async def reset_history(interaction: discord.Interaction):
     if not interaction.guild:
@@ -4207,14 +4589,16 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
 
         contents = [types.Content(role="user", parts=[types.Part(text=f"{format_current_time_marker()}\n"), *parts])]
 
-        response = await create_model_interaction(
+        chat_trace = {"sdk_version": GENAI_SDK_VERSION, "calls": []}
+        chat_sources = []
+        response, token_usage = await run_search_interaction(
+            chat_trace,
+            chat_sources,
             model=TEXT_MODEL,
             input_data=gemini_contents_to_interaction_steps(contents),
             system_instruction=CHAT_SYSTEM_PROMPT,
-            tools=[GOOGLE_SEARCH_TOOL],
             thinking_level=MAX_THINKING_LEVEL,
         )
-        token_usage = get_interaction_usage(response)
 
         status = get_interaction_status(response)
         if status not in {"completed", "incomplete"}:
@@ -4223,15 +4607,18 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
         if status == "incomplete":
             print("  [WARN] Gemini interaction이 incomplete 상태로 종료되어 부분 응답을 전송합니다.")
 
-        text_reply = strip_time_marker_echo(extract_interaction_text(response))
+        text_reply = append_search_sources(strip_time_marker_echo(extract_interaction_text(response)), chat_sources)
 
         if text_reply.strip():
             for chunk in split_discord_message(text_reply):
                 await interaction.followup.send(chunk)
 
-            usage_detail = summarize_interaction_usage(response)
+            usage_detail = chat_trace.get("usage") or {}
             print(f"  [BOT]({TEXT_MODEL}): {text_reply}")
-            print(f"  [TOKEN]: {token_usage} (In: {usage_detail['input']}, Cached: {usage_detail['cached']})")
+            print(
+                f"  [TOKEN]: {token_usage} (In: {usage_detail.get('input', 0)}, Cached: {usage_detail.get('cached', 0)}, "
+                f"Search: {chat_trace.get('search')})"
+            )
         else:
             await interaction.followup.send("[WARN] 응답을 생성하지 못했습니다.")
 
