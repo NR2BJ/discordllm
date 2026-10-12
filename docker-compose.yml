@@ -1,8 +1,11 @@
 # Portainer 스택 Web editor에 그대로 붙여넣는 compose.
 # 이미지는 GitHub Actions가 빌드해 ghcr에 올린다(.github/workflows). 되돌리려면 스택 env에 GEMINI_TAG/LLM_TAG/CLAUDE_TAG=<커밋 해시>.
+name: discord
+
 services:
-  lavalink:
+  discord-lavalink:
     image: ghcr.io/lavalink-devs/lavalink
+    container_name: discord-lavalink
     restart: unless-stopped
     environment:
       SERVER_PORT: 2333
@@ -20,19 +23,20 @@ services:
     volumes:
       - /mnt/storage/docker/discord/sb:/opt/lavalink/sb:ro
 
-  gemini:
+  discord-gemini:
     image: ghcr.io/nr2bj/discord-gemini:${GEMINI_TAG:-latest}
+    container_name: discord-gemini
     pull_policy: always
     user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
     depends_on:
-      - lavalink
+      - discord-lavalink
     environment:
       GEMINI_DISCORD_TOKEN: ${GEMINI_DISCORD_TOKEN}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       CONFIG_FILE: /data/gemini.json
       GEMINI_USE_LAVALINK: "1"
-      LAVALINK_HOST: lavalink
+      LAVALINK_HOST: discord-lavalink
       LAVALINK_PORT: 2333
       LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:-youshallnotpass}
       LAVALINK_SECURE: "0"
@@ -42,8 +46,9 @@ services:
       - /mnt/storage/docker/discord/data:/data
       - /mnt/storage/docker/discord/sb:/app/sb
 
-  llm:
+  discord-llm:
     image: ghcr.io/nr2bj/discord-llm:${LLM_TAG:-latest}
+    container_name: discord-llm
     pull_policy: always
     user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
@@ -55,8 +60,9 @@ services:
     volumes:
       - /mnt/storage/docker/discord/data:/data
 
-  claude:
+  discord-claude:
     image: ghcr.io/nr2bj/discord-claude:${CLAUDE_TAG:-latest}
+    container_name: discord-claude
     pull_policy: always
     user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
