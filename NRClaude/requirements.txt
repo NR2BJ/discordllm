@@ -1,0 +1,8 @@
+discord.py
+anthropic>=1.13,<2
+aiohttp
+beautifulsoup4
+pypdf
+python-docx
+openpyxl
+Pillow

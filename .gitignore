@@ -7,6 +7,8 @@ worklog.md
 # 설정 파일 (볼륨에서 관리)
 NRGemini/server.json
 NRLLM/server.json
+NRClaude/server.json
+NRClaude/claude_guard.json
 
 # 사운드 파일 (볼륨에서 관리)
 NRGemini/sb/
@@ -14,6 +16,7 @@ NRGemini/sb/
 # 문서 캐시 (로컬/볼륨에서 관리)
 NRGemini/gemini_doc_cache/
 NRLLM/llm_doc_cache/
+NRClaude/claude_doc_cache/
 NRLLM/llm_memory.json
 NRGemini/gemini_recent_images/
 NRLLM/llm_recent_images/
