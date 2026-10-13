@@ -105,6 +105,11 @@ _COMMON_RULES = """## General Rules
 - Analyze attached files (images/video/audio) when supported.
 - Keep responses concise and Discord-appropriate."""
 
+HISTORY_TIME_RULE = (
+    "- Earlier user messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
+    "how long ago something was said. Do not copy this label format in your replies."
+)
+
 CURRENT_TIME_RULE = (
     "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
     "automatically; the user did not write it. It is the real current date and time; your training data is older, "
@@ -116,6 +121,7 @@ You are an AI member of this Discord server.
 
 ## Current Time
 {CURRENT_TIME_RULE}
+{HISTORY_TIME_RULE}
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -132,6 +138,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"))
 KST = timezone(timedelta(hours=9))
 DOC_CACHE_DIR = os.environ.get("LLM_DOC_CACHE_DIR", os.path.join(os.path.dirname(CONFIG_FILE), "llm_doc_cache"))
+
+
+def format_sent_time(sent_at):
+    """히스토리 라벨에 붙이는 전송 시각 (KST). 메시지마다 고정된 값이라 요청이 바뀌어도 캐시가 깨지지 않는다."""
+    return sent_at.astimezone(KST).strftime("%m/%d %H:%M")
 
 
 def format_current_time_marker():
@@ -595,6 +606,8 @@ def clean_assistant_response_text(text):
         return text
     # 신규 형식: 모델이 마커를 모방해 응답 첫 줄에 붙인 경우 제거
     text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*", "", text)
+    # 히스토리 라벨 `이름 (MM/DD HH:MM):`을 흉내 낸 경우
+    text = re.sub(r"^[^\n:]{1,60} \(\d{2}/\d{2} \d{2}:\d{2}\):[ \t]*\n?", "", text, count=1)
     text = re.sub(r"^\s*\[CURRENT MESSAGE from [^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*\[Bot replied to [^\]\n]+\]\s*", "", text)
     text = re.sub(r"^\s*\[from [^\]\n]+\]\s*", "", text)
@@ -2295,7 +2308,8 @@ async def on_message(message):
                     if cached_doc_blocks:
                         text_content += "\n\n" + "\n\n".join(cached_doc_blocks)
                     label = speaker_labels.get(msg.author.id) or get_server_display_name(message.guild, msg.author)
-                    history_buffer.append({"role": "user", "content": [{"type": "text", "text": f"{label}:\n{text_content}"}, *media_parts]})
+                    sent_label = f"{label} ({format_sent_time(msg.created_at)})"
+                    history_buffer.append({"role": "user", "content": [{"type": "text", "text": f"{sent_label}:\n{text_content}"}, *media_parts]})
                 print(
                     f"[HISTORY] window={len(window)} (base {history_limit} + block {history_block}) "
                     f"reason={window_reason} media={history_inline_media}/{media_cap}"

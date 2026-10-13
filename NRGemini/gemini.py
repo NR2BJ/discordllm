@@ -194,6 +194,11 @@ RAW_CITATION_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+HISTORY_TIME_RULE = (
+    "- Earlier user messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
+    "how long ago something was said. Do not copy this label format in your replies."
+)
+
 CURRENT_TIME_RULE = (
     "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
     "automatically; the user did not write it. It is the real current date and time; your training data is older, "
@@ -205,6 +210,7 @@ You are an AI member of this Discord server.
 
 ## Current Time
 {CURRENT_TIME_RULE}
+{HISTORY_TIME_RULE}
 
 ## Conversation Context
 - Chat history is for CONTEXT ONLY — to understand the flow, not to recycle.
@@ -1365,6 +1371,8 @@ def should_call_action_router(
 
 
 CURRENT_TIME_MARKER_ECHO_RE = re.compile(r"^\s*\[System time: [^\]\n]+\]\s*")
+# 히스토리 라벨 `이름 (MM/DD HH:MM):`을 모델이 답 첫머리에 흉내 내면 지운다
+SENT_LABEL_ECHO_RE = re.compile(r"^[^\n:]{1,60} \(\d{2}/\d{2} \d{2}:\d{2}\):[ \t]*\n?")
 
 
 def format_current_time_marker():
@@ -1382,8 +1390,14 @@ def format_current_time_marker():
 
 
 def strip_time_marker_echo(text):
-    """모델이 현재 시각 줄을 흉내 내 답변 첫머리에 붙이면 지운다."""
-    return CURRENT_TIME_MARKER_ECHO_RE.sub("", text or "", count=1)
+    """모델이 현재 시각 줄이나 히스토리 라벨을 흉내 내 답변 첫머리에 붙이면 지운다."""
+    text = CURRENT_TIME_MARKER_ECHO_RE.sub("", text or "", count=1)
+    return SENT_LABEL_ECHO_RE.sub("", text, count=1)
+
+
+def format_sent_time(sent_at):
+    """히스토리 라벨에 붙이는 전송 시각 (KST). 메시지마다 고정된 값이라 요청이 바뀌어도 캐시가 깨지지 않는다."""
+    return sent_at.astimezone(KST).strftime("%m/%d %H:%M")
 
 
 def build_gemini_system_prompt():
@@ -1482,10 +1496,14 @@ def merge_adjacent_contents(contents):
 
 
 def label_discord_user_contents(entries):
-    """Add natural speaker labels while keeping Discord IDs out of model input."""
+    """Add natural speaker labels while keeping Discord IDs out of model input.
+
+    entries: (content, user_id, display_name, sent_at). sent_at이 있으면 라벨이 `이름 (MM/DD HH:MM):`
+    (지난 메시지), 없으면 `이름:` (현재 메시지 — 맨 앞 시각 줄이 시간을 알려준다).
+    """
     ordered_user_ids = []
     display_names = {}
-    for content, user_id, display_name in entries:
+    for content, user_id, display_name, _sent_at in entries:
         if content.role != "user" or user_id is None:
             continue
         if user_id not in display_names:
@@ -1504,11 +1522,14 @@ def label_discord_user_contents(entries):
             )
 
     labeled = []
-    for content, user_id, _display_name in entries:
+    for content, user_id, _display_name, sent_at in entries:
         if content.role == "user" and user_id in speaker_labels:
+            label = speaker_labels[user_id]
+            if sent_at is not None:
+                label = f"{label} ({format_sent_time(sent_at)})"
             content = types.Content(
                 role=content.role,
-                parts=[types.Part(text=f"{speaker_labels[user_id]}:\n"), *(content.parts or [])],
+                parts=[types.Part(text=f"{label}:\n"), *(content.parts or [])],
             )
         labeled.append(content)
     return labeled
@@ -4234,6 +4255,7 @@ async def on_message(message):
                             types.Content(role=role, parts=parts),
                             msg.author.id if role == "user" else None,
                             get_server_display_name(message.guild, msg.author) if role == "user" else None,
+                            msg.created_at if role == "user" else None,
                         )
                     )
                     history_texts.append(content)
@@ -4369,6 +4391,7 @@ async def on_message(message):
                         types.Content(role="user", parts=current_parts),
                         message.author.id,
                         current_display_name,
+                        None,
                     )
                 ]
                 labeled_contents = label_discord_user_contents(conversation_entries)
