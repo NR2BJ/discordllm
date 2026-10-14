@@ -126,6 +126,9 @@ DEEP_RESEARCH_AGENTS = {
 DEEP_RESEARCH_POLL_INTERVAL_SECONDS = 10
 DEEP_RESEARCH_STATUS_LOG_INTERVAL_SECONDS = 300
 GEMINI_API_TIMEOUT_SECONDS = 120.0
+# 대화 답장(채널·/chat, 검색 왕복 포함)은 따로 길게 둔다. 실측(2026-10-15, Argon 최고 추론): 성공 18~106초로
+# 대화 길이와 무관하게 들쭉날쭉하고, 120초 타임아웃은 그 꼬리였다.
+GEMINI_TEXT_TIMEOUT_SECONDS = 300.0
 GEMINI_IMAGE_TIMEOUT_SECONDS = 300.0
 GEMINI_IMAGE_MAX_ATTEMPTS = 2
 ROUTING_MODEL = os.environ.get(
@@ -1815,6 +1818,7 @@ async def create_traced_interaction(
             tools=tools,
             thinking_level=thinking_level,
             tool_choice=tool_choice,
+            timeout_seconds=GEMINI_TEXT_TIMEOUT_SECONDS,
         )
     except Exception as e:
         elapsed_ms = round((time_module.perf_counter() - started) * 1000)
@@ -1828,7 +1832,7 @@ async def create_traced_interaction(
         print(
             f"[ERROR] Gemini {phase} interaction failed "
             f"trace={json.dumps(call_trace, ensure_ascii=False, default=str, separators=(',', ':'))} "
-            f"exception={describe_gemini_exception(e)}"
+            f"exception={describe_gemini_exception(e, GEMINI_TEXT_TIMEOUT_SECONDS)}"
         )
         raise
 
@@ -4472,7 +4476,7 @@ async def on_message(message):
                 print("-------")
 
             except Exception as e:
-                error_detail = describe_gemini_exception(e)
+                error_detail = describe_gemini_exception(e, GEMINI_TEXT_TIMEOUT_SECONDS)
                 print(f"[CRITICAL] Error: {error_detail}")
                 traceback.print_exc()
                 await message.channel.send(f"오류가 발생했습니다: {error_detail[:1500]}")
