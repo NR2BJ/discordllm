@@ -92,7 +92,9 @@ print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 
 FLASH_MODEL = "gemini-3.8-flash"
 FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
-IMAGE_MODEL = "gemini-3.1-flash-image"
+ARGON_MODEL = "gemini-4-argon"
+# 이미지 생성·편집은 Nano Banana 2.1 하나만 쓴다 (서버 설정에 예전 모델이 남아 있어도 get_config가 덮어쓴다)
+IMAGE_MODEL = "gemini-nano-banana-2.1"
 MAX_THINKING_LEVEL = "high"
 
 AVAILABLE_MODELS = {
@@ -105,6 +107,12 @@ AVAILABLE_MODELS = {
     "flash": {
         "display_name": "Flash 최고 추론 (Gemini 3.8 Flash)",
         "text": FLASH_MODEL,
+        "image": IMAGE_MODEL,
+        "thinking_level": MAX_THINKING_LEVEL,
+    },
+    "argon": {
+        "display_name": "Argon 최고 추론 (Gemini 4 Argon)",
+        "text": ARGON_MODEL,
         "image": IMAGE_MODEL,
         "thinking_level": MAX_THINKING_LEVEL,
     },
@@ -3367,7 +3375,7 @@ class GeminiBot(commands.Bot):
                 "action_router": DEFAULT_ACTION_ROUTER_ENABLED,
             }
         self.server_configs[gid].setdefault("text_model", TEXT_MODEL)
-        self.server_configs[gid].setdefault("image_model", IMAGE_MODEL)
+        self.server_configs[gid]["image_model"] = IMAGE_MODEL
         self.server_configs[gid]["thinking_level"] = MAX_THINKING_LEVEL
         self.server_configs[gid].setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("history_block", DEFAULT_HISTORY_BLOCK)
