@@ -2077,7 +2077,7 @@ async def respond(message, config):
     if response:
         await send_long_message(message.channel, response)
     await send_images(message.channel, result.images)
-    if result.image_blocked:
+    if result.image_blocked and not result.images:  # 막힌 뒤 모델이 고쳐 그린 경우는 결과가 나왔으니 알리지 않는다
         await message.channel.send("⚠️ 이미지가 OpenAI 안전 필터에 막혔습니다. 요청을 바꿔 다시 시도해 주세요.")
     elif not response and not result.images:
         await message.channel.send(f"⚠️ 빈 응답을 받았습니다 (stop_reason: {result.stop_reason})")
