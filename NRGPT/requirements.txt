@@ -1,0 +1,8 @@
+discord.py
+openai>=3.42,<4
+aiohttp
+beautifulsoup4
+pypdf
+python-docx
+openpyxl
+Pillow
