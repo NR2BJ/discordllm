@@ -273,6 +273,8 @@ VOICE_RECONNECT_DELAY = 3.0
 VOICE_STATE_REJOIN_DELAY = 8.0
 VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_LIBRARY_RECOVERY_GRACE = 75.0
+# 빈 채널에 사람이 처음 들어올 때, 연결이 이 시간(초)보다 오래됐으면 음성 연결을 새로 맺는다 (refresh_lavalink_voice)
+VOICE_REFRESH_MIN_AGE = 1800.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
 VOICE_HEALTH_RECOVERY = os.environ.get("GEMINI_VOICE_HEALTH_RECOVERY", "0") == "1"
@@ -306,6 +308,9 @@ def format_metric(value):
     if isinstance(value, float):
         return f"{value:.3f}"
     return str(value)
+
+_voice_refreshing = set()  # 음성 연결을 새로 맺는 중인 서버
+
 
 def is_lavalink_player(vc):
     return LAVALINK_ENABLED and isinstance(vc, mafic.Player)
@@ -765,7 +770,8 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
             extra=f"target={format_channel_ref(channel)} move={move}",
         )
         if vc and voice_is_connected(vc):
-            if move and vc.channel != channel:
+            moved = move and vc.channel != channel
+            if moved:
                 old_channel = vc.channel
                 if is_lavalink_player(vc):
                     await vc.disconnect(force=True)
@@ -785,7 +791,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
                     extra=f"from={format_channel_ref(old_channel)} to={format_channel_ref(channel)}",
                 )
             await apply_voice_preferences(guild, channel)
-            bot.mark_voice_connected(guild.id)
+            bot.mark_voice_connected(guild.id, new_connection=moved)
             await ensure_silence_keepalive(guild, vc, reason=reason)
             return vc
 
@@ -823,6 +829,43 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
         bot.mark_voice_connected(guild.id)
         await ensure_silence_keepalive(guild, vc, reason=reason)
         return vc
+
+async def refresh_lavalink_voice(guild, channel_id, *, reason):
+    """Lavalink 음성 연결을 끊고 새로 맺는다.
+
+    실측(2026-10-16~11-02): Lavalink 4.2.2에서 음성 게이트웨이가 `Connection reset by peer`로 끊긴 뒤,
+    connected=True·ping 정상·트랙 재생 중인데 소리만 Discord로 안 나가는 상태가 재시작 전까지 16일 이어졌다.
+    상태값으로는 감지할 수 없어서, 듣는 사람이 생기는 시점에 연결을 새로 맺는다.
+    """
+    if guild.id in _voice_refreshing:
+        return
+    _voice_refreshing.add(guild.id)
+    try:
+        vc = guild.voice_client
+        print(f"[LAVALINK] 음성 연결 새로 맺기 ({reason}): guild={guild.id}")
+        if vc:
+            await cleanup_stale_voice_client(vc, guild)
+        await ensure_voice_connection(guild, channel_id, move=True, reason=reason)
+        bot.reset_voice_retry(guild.id)
+    except Exception as e:
+        print(f"[LAVALINK] 음성 연결 새로 맺기 실패 ({reason}): guild={guild.id} {e}")
+    finally:
+        _voice_refreshing.discard(guild.id)
+
+
+def should_refresh_voice_on_join(member, before, after):
+    """빈 채널에 사람이 처음 들어왔고, 봇이 재생 중이 아니며, 연결이 오래됐으면 True."""
+    guild = member.guild
+    vc = guild.voice_client
+    if member.bot or not is_lavalink_player(vc) or after.channel is None or before.channel == after.channel:
+        return False
+    if after.channel != vc.channel or bot.get_voice_target(guild.id) != after.channel.id:
+        return False
+    if sum(1 for person in after.channel.members if not person.bot) != 1 or voice_is_playing(vc):
+        return False
+    connected_age = bot.get_voice_connected_age(guild.id)
+    return connected_age is not None and connected_age >= VOICE_REFRESH_MIN_AGE
+
 
 # ================= 사운드보드 유틸리티 =================
 
@@ -3511,9 +3554,11 @@ class GeminiBot(commands.Bot):
     def reset_voice_retry(self, guild_id):
         self.voice_retry_after[str(guild_id)] = 0.0
 
-    def mark_voice_connected(self, guild_id):
+    def mark_voice_connected(self, guild_id, *, new_connection=True):
+        """new_connection=False: 이미 붙어 있는 연결을 확인만 한 경우 (연결 나이를 유지한다)."""
         gid = str(guild_id)
-        self.voice_connected_at[gid] = time_module.monotonic()
+        if new_connection or gid not in self.voice_connected_at:
+            self.voice_connected_at[gid] = time_module.monotonic()
         self.voice_disconnected_at.pop(gid, None)
         self.voice_bad_state_counts[gid] = 0
 
@@ -4076,6 +4121,8 @@ async def on_track_exception(event):
 async def on_voice_state_update(member, before, after):
     """봇의 VC 상태 변화 추적: 목표 채널 저장 + 끊긴 경우 빠른 재접속."""
     if member != bot.user:
+        if should_refresh_voice_on_join(member, before, after):
+            await refresh_lavalink_voice(member.guild, after.channel.id, reason="first_listener_joined")
         return
 
     log_voice_snapshot(
