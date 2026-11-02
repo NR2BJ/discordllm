@@ -109,6 +109,7 @@ IMAGE_SIZES = ("auto", "1024x1024", "1536x1024", "1024x1536")
 DEFAULT_IMAGE_SIZE = "auto"
 IMAGE_TOKEN_PRICE = (5.0, 8.0, 30.0)  # 100만 토큰당: 텍스트 입력, 이미지 입력, 이미지 출력
 IMAGE_MAX_PER_MESSAGE = 4  # 메시지 하나에서 만드는 이미지 상한 (비용 안전장치)
+IMAGE_PROMPT_DISPLAY_CHARS = 1500  # 임베드에 보여주는 프롬프트 길이
 
 # 🔢 [수치 조절 구역]
 # 히스토리는 블록 단위로 자른다: 창이 HISTORY_LIMIT개에서 시작해 HISTORY_LIMIT + 블록 - 1개까지 뒤로만 늘고,
@@ -1399,6 +1400,7 @@ class ReplyResult:
     stop_reason: Optional[str]
     backend: str
     images: list = field(default_factory=list)  # 생성된 이미지 bytes
+    image_prompts: list = field(default_factory=list)  # 이미지 모델에 실제로 들어간 프롬프트
     image_blocked: bool = False
     refusal_explanation: Optional[str] = None
 
@@ -1520,6 +1522,7 @@ async def run_gpt(model, messages, *, effort, user_hash, cache_key, backend, ima
     search_handler = make_web_search_handler(sources=sources) if backend == "tavily" else None
     convo = [DEVELOPER_ITEM] + list(messages)
     images = []
+    image_prompts = []
     image_blocked = False
     cited_urls = []
     tool_rounds = 0
@@ -1550,13 +1553,13 @@ async def run_gpt(model, messages, *, effort, user_hash, cache_key, backend, ima
             if e.code != "moderation_blocked":
                 raise
             print(f"[IMAGE] 안전 필터 차단: {e}")
-            return ReplyResult(text="", stop_reason="moderation_blocked", backend=backend, images=images, image_blocked=True)
+            return ReplyResult(text="", stop_reason="moderation_blocked", backend=backend, images=images, image_prompts=image_prompts, image_blocked=True)
         tally.add_response(model, response)
         if response.status == "failed":
             error = response.error
             code = getattr(error, "code", None)
             if code == "moderation_blocked":
-                return ReplyResult(text="", stop_reason=code, backend=backend, images=images, image_blocked=True)
+                return ReplyResult(text="", stop_reason=code, backend=backend, images=images, image_prompts=image_prompts, image_blocked=True)
             raise ResponseFailed(code, getattr(error, "message", "알 수 없는 오류"))
 
         answer_parts = []
@@ -1569,6 +1572,8 @@ async def run_gpt(model, messages, *, effort, user_hash, cache_key, backend, ima
                 if item.result:
                     images.append(base64.b64decode(item.result))
                     tally.images += 1
+                    if getattr(item, "revised_prompt", None):
+                        image_prompts.append(item.revised_prompt)
                 else:
                     error = getattr(item, "error", None)
                     code = getattr(error, "code", None)
@@ -1615,6 +1620,7 @@ async def run_gpt(model, messages, *, effort, user_hash, cache_key, backend, ima
             stop_reason=incomplete or response.status,
             backend=backend,
             images=images,
+            image_prompts=image_prompts,
             image_blocked=image_blocked,
         )
 
@@ -1767,6 +1773,19 @@ async def send_images(channel, images):
         files.append(discord.File(io.BytesIO(data), filename=f"gpt_image_{index}.{extension}"))
     if files:
         await channel.send(files=files)
+
+
+async def send_image_prompts(channel, prompts):
+    """이미지 모델에 들어간 프롬프트를 임베드로 보인다. 본문이 없는 메시지라 히스토리에 들어가지 않는다."""
+    if not prompts:
+        return
+    description = "\n\n".join(prompts)
+    if len(description) > IMAGE_PROMPT_DISPLAY_CHARS:
+        description = description[:IMAGE_PROMPT_DISPLAY_CHARS].rstrip() + "..."
+    try:
+        await channel.send(embed=discord.Embed(title="이미지 생성 완료", description=description))
+    except discord.Forbidden:
+        print("[IMAGE] 프롬프트 임베드를 못 보냄 (Embed Links 권한 필요)")
 
 
 async def read_current_attachments(message, user_text):
@@ -2077,6 +2096,7 @@ async def respond(message, config):
     if response:
         await send_long_message(message.channel, response)
     await send_images(message.channel, result.images)
+    await send_image_prompts(message.channel, result.image_prompts)
     if result.image_blocked and not result.images:  # 막힌 뒤 모델이 고쳐 그린 경우는 결과가 나왔으니 알리지 않는다
         await message.channel.send("⚠️ 이미지가 OpenAI 안전 필터에 막혔습니다. 요청을 바꿔 다시 시도해 주세요.")
     elif not response and not result.images:
