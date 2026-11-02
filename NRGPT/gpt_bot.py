@@ -1483,17 +1483,21 @@ class UsageTally:
 async def call_openai(**request):
     # 이미지·사고 시간이 길어 스트리밍으로 받는다 (긴 요청의 연결 끊김 방지). 결과는 한 번에 쓴다.
     try:
-        stream = await bot.openai.responses.create(stream=True, **request)
-        async for event in stream:
-            if event.type in ("response.completed", "response.incomplete", "response.failed"):
-                return event.response
-            if event.type == "error":
-                raise ResponseFailed(event.code, event.message)
+        final = None
+        # 끝 이벤트를 받아도 스트림을 끝까지 읽는다 (중간에 빠져나가면 연결 정리 중 오류가 난다)
+        async with await bot.openai.responses.create(stream=True, **request) as stream:
+            async for event in stream:
+                if event.type in ("response.completed", "response.incomplete", "response.failed"):
+                    final = event.response
+                elif event.type == "error":
+                    raise ResponseFailed(event.code, event.message)
     except openai.APIError as e:
         if getattr(e, "code", None) == "moderation_blocked":
             raise ResponseFailed("moderation_blocked", e.message) from e
         raise
-    raise RuntimeError("OpenAI 스트림이 응답 없이 끝났습니다.")
+    if final is None:
+        raise RuntimeError("OpenAI 스트림이 응답 없이 끝났습니다.")
+    return final
 
 
 def build_image_tool(config):
@@ -1603,9 +1607,8 @@ async def run_gpt(model, messages, *, effort, user_hash, cache_key, backend, ima
             continue
 
         if cited_urls:
-            # OpenAI 기본 검색: 답에 인용된 출처를 앞에 둔다
-            cited = set(cited_urls)
-            sources[:] = [{"url": url} for url in cited_urls] + [item for item in sources if item.get("url") not in cited]
+            # OpenAI 기본 검색: 참고만 한 페이지는 빼고 답에 인용된 출처만 남긴다
+            sources[:] = [{"url": url} for url in cited_urls]
         incomplete = getattr(response.incomplete_details, "reason", None) if response.incomplete_details else None
         return ReplyResult(
             text="".join(answer_parts).strip(),
