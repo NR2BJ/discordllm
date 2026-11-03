@@ -23,6 +23,8 @@ from typing import Optional
 from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 
+from prompt_inject import PromptInjector, resolve_inject_path
+
 try:
     from PIL import Image, ImageOps
 except Exception:
@@ -177,7 +179,7 @@ DEEPSEEK_RULES = (
     "link from the conversation.",
     "You cannot create images, watch videos, or listen to audio. If asked, say so.",
 )
-DEEPSEEK_SYSTEM_PROMPT = SYSTEM_PROMPT.rstrip() + "\n" + "\n".join(f"- {rule}" for rule in DEEPSEEK_RULES) + "\n"
+DEEPSEEK_BASE_PROMPT = SYSTEM_PROMPT.rstrip() + "\n" + "\n".join(f"- {rule}" for rule in DEEPSEEK_RULES) + "\n"
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -185,6 +187,19 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"
 DATA_DIR = os.path.dirname(CONFIG_FILE)
 DOC_CACHE_DIR = os.environ.get("DEEPSEEK_DOC_CACHE_DIR", os.path.join(DATA_DIR, "deepseek_doc_cache"))
 KST = timezone(timedelta(hours=9))
+
+# dsh-purge 의 prompt-inject.md 자리를 봇 쪽으로 옮긴 것. 본문은 파일에 있고 여기서는 읽기만 한다.
+# 파일이 바뀌면 다음 요청부터 반영되고, 그대로면 같은 문자열이 유지되어 DeepSeek 접두사 캐시가 깨지지 않는다.
+PROMPT_INJECT = PromptInjector(
+    resolve_inject_path(BASE_DIR, DATA_DIR),
+    DEEPSEEK_BASE_PROMPT,
+    label="NRDeepSeek",
+)
+
+
+def system_prompt():
+    """요청마다 부른다 (베이스 프롬프트 + ~/.dsh/prompt-inject.md 에 해당하는 파일)."""
+    return PROMPT_INJECT.system_prompt()
 
 
 def format_sent_time(sent_at):
@@ -1338,7 +1353,7 @@ async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, so
     while True:
         request = {
             "model": model["id"],
-            "instructions": DEEPSEEK_SYSTEM_PROMPT,
+            "instructions": system_prompt(),
             "input": convo,
             "tools": tools,
             "max_output_tokens": MAX_OUTPUT_TOKENS_DEEP if effort == "max" else MAX_OUTPUT_TOKENS,
@@ -1425,6 +1440,7 @@ class DeepSeekBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
+        print(PROMPT_INJECT.status_line())
         print("✅ DeepSeek Bot 준비 완료")
 
     def get_config(self, guild_id):

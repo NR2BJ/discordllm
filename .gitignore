@@ -22,6 +22,7 @@ NRLLM/llm_doc_cache/
 NRClaude/claude_doc_cache/
 NRGPT/gpt_doc_cache/
 NRDeepSeek/deepseek_doc_cache/
+NRDeepSeek/.nr-purge/
 NRLLM/llm_memory.json
 NRGemini/gemini_recent_images/
 NRLLM/llm_recent_images/

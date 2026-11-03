@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install --no-cache-dir -r requirements.txt
-COPY --chown=${PUID}:${PGID} deepseek_bot.py .
+COPY --chown=${PUID}:${PGID} deepseek_bot.py prompt_inject.py nr_purge.py prompt-inject.md ./
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/app
