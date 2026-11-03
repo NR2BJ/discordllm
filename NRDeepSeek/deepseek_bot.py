@@ -23,7 +23,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 
-from prompt_inject import PromptInjector, resolve_inject_path
+from prompt_inject import REFUSAL_NUDGE, PromptInjector, refusal_hits, resolve_inject_path
 
 try:
     from PIL import Image, ImageOps
@@ -190,6 +190,12 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(BASE_DIR, "server.json"
 DATA_DIR = os.path.dirname(CONFIG_FILE)
 DOC_CACHE_DIR = os.environ.get("DEEPSEEK_DOC_CACHE_DIR", os.path.join(DATA_DIR, "deepseek_doc_cache"))
 KST = timezone(timedelta(hours=9))
+
+# 거절 가드 재생성 횟수. 0 이면 끔. 재생성은 거절 문구가 나왔을 때만 1회 더 호출한다.
+try:
+    REFUSAL_RETRIES = max(0, int(os.environ.get("DEEPSEEK_REFUSAL_RETRIES", "1")))
+except ValueError:
+    REFUSAL_RETRIES = 1
 
 # dsh-purge 의 prompt-inject.md 자리를 봇 쪽으로 옮긴 것. 본문은 파일에 있고 여기서는 읽기만 한다.
 # 파일이 바뀌면 다음 요청부터 반영되고, 그대로면 같은 문자열이 유지되어 DeepSeek 접두사 캐시가 깨지지 않는다.
@@ -1360,7 +1366,7 @@ async def call_deepseek(**request):
     return final
 
 
-async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, sources):
+async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, sources, extra=""):
     """DeepSeek 호출 + 도구 루프. backend: deepseek | tavily (web_search 도구), None이면 검색 없이
 
     서버가 상태를 저장하지 않아 도구 왕복은 응답 항목(사고 포함)을 그대로 다시 보낸다.
@@ -1373,7 +1379,7 @@ async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, so
     while True:
         request = {
             "model": model["id"],
-            "instructions": system_prompt(),
+            "instructions": system_prompt() + extra,
             "input": convo,
             "tools": tools,
             "max_output_tokens": MAX_OUTPUT_TOKENS_DEEP if effort == "max" else MAX_OUTPUT_TOKENS,
@@ -1391,7 +1397,7 @@ async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, so
 
         answer_parts = []
         function_calls = []
-        for item in response.output:
+        for item in (response.output or []):
             if item.type == "function_call":
                 function_calls.append(item)
             elif item.type == "message":
@@ -1401,7 +1407,7 @@ async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, so
 
         if function_calls and response.status == "completed":
             tool_rounds += 1
-            convo.extend(item.to_dict() for item in response.output)
+            convo.extend(item.to_dict() for item in (response.output or []))
             for call in function_calls:
                 try:
                     args = json.loads(call.arguments or "{}")
@@ -1424,11 +1430,36 @@ def search_fallback_order(config):
 
 async def generate_reply(model, messages, *, effort, user_hash, config, tally, sources):
     """답을 만든다. 검색 장애가 나면 다른 검색으로, 둘 다 안 되면 검색 없이 처음부터 다시 만든다."""
+    result = await generate_reply_once(
+        model, messages, effort=effort, user_hash=user_hash, config=config, tally=tally, sources=sources,
+    )
+    # dsh-purge 식 거절 가드: 완성된 답에 거절·회피 문구가 있으면 그 답을 assistant 턴으로 붙이고
+    # 같은 요청을 다시 처리시킨다. 프롬프트만으로는 확률적으로 새는 부분을 여기서 잡는다.
+    for attempt in range(1, REFUSAL_RETRIES + 1):
+        hits = refusal_hits(result.text)
+        if not hits and result.text:
+            break
+        reason = ", ".join(hits) if hits else "빈 답"
+        print(f"[PURGE] 거절 문구 감지({reason}) → 재생성 {attempt}/{REFUSAL_RETRIES}")
+        sources.clear()
+        # 거절 답을 히스토리에 넣지 않는다: 모델이 자기 거절을 보고 "반복 요청해도 같다"로 굳는 걸 막는다.
+        retry = await generate_reply_once(
+            model, messages, effort=effort, user_hash=user_hash, config=config, tally=tally,
+            sources=sources, extra=REFUSAL_NUDGE,
+        )
+        if not retry.text:
+            break
+        result = retry
+    return result
+
+
+async def generate_reply_once(model, messages, *, effort, user_hash, config, tally, sources, extra=""):
     backends = search_fallback_order(config) + [None]
     for backend in backends:
         try:
             return await run_deepseek(
-                model, messages, effort=effort, user_hash=user_hash, backend=backend, tally=tally, sources=sources,
+                model, messages, effort=effort, user_hash=user_hash, backend=backend, tally=tally,
+                sources=sources, extra=extra,
             )
         except SearchOutage as e:
             mark_search_down(e.backend, e.reason)
