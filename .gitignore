@@ -11,6 +11,7 @@ NRClaude/server.json
 NRClaude/claude_guard.json
 NRGPT/server.json
 NRGPT/gpt_guard.json
+NRDeepSeek/server.json
 
 # 사운드 파일 (볼륨에서 관리)
 NRGemini/sb/
@@ -20,6 +21,7 @@ NRGemini/gemini_doc_cache/
 NRLLM/llm_doc_cache/
 NRClaude/claude_doc_cache/
 NRGPT/gpt_doc_cache/
+NRDeepSeek/deepseek_doc_cache/
 NRLLM/llm_memory.json
 NRGemini/gemini_recent_images/
 NRLLM/llm_recent_images/
