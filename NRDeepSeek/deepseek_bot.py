@@ -69,6 +69,9 @@ SEARCH_OUTAGE_COOLDOWN = 600  # 검색 키·잔액·서버 문제가 나면 이 
 WEB_SEARCH_MAX_CALLS = 5  # 한 메시지에서 검색 호출 총 상한
 FETCH_MAX_CALLS = 5  # 한 메시지에서 페이지 읽기 호출 총 상한
 TOOL_MAX_ROUNDS = WEB_SEARCH_MAX_CALLS + FETCH_MAX_CALLS  # 한 번에 하나씩 불러도 한도를 다 쓸 수 있게 왕복 수를 맞춘다
+# DeepSeek는 붐빌 때 연결만 열어 두고 keep-alive로 최대 10분 기다리게 한다. 그동안 채널 잠금이 잡혀
+# 뒤 메시지가 전부 막히므로, 이벤트가 이 시간(초) 동안 하나도 안 오면 포기한다.
+STREAM_IDLE_TIMEOUT = 150
 SEARCH_MODES = {"deepseek": "DeepSeek 검색", "tavily": "Tavily"}
 DEFAULT_SEARCH_MODE = "deepseek"
 
@@ -1252,6 +1255,16 @@ class ReplyResult:
     backend: Optional[str]
 
 
+class DeepSeekBusy(Exception):
+    """DeepSeek 서버가 붐벼서 답을 못 받음 (503·429·응답 없음)."""
+
+
+def is_busy_error(error):
+    if isinstance(error, (DeepSeekBusy, openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
+        return True
+    return isinstance(error, openai.APIStatusError) and error.status_code in (502, 503, 504)
+
+
 class ResponseFailed(Exception):
     """DeepSeek가 응답을 끝내지 못함 (response.failed)."""
 
@@ -1328,13 +1341,20 @@ class UsageTally:
 async def call_deepseek(**request):
     # 사고 시간이 길 수 있어 스트리밍으로 받는다 (긴 요청의 연결 끊김 방지). 결과는 한 번에 쓴다.
     final = None
-    # 끝 이벤트를 받아도 스트림을 끝까지 읽는다 (중간에 빠져나가면 연결 정리 중 오류가 난다)
-    async with await bot.deepseek.responses.create(stream=True, **request) as stream:
-        async for event in stream:
-            if event.type in ("response.completed", "response.incomplete", "response.failed"):
-                final = event.response
-            elif event.type == "error":
-                raise ResponseFailed(getattr(event, "code", None), getattr(event, "message", ""))
+    loop = asyncio.get_running_loop()
+    try:
+        # 연결·재시도 포함 첫 이벤트까지, 그 뒤로는 이벤트 사이 간격마다 STREAM_IDLE_TIMEOUT
+        async with asyncio.timeout(STREAM_IDLE_TIMEOUT) as deadline:
+            # 끝 이벤트를 받아도 스트림을 끝까지 읽는다 (중간에 빠져나가면 연결 정리 중 오류가 난다)
+            async with await bot.deepseek.responses.create(stream=True, **request) as stream:
+                async for event in stream:
+                    deadline.reschedule(loop.time() + STREAM_IDLE_TIMEOUT)
+                    if event.type in ("response.completed", "response.incomplete", "response.failed"):
+                        final = event.response
+                    elif event.type == "error":
+                        raise ResponseFailed(getattr(event, "code", None), getattr(event, "message", ""))
+    except TimeoutError:
+        raise DeepSeekBusy(f"{STREAM_IDLE_TIMEOUT}초 동안 응답이 없음") from None
     if final is None:
         raise RuntimeError("DeepSeek 스트림이 응답 없이 끝났습니다.")
     return final
@@ -1753,6 +1773,10 @@ async def on_message(message):
             try:
                 await respond(message, config)
             except Exception as e:
+                if is_busy_error(e):
+                    print(f"⏳ DeepSeek 혼잡: {type(e).__name__}: {e}")
+                    await message.channel.send("⏳ DeepSeek 서버가 붐벼서 답을 못 받았습니다. 잠시 뒤 다시 보내 주세요.")
+                    return
                 print(f"❌ 오류: {e}")
                 traceback.print_exc()
                 await message.channel.send(f"오류가 발생했습니다: {str(e)[:1500]}")
