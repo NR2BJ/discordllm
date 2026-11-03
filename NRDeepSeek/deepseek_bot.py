@@ -536,14 +536,14 @@ def select_history_window(
     if window >= base + block:
         start += ((window - base) // block) * block
         reason = "rollover"
-    if media_cap > 0:
-        early_start = max(start, total - base)
-        over_now = sum(media_counts[start:]) > media_cap or sum(media_bytes[start:]) > media_bytes_cap
-        fits_after = (
-            sum(media_counts[early_start:]) <= media_cap and sum(media_bytes[early_start:]) <= media_bytes_cap
-        )
-        if over_now and early_start > start and fits_after:
-            start, reason = early_start, "media"
+    def over_cap(begin):
+        # media_cap 0은 개수 상한 없이 창에 담긴 만큼 쓴다 (용량 상한은 그대로 본다)
+        over_count = media_cap > 0 and sum(media_counts[begin:]) > media_cap
+        return over_count or sum(media_bytes[begin:]) > media_bytes_cap
+
+    early_start = max(start, total - base)
+    if early_start > start and over_cap(start) and not over_cap(early_start):
+        start, reason = early_start, "media"
     return start, reason
 
 
@@ -1447,8 +1447,9 @@ class DeepSeekBot(commands.Bot):
             # 모델이 @everyone·역할 멘션을 따라 써도 실제로 알림이 가지 않게 한다
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False),
         )
+        # 재시도하지 않는다: 503(혼잡) 등이 나면 바로 안내하고 채널 잠금을 풀어 다음 메시지를 받는다
         self.deepseek = openai.AsyncOpenAI(
-            api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=600.0, max_retries=3
+            api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=600.0, max_retries=0
         )
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
@@ -1608,7 +1609,7 @@ async def build_history(message, config, current_display_name, vision):
     reset_dt = datetime.fromisoformat(config["reset_time"]) if config.get("reset_time") else None
     history_limit = get_history_limit(config)
     history_block = get_history_block(config)
-    media_cap = get_image_history_limit(config) if vision else 0
+    media_cap = get_image_history_limit(config)
 
     # 1) 히스토리 후보를 모은다 (최신 → 과거). 창 범위를 먼저 정하고 나서 내용을 만든다.
     candidates = []
@@ -1635,7 +1636,7 @@ async def build_history(message, config, current_display_name, vision):
     candidates.reverse()
 
     # 2) 블록 창을 고른다. 블록 동안 시작점이 고정돼 앞부분이 요청마다 같게 유지된다.
-    image_plans = [plan_history_images(msg, enabled=media_cap > 0) for msg in candidates]
+    image_plans = [plan_history_images(msg, enabled=vision) for msg in candidates]
     anchor_id = bot.history_anchors.get(message.channel.id)
     covered = hit_reset or scanned < scan_limit or (
         anchor_id is not None and oldest_scanned_id is not None and oldest_scanned_id <= anchor_id
@@ -1689,7 +1690,7 @@ async def build_history(message, config, current_display_name, vision):
         history.pop(0)
     print(
         f"[HISTORY] window={len(window)} (base {history_limit} + block {history_block}) reason={window_reason} "
-        f"turns={len(history)} images={image_count}/{media_cap}"
+        f"turns={len(history)} images={image_count}/{media_cap or '무제한'}"
     )
     return history, speaker_labels
 
@@ -1814,7 +1815,7 @@ async def reset_history(interaction: discord.Interaction):
 @app_commands.describe(
     count=f"항상 남기는 최소 히스토리 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)",
     block=f"블록 크기: 히스토리가 count+block개가 되면 오래된 block개를 한 번에 버림 ({MIN_HISTORY_BLOCK}~{MAX_HISTORY_BLOCK})",
-    image_count=f"히스토리 속 이미지 상한, 넘으면 블록을 일찍 교체 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)",
+    image_count=f"히스토리 속 이미지 상한, 넘으면 블록을 일찍 교체 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=개수 제한 없음)",
 )
 async def set_history(
     interaction: discord.Interaction,
@@ -1833,7 +1834,7 @@ async def set_history(
             f"현재 DeepSeek 히스토리: 최소 **{base}개**, 블록 **{block_size}개** → {base}~{base + block_size - 1}개 사이를 오감 "
             f"(사용자+봇 합산)\n"
             f"현재 DeepSeek 히스토리 이미지 상한: **{get_image_history_limit(config)}개** "
-            f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)"
+            f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=개수 제한 없음)"
         )
         return
     changed = []

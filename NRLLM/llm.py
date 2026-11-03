@@ -484,14 +484,14 @@ def select_history_window(
     if window >= base + block:
         start += ((window - base) // block) * block
         reason = "rollover"
-    if media_cap > 0:
-        early_start = max(start, total - base)
-        over_now = sum(media_counts[start:]) > media_cap or sum(media_bytes[start:]) > media_bytes_cap
-        fits_after = (
-            sum(media_counts[early_start:]) <= media_cap and sum(media_bytes[early_start:]) <= media_bytes_cap
-        )
-        if over_now and early_start > start and fits_after:
-            start, reason = early_start, "media"
+    def over_cap(begin):
+        # media_cap 0은 개수 상한 없이 창에 담긴 만큼 쓴다 (용량 상한은 그대로 본다)
+        over_count = media_cap > 0 and sum(media_counts[begin:]) > media_cap
+        return over_count or sum(media_bytes[begin:]) > media_bytes_cap
+
+    early_start = max(start, total - base)
+    if early_start > start and over_cap(start) and not over_cap(early_start):
+        start, reason = early_start, "media"
     return start, reason
 
 
@@ -2237,7 +2237,7 @@ async def on_message(message):
                 media_plans = [
                     plan_history_media(
                         msg,
-                        enabled=media_cap > 0,
+                        enabled=True,
                         can_see_image=can_see_image,
                         can_see_video=can_see_video,
                         can_see_audio=can_see_audio,
@@ -2312,7 +2312,7 @@ async def on_message(message):
                     history_buffer.append({"role": "user", "content": [{"type": "text", "text": f"{sent_label}:\n{text_content}"}, *media_parts]})
                 print(
                     f"[HISTORY] window={len(window)} (base {history_limit} + block {history_block}) "
-                    f"reason={window_reason} media={history_inline_media}/{media_cap}"
+                    f"reason={window_reason} media={history_inline_media}/{media_cap or '무제한'}"
                 )
 
                 messages.extend(history_buffer)
@@ -2803,7 +2803,7 @@ async def set_provider_routing(
 @app_commands.describe(
     count=f"항상 남기는 최소 히스토리 메시지 개수 ({MIN_HISTORY_LIMIT}~{MAX_HISTORY_LIMIT}, 사용자+봇 합산)",
     block=f"블록 크기: 히스토리가 count+block개가 되면 오래된 block개를 한 번에 버림 ({MIN_HISTORY_BLOCK}~{MAX_HISTORY_BLOCK})",
-    image_count=f"히스토리 속 미디어(이미지·영상·오디오) 상한, 넘으면 블록을 일찍 교체 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)",
+    image_count=f"히스토리 속 미디어(이미지·영상·오디오) 상한, 넘으면 블록을 일찍 교체 ({MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=개수 제한 없음)",
 )
 async def set_history_limit(
     interaction: discord.Interaction,
@@ -2819,7 +2819,7 @@ async def set_history_limit(
             f"현재 히스토리: 최소 **{base}개**, 블록 **{block_size}개** → {base}~{base + block_size - 1}개 사이를 오감 "
             f"(사용자+봇 합산)\n"
             f"현재 히스토리 미디어 상한: **{get_image_history_limit(config)}개** "
-            f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=끄기)"
+            f"(범위 {MIN_IMAGE_HISTORY_LIMIT}~{MAX_IMAGE_HISTORY_LIMIT}, 0=개수 제한 없음)"
         )
         return
     changed = []
