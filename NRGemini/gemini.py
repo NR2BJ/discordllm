@@ -293,7 +293,8 @@ LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "youshallnotpass")
 LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "0") == "1"
 LAVALINK_LABEL = os.environ.get("LAVALINK_LABEL", "main")
 LAVALINK_LOCAL_ROOT = Path(os.environ.get("LAVALINK_LOCAL_ROOT", "/opt/lavalink/sb"))
-LAVALINK_TIMEOUT = float(os.environ.get("LAVALINK_TIMEOUT", "10"))
+# 음성 재연결 대기(초). 10초일 때 Discord 음성 서버 정보가 10.4초에 와서 시간 초과가 났다 (2026-11-04)
+LAVALINK_TIMEOUT = float(os.environ.get("LAVALINK_TIMEOUT", "20"))
 
 def format_channel_ref(channel):
     if channel is None:
@@ -848,7 +849,7 @@ async def refresh_lavalink_voice(guild, channel_id, *, reason):
         await ensure_voice_connection(guild, channel_id, move=True, reason=reason)
         bot.reset_voice_retry(guild.id)
     except Exception as e:
-        print(f"[LAVALINK] 음성 연결 새로 맺기 실패 ({reason}): guild={guild.id} {e}")
+        print(f"[LAVALINK] 음성 연결 새로 맺기 실패 ({reason}): guild={guild.id} {type(e).__name__}: {e}")
     finally:
         _voice_refreshing.discard(guild.id)
 
