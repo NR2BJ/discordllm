@@ -275,6 +275,8 @@ VOICE_RECONNECT_COOLDOWN = 20.0
 VOICE_LIBRARY_RECOVERY_GRACE = 75.0
 # 빈 채널에 사람이 처음 들어올 때, 연결이 이 시간(초)보다 오래됐으면 음성 연결을 새로 맺는다 (refresh_lavalink_voice)
 VOICE_REFRESH_MIN_AGE = 1800.0
+# 음성 채널에서 나간 뒤 Discord가 나간 상태를 알려줄 때까지 기다리는 최대 시간(초)
+VOICE_LEAVE_WAIT = 5.0
 VOICE_HEALTH_GRACE = 30.0
 VOICE_HEALTH_BAD_LIMIT = 3
 VOICE_HEALTH_RECOVERY = os.environ.get("GEMINI_VOICE_HEALTH_RECOVERY", "0") == "1"
@@ -626,6 +628,21 @@ def log_voice_debug(message):
     if VOICE_DEBUG_LOGS:
         print(message)
 
+async def wait_for_voice_leave(guild, timeout=VOICE_LEAVE_WAIT):
+    """나가기 요청 후 Discord가 '채널 없음' 상태를 돌려줄 때까지 기다린다.
+
+    기다리지 않고 바로 다시 접속하면, 늦게 도착한 '채널 없음' 이벤트가 새 mafic Player로 전달되고
+    Player가 그걸 받고 스스로 disconnect한다. 그러면 봇이 들어오자마자 튕기고 connect는 TimeoutError가 난다 (2026-11-05 실측).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while guild.me is not None and guild.me.voice is not None and guild.me.voice.channel is not None:
+        if loop.time() >= deadline:
+            print(f"[LAVALINK] 음성 나가기 확인 대기 시간 초과 ({timeout:.0f}s): guild={guild.id}")
+            return False
+        await asyncio.sleep(0.1)
+    return True
+
 async def cleanup_stale_voice_client(vc, guild):
     """끊어진 VoiceClient 캐시를 정리해서 재접속 막힘 방지."""
     log_voice_snapshot("stale VC 정리 시작", guild, vc)
@@ -637,6 +654,8 @@ async def cleanup_stale_voice_client(vc, guild):
         vc.cleanup()
     except Exception:
         pass
+    if is_lavalink_player(vc):
+        await wait_for_voice_leave(guild)
     log_voice_snapshot("stale VC 정리 완료", guild, guild.voice_client)
 
 async def resolve_voice_channel(guild, channel_id):
@@ -776,6 +795,7 @@ async def ensure_voice_connection(guild, channel_id, *, move=True, reason="unkno
                 old_channel = vc.channel
                 if is_lavalink_player(vc):
                     await vc.disconnect(force=True)
+                    await wait_for_voice_leave(guild)
                     vc = await channel.connect(
                         cls=mafic.Player,
                         timeout=LAVALINK_TIMEOUT,
