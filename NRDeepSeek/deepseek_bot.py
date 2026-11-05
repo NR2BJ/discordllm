@@ -214,7 +214,10 @@ def auto_sync_prompt_inject():
     재배포만으로 프롬프트가 따라오게 하는 opt-in. 기본은 꺼짐 —
     켜지 않으면 서버에서 직접 고친 본문이 그대로 유지된다. 덮어쓰기 전에 백업한다.
     """
-    if os.environ.get("DEEPSEEK_PROMPT_AUTOSYNC", "").strip().lower() not in ("1", "true", "yes", "on"):
+    flag = os.environ.get("DEEPSEEK_PROMPT_AUTOSYNC", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        # 꺼져 있어도 한 줄 남긴다 — 로그에 아무것도 없으면 원인을 알 수 없다
+        print(f"[PURGE] 프롬프트 자동 동기화: 꺼짐 (DEEPSEEK_PROMPT_AUTOSYNC={flag or '미설정'})")
         return
     template = os.path.join(BASE_DIR, "prompt-inject.md")
     live = PROMPT_INJECT.path
@@ -1515,6 +1518,7 @@ class DeepSeekBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
+        print(f"[BUILD] {os.environ.get('DEEPSEEK_BUILD') or 'dev'}")
         auto_sync_prompt_inject()
         print(PROMPT_INJECT.status_line())
         print("✅ DeepSeek Bot 준비 완료")

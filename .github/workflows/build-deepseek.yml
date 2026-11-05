@@ -27,6 +27,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: ./NRDeepSeek
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
           platforms: linux/amd64
           push: true
           tags: |
