@@ -23,7 +23,9 @@ from typing import Optional
 from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 
-from prompt_inject import REFUSAL_NUDGE, PromptInjector, refusal_hits, resolve_inject_path
+from prompt_inject import (
+    REFUSAL_NUDGE, PromptInjector, refusal_hits, resolve_inject_path, sync_from_template,
+)
 
 try:
     from PIL import Image, ImageOps
@@ -204,6 +206,27 @@ PROMPT_INJECT = PromptInjector(
     DEEPSEEK_BASE_PROMPT,
     label="NRDeepSeek",
 )
+
+
+def auto_sync_prompt_inject():
+    """DEEPSEEK_PROMPT_AUTOSYNC=1 이면 이미지가 들고 온 본문을 실제 경로에 반영한다.
+
+    재배포만으로 프롬프트가 따라오게 하는 opt-in. 기본은 꺼짐 —
+    켜지 않으면 서버에서 직접 고친 본문이 그대로 유지된다. 덮어쓰기 전에 백업한다.
+    """
+    if os.environ.get("DEEPSEEK_PROMPT_AUTOSYNC", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    template = os.path.join(BASE_DIR, "prompt-inject.md")
+    live = PROMPT_INJECT.path
+    try:
+        changed, backup, snap = sync_from_template(template, live, os.path.join(DATA_DIR, ".nr-purge"))
+    except OSError as exc:
+        print(f"[PURGE] 자동 동기화 실패: {type(exc).__name__}: {exc}")
+        return
+    if changed:
+        print(f"[PURGE] 프롬프트 자동 동기화: {template} → {live} ({snap.size:,}자, 백업 {backup})")
+    else:
+        print(f"[PURGE] 프롬프트 동기화 불필요 (이미 최신: {snap.size:,}자)")
 
 
 def system_prompt():
@@ -1492,6 +1515,7 @@ class DeepSeekBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
+        auto_sync_prompt_inject()
         print(PROMPT_INJECT.status_line())
         print("✅ DeepSeek Bot 준비 완료")
 

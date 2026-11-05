@@ -103,5 +103,7 @@ services:
       CONFIG_FILE: /data/deepseek.json
       # dsh-purge 식 프롬프트 인젝트: 볼륨의 파일을 고치면 재빌드·재시작 없이 다음 요청부터 반영된다
       DEEPSEEK_PROMPT_INJECT: ${DEEPSEEK_PROMPT_INJECT:-/data/prompt-inject.md}
+      # 1로 두면 재배포 때 이미지에 든 본문을 /data 로 자동 복사한다(덮어쓰기 전 자동 백업). 기본 꺼짐
+      DEEPSEEK_PROMPT_AUTOSYNC: ${DEEPSEEK_PROMPT_AUTOSYNC:-0}
     volumes:
       - /mnt/storage/docker/discord/data:/data

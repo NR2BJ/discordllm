@@ -20,6 +20,8 @@ DeepSeek 자동 프롬프트 캐시(같은 접두사면 입력 요금이 할인�
 import hashlib
 import os
 import re
+import shutil
+import time
 
 DEFAULT_FILENAME = "prompt-inject.md"
 ENV_VAR = "DEEPSEEK_PROMPT_INJECT"
@@ -90,6 +92,40 @@ def resolve_inject_path(base_dir, data_dir, env=None):
     if os.path.abspath(data_dir) == os.path.abspath(base_dir):
         return local_path
     return data_path
+
+
+def backup_file(path, backup_dir, prefix="prompt-inject"):
+    """현재 파일을 백업하고 경로를 돌려준다. 파일이 없으면 None."""
+    if not os.path.exists(path):
+        return None
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = os.path.join(backup_dir, "%s-%s.md" % (prefix, stamp))
+    suffix = 1
+    while os.path.exists(target):
+        target = os.path.join(backup_dir, "%s-%s-%d.md" % (prefix, stamp, suffix))
+        suffix += 1
+    shutil.copy2(path, target)
+    return target
+
+
+def sync_from_template(template_path, live_path, backup_dir):
+    """이미지에 든 기본 본문을 실제 사용 경로로 복사한다.
+
+    돌려주는 값: (변경 여부, 백업 경로, Snapshot). 내용이 같으면 아무것도 하지 않는다.
+    컨테이너 재배포 때 이미지가 들고 온 본문을 볼륨에 반영하는 용도(opt-in).
+    """
+    if os.path.abspath(template_path) == os.path.abspath(live_path):
+        return False, None, read_snapshot(live_path)
+    if not os.path.exists(template_path):
+        return False, None, read_snapshot(live_path)
+    template = read_snapshot(template_path)
+    live = read_snapshot(live_path)
+    if template.sha and template.sha == live.sha:
+        return False, None, live
+    backup = backup_file(live_path, backup_dir)
+    shutil.copy2(template_path, live_path)
+    return True, backup, read_snapshot(live_path)
 
 
 def _parse_front_matter(raw):
