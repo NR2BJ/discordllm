@@ -2,7 +2,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import openai
-import httpx
 import aiohttp
 import asyncio
 import base64
@@ -1714,7 +1713,7 @@ class GPTBot(commands.Bot):
         self.openai = openai.AsyncOpenAI(
             api_key=OPENAI_API_KEY,
             # 단계별 시간은 call_openai가 asyncio로 잰다. 여기 값은 그보다 넉넉한 예비 장치.
-            timeout=httpx.Timeout(OPENAI_IDLE_TIMEOUT_SECONDS + 60, connect=20.0),
+            timeout=float(OPENAI_IDLE_TIMEOUT_SECONDS + 60),  # 연결 시간은 call_openai의 접수 마감이 잰다
             max_retries=0,  # 접수 전 재시도는 call_openai가 한다 (SDK 재시도는 접수 마감 안에서 시간을 다 쓴다)
         )
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})

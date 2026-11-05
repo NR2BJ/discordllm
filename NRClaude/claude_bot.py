@@ -2,7 +2,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import anthropic
-import httpx
 import aiohttp
 import asyncio
 import base64
@@ -1637,7 +1636,7 @@ class ClaudeBot(commands.Bot):
         # 단계별 시간은 call_claude가 asyncio로 잰다. 여기 값은 그보다 넉넉한 예비 장치.
         # 접수 전 재시도도 call_claude가 한다 (SDK 재시도는 접수 마감 안에서 시간을 다 쓴다).
         self.claude = anthropic.AsyncAnthropic(
-            timeout=httpx.Timeout(CLAUDE_IDLE_TIMEOUT_SECONDS + 60, connect=20.0), max_retries=0
+            timeout=float(CLAUDE_IDLE_TIMEOUT_SECONDS + 60), max_retries=0  # 연결 시간은 call_claude의 접수 마감이 잰다
         )
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
