@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import openai
+import httpx
 import aiohttp
 import asyncio
 import base64
@@ -96,6 +97,13 @@ DEFAULT_MODEL_KEY = "terra"
 MAX_OUTPUT_TOKENS = 25000  # 사고 토큰도 여기에 포함된다
 MAX_OUTPUT_TOKENS_DEEP = 64000  # 사고 강도 xhigh·max
 NATIVE_SEARCH_PRICE = 0.01  # OpenAI 기본 웹 검색 1회 요금
+# 접수 단계: 연결~첫 이벤트(response.created)까지. 보통 몇 초라 넘으면 꼬인 것으로 보고 버린 뒤 다시 보낸다.
+OPENAI_ACCEPT_TIMEOUT_SECONDS = 60
+OPENAI_ACCEPT_ATTEMPTS = 3  # 2026-11-05 실제로 두 번 연속 접수가 막히고 세 번째에 11초 만에 답이 온 적이 있다
+# 추론 단계: 접수 뒤 이벤트 사이 무응답 상한 (긴 사고·이미지 생성 중에는 이벤트가 한동안 없을 수 있다)
+OPENAI_IDLE_TIMEOUT_SECONDS = 300
+# 답 하나(도구 왕복 포함)의 전체 안전 상한. 넘으면 중단하고 채널에 알린다.
+REPLY_DEADLINE_SECONDS = 900
 
 # 이미지 생성·수정은 hosted image_generation 도구. 그릴지, 새로 그릴지 고칠지는 대화 모델이 정한다.
 IMAGE_MODELS = {
@@ -1482,24 +1490,70 @@ class UsageTally:
         )
 
 
-async def call_openai(**request):
-    # 이미지·사고 시간이 길어 스트리밍으로 받는다 (긴 요청의 연결 끊김 방지). 결과는 한 번에 쓴다.
+class OpenAINotAccepted(Exception):
+    """OpenAI가 요청을 받았다는 첫 이벤트(response.created)조차 오지 않음 → 추론이 시작되지 않았다."""
+
+
+async def _stream_openai_once(request):
+    """요청 한 번. 두 단계로 시간을 잰다.
+
+    1) 접수: 연결 → 헤더 → 첫 이벤트까지 OPENAI_ACCEPT_TIMEOUT_SECONDS. 넘으면 OpenAINotAccepted (아직 추론 전이라 바로 버린다).
+    2) 추론: 첫 이벤트 뒤로는 이벤트 사이 무응답 OPENAI_IDLE_TIMEOUT_SECONDS마다 마감을 다시 잡는다.
+    """
+    loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    events = 0
+    last_event = "(연결 전)"
+    final = None
     try:
-        final = None
-        # 끝 이벤트를 받아도 스트림을 끝까지 읽는다 (중간에 빠져나가면 연결 정리 중 오류가 난다)
-        async with await bot.openai.responses.create(stream=True, **request) as stream:
-            async for event in stream:
-                if event.type in ("response.completed", "response.incomplete", "response.failed"):
-                    final = event.response
-                elif event.type == "error":
-                    raise ResponseFailed(event.code, event.message)
-    except openai.APIError as e:
-        if getattr(e, "code", None) == "moderation_blocked":
+        async with asyncio.timeout(OPENAI_ACCEPT_TIMEOUT_SECONDS) as deadline:
+            # 끝 이벤트를 받아도 스트림을 끝까지 읽는다 (중간에 빠져나가면 연결 정리 중 오류가 난다)
+            async with await bot.openai.responses.create(stream=True, **request) as stream:
+                last_event = "(헤더 받음)"
+                async for event in stream:
+                    if events == 0:
+                        print(f"[GPT] 접수됨 ({time.perf_counter() - started:.1f}s) → 추론 대기")
+                    events += 1
+                    last_event = event.type
+                    deadline.reschedule(loop.time() + OPENAI_IDLE_TIMEOUT_SECONDS)
+                    if event.type in ("response.completed", "response.incomplete", "response.failed"):
+                        final = event.response
+                    elif event.type == "error":
+                        raise ResponseFailed(event.code, event.message)
+    except (asyncio.CancelledError, Exception) as e:
+        # 타임아웃·취소·오류 때 어디까지 받았는지 남긴다 (조용히 멈춘 것과 구분하려고)
+        print(
+            f"[GPT] 스트림 중단: {type(e).__name__} events={events} last={last_event} "
+            f"elapsed={time.perf_counter() - started:.1f}s"
+        )
+        if isinstance(e, TimeoutError):
+            if events == 0:
+                raise OpenAINotAccepted(
+                    f"OpenAI가 {OPENAI_ACCEPT_TIMEOUT_SECONDS}초 안에 요청을 받지 않았습니다 ({last_event})"
+                ) from None
+            raise RuntimeError(
+                f"OpenAI 응답이 추론 중 {OPENAI_IDLE_TIMEOUT_SECONDS}초 동안 멈췄습니다 (마지막 이벤트 {last_event})"
+            ) from None
+        if isinstance(e, openai.APIError) and getattr(e, "code", None) == "moderation_blocked":
             raise ResponseFailed("moderation_blocked", e.message) from e
         raise
     if final is None:
         raise RuntimeError("OpenAI 스트림이 응답 없이 끝났습니다.")
     return final
+
+
+async def call_openai(**request):
+    # 이미지·사고 시간이 길어 스트리밍으로 받는다 (긴 요청의 연결 끊김 방지). 결과는 한 번에 쓴다.
+    # 접수 전에 막히면 추론이 시작되지 않은 것이라 비용 없이 바로 다시 보낸다.
+    for attempt in range(1, OPENAI_ACCEPT_ATTEMPTS + 1):
+        try:
+            return await _stream_openai_once(request)
+        except (OpenAINotAccepted, openai.APIConnectionError, openai.InternalServerError, openai.RateLimitError) as e:
+            # 모두 접수 전(HTTP 상태·연결 단계) 실패라 다시 보내도 중복 과금이 없다
+            if attempt == OPENAI_ACCEPT_ATTEMPTS:
+                raise
+            print(f"[GPT] 접수 실패 → 다시 보냄 ({attempt}/{OPENAI_ACCEPT_ATTEMPTS}): {type(e).__name__}: {e}")
+            await asyncio.sleep(2)
 
 
 def build_image_tool(config):
@@ -1547,8 +1601,14 @@ async def run_gpt(model, messages, *, effort, user_hash, cache_key, backend, ima
             request["include"] = ["web_search_call.action.sources"]
         if tool_rounds >= WEB_SEARCH_MAX_ROUNDS:
             request["tool_choice"] = "none"
+        round_started = time.perf_counter()
+        print(
+            f"[GPT] 요청 round={tool_rounds} model={model['id']} effort={effort or 'default'} "
+            f"backend={backend} items={len(convo)}"
+        )
         try:
             response = await call_openai(**request)
+            print(f"[GPT] 응답 round={tool_rounds} status={response.status} {time.perf_counter() - round_started:.1f}s")
         except ResponseFailed as e:
             if e.code != "moderation_blocked":
                 raise
@@ -1651,7 +1711,12 @@ class GPTBot(commands.Bot):
             # 모델이 @everyone·역할 멘션을 따라 써도 실제로 알림이 가지 않게 한다
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False),
         )
-        self.openai = openai.AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=600.0, max_retries=3)
+        self.openai = openai.AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            # 단계별 시간은 call_openai가 asyncio로 잰다. 여기 값은 그보다 넉넉한 예비 장치.
+            timeout=httpx.Timeout(OPENAI_IDLE_TIMEOUT_SECONDS + 60, connect=20.0),
+            max_retries=0,  # 접수 전 재시도는 call_openai가 한다 (SDK 재시도는 접수 마감 안에서 시간을 다 쓴다)
+        )
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
         self.history_anchors = {}  # 채널별 현재 히스토리 블록의 시작 메시지 ID (재시작하면 새 블록부터)
@@ -2060,18 +2125,31 @@ async def respond(message, config):
     # 4) GPT
     tally = UsageTally()
     sources = []
-    result = await generate_reply(
-        model,
-        messages,
-        effort=effort,
-        user_hash=hash_user_id(message.author.id),
-        cache_key=f"discord:{message.channel.id}",
-        backend=pick_search_backend(config, unread_urls),
-        image_tool=build_image_tool(config),
-        tally=tally,
-        sources=sources,
-    )
-    bot.stats.merge(tally)
+    gpt_started = time.perf_counter()
+    try:
+        async with asyncio.timeout(REPLY_DEADLINE_SECONDS):
+            result = await generate_reply(
+                model,
+                messages,
+                effort=effort,
+                user_hash=hash_user_id(message.author.id),
+                cache_key=f"discord:{message.channel.id}",
+                backend=pick_search_backend(config, unread_urls),
+                image_tool=build_image_tool(config),
+                tally=tally,
+                sources=sources,
+            )
+    except TimeoutError:
+        print(
+            f"[GPT] 전체 시간 초과 {time.perf_counter() - gpt_started:.0f}s (상한 {REPLY_DEADLINE_SECONDS}s) "
+            f"msg={message.id} {display_name}: {(message.content or '')[:80]!r} ({tally.describe()})"
+        )
+        await message.channel.send(
+            f"⚠️ GPT 응답이 {REPLY_DEADLINE_SECONDS // 60}분 안에 오지 않아 중단했습니다. 다시 보내 주세요."
+        )
+        return
+    finally:
+        bot.stats.merge(tally)
     if result.stop_reason == "refusal":
         await handle_refusal(message, config, result, display_name)
         return

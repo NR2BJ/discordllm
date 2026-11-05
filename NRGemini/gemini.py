@@ -130,6 +130,8 @@ GEMINI_API_TIMEOUT_SECONDS = 120.0
 # 대화 길이와 무관하게 들쭉날쭉하고, 120초 타임아웃은 그 꼬리였다.
 GEMINI_TEXT_TIMEOUT_SECONDS = 300.0
 GEMINI_IMAGE_TIMEOUT_SECONDS = 300.0
+# File API 업로드 + ACTIVE 대기 전체 상한. SDK 업로드에는 자체 시간 제한이 없어 채널 잠금을 쥔 채 멈출 수 있다.
+GEMINI_FILE_UPLOAD_TIMEOUT_SECONDS = 180.0
 GEMINI_IMAGE_MAX_ATTEMPTS = 2
 ROUTING_MODEL = os.environ.get(
     "GEMINI_ROUTING_MODEL",
@@ -2848,16 +2850,26 @@ async def upload_file_api(file_data, mime_type):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp.write(file_data)
         tmp.close()
-        uploaded = await CLIENT.aio.files.upload(
-            file=Path(tmp.name),
-            config=types.UploadFileConfig(mime_type=mime_type)
-        )
-        for _ in range(30):  # 최대 60초
-            if uploaded.state and uploaded.state.name == "ACTIVE":
-                return uploaded
-            await asyncio.sleep(2)
-            uploaded = await CLIENT.aio.files.get(name=uploaded.name)
+        started = time_module.perf_counter()
+        print(f"[GEMINI] File API 업로드 시작: {mime_type} {len(file_data)} bytes")
+        async with asyncio.timeout(GEMINI_FILE_UPLOAD_TIMEOUT_SECONDS):
+            uploaded = await CLIENT.aio.files.upload(
+                file=Path(tmp.name),
+                config=types.UploadFileConfig(mime_type=mime_type)
+            )
+            print(f"[GEMINI] File API 업로드 완료 ({time_module.perf_counter() - started:.1f}s) → ACTIVE 대기")
+            for _ in range(30):  # 최대 60초
+                if uploaded.state and uploaded.state.name == "ACTIVE":
+                    return uploaded
+                await asyncio.sleep(2)
+                uploaded = await CLIENT.aio.files.get(name=uploaded.name)
         print(f"[WARN] File API 업로드 타임아웃: {mime_type}")
+        return None
+    except TimeoutError:
+        print(
+            f"[ERROR] File API 업로드 시간 초과 {GEMINI_FILE_UPLOAD_TIMEOUT_SECONDS:.0f}s: {mime_type} "
+            f"({time_module.perf_counter() - started:.1f}s)"
+        )
         return None
     except Exception as e:
         print(f"[ERROR] File API 업로드 실패: {e}")

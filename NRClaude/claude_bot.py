@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import anthropic
+import httpx
 import aiohttp
 import asyncio
 import base64
@@ -90,6 +91,13 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MAX_OUTPUT_TOKENS = 16000  # 사고 토큰도 여기에 포함된다
 MAX_OUTPUT_TOKENS_DEEP = 32000  # 사고 강도 xhigh·max
 NATIVE_SEARCH_PRICE = 0.01  # Claude 기본 웹 검색 1회 요금
+# 접수 단계: 연결~첫 이벤트(message_start)까지. 보통 몇 초라 넘으면 꼬인 것으로 보고 버린 뒤 다시 보낸다.
+CLAUDE_ACCEPT_TIMEOUT_SECONDS = 60
+CLAUDE_ACCEPT_ATTEMPTS = 2
+# 추론 단계: 접수 뒤 이벤트 사이 무응답 상한 (Claude는 사고 중에도 ping·thinking 이벤트를 보낸다)
+CLAUDE_IDLE_TIMEOUT_SECONDS = 300
+# 답 하나(도구 왕복 포함)의 전체 안전 상한. 넘으면 중단하고 채널에 알린다.
+REPLY_DEADLINE_SECONDS = 900
 
 # 🔢 [수치 조절 구역]
 # 히스토리는 블록 단위로 자른다: 창이 HISTORY_LIMIT개에서 시작해 HISTORY_LIMIT + 블록 - 1개까지 뒤로만 늘고,
@@ -1442,10 +1450,69 @@ class UsageTally:
 TOOL_BLOCK_TYPES = ("tool_use", "server_tool_use", "web_search_tool_result", "web_fetch_tool_result")
 
 
+class ClaudeNotAccepted(Exception):
+    """Claude가 요청을 받았다는 첫 이벤트(message_start)조차 오지 않음 → 추론이 시작되지 않았다."""
+
+
+def is_retryable_before_accept(error):
+    """접수 전 실패 중 다시 보내도 되는 것: 연결 오류·타임아웃, 429, 5xx(529 과부하 포함)."""
+    if isinstance(error, anthropic.APIConnectionError):
+        return True
+    status = getattr(error, "status_code", None)
+    return isinstance(error, anthropic.APIStatusError) and status is not None and (status == 429 or status >= 500)
+
+
+async def _stream_claude_once(request):
+    """요청 한 번. 두 단계로 시간을 잰다.
+
+    1) 접수: 연결 → 헤더 → 첫 이벤트까지 CLAUDE_ACCEPT_TIMEOUT_SECONDS. 넘으면 ClaudeNotAccepted (추론 전이라 바로 버린다).
+    2) 추론: 첫 이벤트 뒤로는 이벤트 사이 무응답 CLAUDE_IDLE_TIMEOUT_SECONDS마다 마감을 다시 잡는다.
+    """
+    loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    events = 0
+    last_event = "(연결 전)"
+    try:
+        async with asyncio.timeout(CLAUDE_ACCEPT_TIMEOUT_SECONDS) as deadline:
+            async with bot.claude.messages.stream(**request) as stream:
+                last_event = "(헤더 받음)"
+                async for event in stream:
+                    if events == 0:
+                        print(f"[CLAUDE] 접수됨 ({time.perf_counter() - started:.1f}s) → 추론 대기")
+                    events += 1
+                    last_event = event.type
+                    deadline.reschedule(loop.time() + CLAUDE_IDLE_TIMEOUT_SECONDS)
+                return await stream.get_final_message()
+    except (asyncio.CancelledError, Exception) as e:
+        # 타임아웃·취소·오류 때 어디까지 받았는지 남긴다 (조용히 멈춘 것과 구분하려고)
+        print(
+            f"[CLAUDE] 스트림 중단: {type(e).__name__} events={events} last={last_event} "
+            f"elapsed={time.perf_counter() - started:.1f}s"
+        )
+        if isinstance(e, TimeoutError):
+            if events == 0:
+                raise ClaudeNotAccepted(
+                    f"Claude가 {CLAUDE_ACCEPT_TIMEOUT_SECONDS}초 안에 요청을 받지 않았습니다 ({last_event})"
+                ) from None
+            raise RuntimeError(
+                f"Claude 응답이 추론 중 {CLAUDE_IDLE_TIMEOUT_SECONDS}초 동안 멈췄습니다 (마지막 이벤트 {last_event})"
+            ) from None
+        if events == 0 and isinstance(e, Exception) and is_retryable_before_accept(e):
+            raise ClaudeNotAccepted(f"{type(e).__name__}: {e}") from e
+        raise
+
+
 async def call_claude(**request):
     # 사고 토큰까지 길어질 수 있어 스트리밍으로 받는다 (긴 요청의 연결 끊김 방지). 결과는 한 번에 쓴다.
-    async with bot.claude.messages.stream(**request) as stream:
-        return await stream.get_final_message()
+    # 접수 전에 막히면 추론이 시작되지 않은 것이라 중복 과금 없이 바로 다시 보낸다.
+    for attempt in range(1, CLAUDE_ACCEPT_ATTEMPTS + 1):
+        try:
+            return await _stream_claude_once(request)
+        except ClaudeNotAccepted as e:
+            if attempt == CLAUDE_ACCEPT_ATTEMPTS:
+                raise
+            print(f"[CLAUDE] 접수 실패 → 다시 보냄 ({attempt}/{CLAUDE_ACCEPT_ATTEMPTS}): {e}")
+            await asyncio.sleep(2)
 
 
 async def run_claude(model, system_blocks, messages, *, effort, user_hash, backend, fetch_enabled, tally, sources):
@@ -1478,7 +1545,16 @@ async def run_claude(model, system_blocks, messages, *, effort, user_hash, backe
             request["output_config"] = {"effort": effort}
         if tool_rounds >= WEB_SEARCH_MAX_ROUNDS:
             request["tool_choice"] = {"type": "none"}
+        round_started = time.perf_counter()
+        print(
+            f"[CLAUDE] 요청 round={tool_rounds} pause={pauses} model={model['id']} effort={effort or 'default'} "
+            f"backend={backend} messages={len(convo)}"
+        )
         response = await call_claude(**request)
+        print(
+            f"[CLAUDE] 응답 round={tool_rounds} stop={response.stop_reason} "
+            f"{time.perf_counter() - round_started:.1f}s"
+        )
         tally.add_usage(model, response.usage)
         if response.stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
@@ -1558,7 +1634,11 @@ class ClaudeBot(commands.Bot):
             # 모델이 @everyone·역할 멘션을 따라 써도 실제로 알림이 가지 않게 한다
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False),
         )
-        self.claude = anthropic.AsyncAnthropic(timeout=300.0, max_retries=3)
+        # 단계별 시간은 call_claude가 asyncio로 잰다. 여기 값은 그보다 넉넉한 예비 장치.
+        # 접수 전 재시도도 call_claude가 한다 (SDK 재시도는 접수 마감 안에서 시간을 다 쓴다).
+        self.claude = anthropic.AsyncAnthropic(
+            timeout=httpx.Timeout(CLAUDE_IDLE_TIMEOUT_SECONDS + 60, connect=20.0), max_retries=0
+        )
         self.server_configs = DataManager.load_json(CONFIG_FILE, {})
         self.channel_locks = {}
         self.history_anchors = {}  # 채널별 현재 히스토리 블록의 시작 메시지 ID (재시작하면 새 블록부터)
@@ -1926,16 +2006,29 @@ async def respond(message, config):
     # 4) Claude
     tally = UsageTally()
     sources = []
-    result = await generate_reply(
-        model,
-        messages,
-        effort=effort,
-        user_hash=hash_user_id(message.author.id),
-        fetch_enabled=bool(unread_urls),
-        tally=tally,
-        sources=sources,
-    )
-    bot.stats.merge(tally)
+    gen_started = time.perf_counter()
+    try:
+        async with asyncio.timeout(REPLY_DEADLINE_SECONDS):
+            result = await generate_reply(
+                model,
+                messages,
+                effort=effort,
+                user_hash=hash_user_id(message.author.id),
+                fetch_enabled=bool(unread_urls),
+                tally=tally,
+                sources=sources,
+            )
+    except TimeoutError:
+        print(
+            f"[CLAUDE] 전체 시간 초과 {time.perf_counter() - gen_started:.0f}s (상한 {REPLY_DEADLINE_SECONDS}s) "
+            f"msg={message.id} {display_name}: {(message.content or '')[:80]!r} ({tally.describe()})"
+        )
+        await message.channel.send(
+            f"⚠️ Claude 응답이 {REPLY_DEADLINE_SECONDS // 60}분 안에 오지 않아 중단했습니다. 다시 보내 주세요."
+        )
+        return
+    finally:
+        bot.stats.merge(tally)
     if result.stop_reason == "refusal":
         await handle_refusal(message, config, result, display_name)
         return

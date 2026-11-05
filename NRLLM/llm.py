@@ -642,6 +642,12 @@ class APIStatusError(Exception):
         self.provider = provider  # OpenRouter 응답 헤더/본문에서 추출된 provider name (있을 때만)
 
 
+# OpenRouter 요청 한 번의 단계별 상한. 접수(연결~응답 헤더)가 안 되면 꼬인 것으로 보고 바로 버린다.
+OPENROUTER_ACCEPT_TIMEOUT_SECONDS = 60
+# 접수 뒤 본문(생성)이 끝날 때까지. 예전 aiohttp 기본값(전체 300초)과 같은 수준.
+OPENROUTER_GENERATION_TIMEOUT_SECONDS = 300
+
+
 class OpenRouterClient:
     def __init__(self, api_key):
         self.api_key = api_key
@@ -977,41 +983,70 @@ class OpenRouterClient:
 
         async with aiohttp.ClientSession() as session:
             async def _post_completion(request_payload):
-                async with session.post(f"{self.base_url}/chat/completions", headers=self.headers, json=request_payload) as resp:
-                    # provider 추출: 헤더 우선, 200 body의 provider 필드, 5xx body의 provider 필드 순
-                    provider_used = (
-                        resp.headers.get("X-OpenRouter-Provider")
-                        or resp.headers.get("X-Provider")
-                        or resp.headers.get("X-Provider-Name")
-                    )
-                    if resp.status == 200:
-                        raw_text = await resp.text()
-                        try:
-                            data = json.loads(raw_text) if raw_text and raw_text.strip() else None
-                        except Exception:
-                            data = None
-                        if not provider_used and isinstance(data, dict):
-                            provider_used = data.get("provider")
-                        try:
-                            final_content, usage, images, full_data = self._parse_completion_output(data, raw_text=raw_text)
-                        except CompletionContentError as content_err:
-                            # 빈 content를 반환한 provider를 에러에 실어 보내 재시도에서 회전할 수 있게 한다.
-                            if content_err.provider is None:
-                                content_err.provider = provider_used
-                            raise
-                        return final_content, usage, images, full_data
-                    error_text = await resp.text()
-                    if not provider_used:
-                        try:
-                            err_json = json.loads(error_text)
-                            if isinstance(err_json, dict):
-                                provider_used = (
-                                    (err_json.get("error") or {}).get("provider")
-                                    if isinstance(err_json.get("error"), dict) else None
-                                ) or err_json.get("provider")
-                        except Exception:
-                            pass
-                    raise APIStatusError(resp.status, error_text, provider=provider_used)
+                # 두 단계: 접수(연결~응답 헤더)는 OPENROUTER_ACCEPT_TIMEOUT_SECONDS, 접수 뒤 본문(생성)은
+                # OPENROUTER_GENERATION_TIMEOUT_SECONDS. 접수가 안 되면 추론이 시작되지 않은 것이라 바로 버린다.
+                loop = asyncio.get_running_loop()
+                started = time.perf_counter()
+                accepted = False
+                print(f"[OPENROUTER] 요청 model={model} messages={len(request_payload.get('messages') or [])}")
+                try:
+                    async with asyncio.timeout(OPENROUTER_ACCEPT_TIMEOUT_SECONDS) as deadline:
+                        async with session.post(
+                            f"{self.base_url}/chat/completions",
+                            headers=self.headers,
+                            json=request_payload,
+                            timeout=aiohttp.ClientTimeout(total=None, sock_connect=20),
+                        ) as resp:
+                            accepted = True
+                            print(f"[OPENROUTER] 접수됨 status={resp.status} ({time.perf_counter() - started:.1f}s) → 생성 대기")
+                            deadline.reschedule(loop.time() + OPENROUTER_GENERATION_TIMEOUT_SECONDS)
+                            # provider 추출: 헤더 우선, 200 body의 provider 필드, 5xx body의 provider 필드 순
+                            provider_used = (
+                                resp.headers.get("X-OpenRouter-Provider")
+                                or resp.headers.get("X-Provider")
+                                or resp.headers.get("X-Provider-Name")
+                            )
+                            if resp.status == 200:
+                                raw_text = await resp.text()
+                                try:
+                                    data = json.loads(raw_text) if raw_text and raw_text.strip() else None
+                                except Exception:
+                                    data = None
+                                if not provider_used and isinstance(data, dict):
+                                    provider_used = data.get("provider")
+                                try:
+                                    final_content, usage, images, full_data = self._parse_completion_output(data, raw_text=raw_text)
+                                except CompletionContentError as content_err:
+                                    # 빈 content를 반환한 provider를 에러에 실어 보내 재시도에서 회전할 수 있게 한다.
+                                    if content_err.provider is None:
+                                        content_err.provider = provider_used
+                                    raise
+                                return final_content, usage, images, full_data
+                            error_text = await resp.text()
+                            if not provider_used:
+                                try:
+                                    err_json = json.loads(error_text)
+                                    if isinstance(err_json, dict):
+                                        provider_used = (
+                                            (err_json.get("error") or {}).get("provider")
+                                            if isinstance(err_json.get("error"), dict) else None
+                                        ) or err_json.get("provider")
+                                except Exception:
+                                    pass
+                            raise APIStatusError(resp.status, error_text, provider=provider_used)
+                except TimeoutError:
+                    elapsed = time.perf_counter() - started
+                    if not accepted:
+                        print(f"[OPENROUTER] 접수 시간 초과 {elapsed:.1f}s model={model}")
+                        raise Exception(
+                            f"OpenRouter가 {OPENROUTER_ACCEPT_TIMEOUT_SECONDS}초 안에 요청을 받지 않았습니다. 다시 보내 주세요."
+                        ) from None
+                    print(f"[OPENROUTER] 생성 시간 초과 {elapsed:.1f}s model={model}")
+                    raise Exception(
+                        f"OpenRouter 응답이 접수 후 {OPENROUTER_GENERATION_TIMEOUT_SECONDS}초 안에 끝나지 않았습니다."
+                    ) from None
+                finally:
+                    print(f"[OPENROUTER] 요청 끝 accepted={accepted} ({time.perf_counter() - started:.1f}s)")
 
             try:
                 return await _post_completion(payload)

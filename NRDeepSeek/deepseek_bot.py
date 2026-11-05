@@ -74,6 +74,8 @@ TOOL_MAX_ROUNDS = WEB_SEARCH_MAX_CALLS + FETCH_MAX_CALLS  # 한 번에 하나씩
 # DeepSeek는 붐빌 때 연결만 열어 두고 keep-alive로 최대 10분 기다리게 한다. 그동안 채널 잠금이 잡혀
 # 뒤 메시지가 전부 막히므로, 이벤트가 이 시간(초) 동안 하나도 안 오면 포기한다.
 STREAM_IDLE_TIMEOUT = 150
+# 답 하나(도구 왕복·거절 재생성 포함)의 전체 안전 상한. 넘으면 중단하고 채널에 알린다.
+REPLY_DEADLINE_SECONDS = 900
 SEARCH_MODES = {"deepseek": "DeepSeek 검색", "tavily": "Tavily"}
 DEFAULT_SEARCH_MODE = "deepseek"
 
@@ -1372,21 +1374,37 @@ class UsageTally:
 
 async def call_deepseek(**request):
     # 사고 시간이 길 수 있어 스트리밍으로 받는다 (긴 요청의 연결 끊김 방지). 결과는 한 번에 쓴다.
+    # 두 단계: 접수(연결~첫 이벤트)와 추론(첫 이벤트 뒤). 둘 다 무응답 STREAM_IDLE_TIMEOUT으로 끊되,
+    # 로그로 어느 단계에서 멈췄는지 구분한다. 붐빌 때는 접수 자체가 길게 밀리므로 다시 보내지 않는다.
     final = None
     loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    events = 0
+    last_event = "(연결 전)"
     try:
-        # 연결·재시도 포함 첫 이벤트까지, 그 뒤로는 이벤트 사이 간격마다 STREAM_IDLE_TIMEOUT
         async with asyncio.timeout(STREAM_IDLE_TIMEOUT) as deadline:
             # 끝 이벤트를 받아도 스트림을 끝까지 읽는다 (중간에 빠져나가면 연결 정리 중 오류가 난다)
             async with await bot.deepseek.responses.create(stream=True, **request) as stream:
+                last_event = "(헤더 받음)"
                 async for event in stream:
+                    if events == 0:
+                        print(f"[DEEPSEEK] 접수됨 ({time.perf_counter() - started:.1f}s) → 추론 대기")
+                    events += 1
+                    last_event = event.type
                     deadline.reschedule(loop.time() + STREAM_IDLE_TIMEOUT)
                     if event.type in ("response.completed", "response.incomplete", "response.failed"):
                         final = event.response
                     elif event.type == "error":
                         raise ResponseFailed(getattr(event, "code", None), getattr(event, "message", ""))
-    except TimeoutError:
-        raise DeepSeekBusy(f"{STREAM_IDLE_TIMEOUT}초 동안 응답이 없음") from None
+    except (asyncio.CancelledError, Exception) as e:
+        print(
+            f"[DEEPSEEK] 스트림 중단: {type(e).__name__} events={events} last={last_event} "
+            f"elapsed={time.perf_counter() - started:.1f}s"
+        )
+        if isinstance(e, TimeoutError):
+            phase = "접수 전" if events == 0 else f"추론 중 (마지막 이벤트 {last_event})"
+            raise DeepSeekBusy(f"{phase} {STREAM_IDLE_TIMEOUT}초 동안 응답이 없음") from None
+        raise
     if final is None:
         raise RuntimeError("DeepSeek 스트림이 응답 없이 끝났습니다.")
     return final
@@ -1415,7 +1433,16 @@ async def run_deepseek(model, messages, *, effort, user_hash, backend, tally, so
             request["reasoning"] = {"effort": effort}
         if tool_rounds >= TOOL_MAX_ROUNDS:
             request["tool_choice"] = "none"
+        round_started = time.perf_counter()
+        print(
+            f"[DEEPSEEK] 요청 round={tool_rounds} model={model['id']} effort={effort or 'default'} "
+            f"backend={backend} items={len(convo)}"
+        )
         response = await call_deepseek(**request)
+        print(
+            f"[DEEPSEEK] 응답 round={tool_rounds} status={response.status} "
+            f"{time.perf_counter() - round_started:.1f}s"
+        )
         tally.add_response(model, response)
         if response.status == "failed":
             error = response.error
@@ -1778,16 +1805,29 @@ async def respond(message, config):
 
     # 3) DeepSeek
     sources = []
-    result = await generate_reply(
-        model,
-        messages,
-        effort=effort,
-        user_hash=hash_user_id(message.author.id),
-        config=config,
-        tally=tally,
-        sources=sources,
-    )
-    bot.stats.merge(tally)
+    gen_started = time.perf_counter()
+    try:
+        async with asyncio.timeout(REPLY_DEADLINE_SECONDS):
+            result = await generate_reply(
+                model,
+                messages,
+                effort=effort,
+                user_hash=hash_user_id(message.author.id),
+                config=config,
+                tally=tally,
+                sources=sources,
+            )
+    except TimeoutError:
+        print(
+            f"[DEEPSEEK] 전체 시간 초과 {time.perf_counter() - gen_started:.0f}s (상한 {REPLY_DEADLINE_SECONDS}s) "
+            f"msg={message.id} {display_name}: {(message.content or '')[:80]!r} ({tally.describe()})"
+        )
+        await message.channel.send(
+            f"⚠️ DeepSeek 응답이 {REPLY_DEADLINE_SECONDS // 60}분 안에 오지 않아 중단했습니다. 다시 보내 주세요."
+        )
+        return
+    finally:
+        bot.stats.merge(tally)
     bot.counters["replies"] += 1
 
     response = clean_response_text(result.text, speaker_labels)
