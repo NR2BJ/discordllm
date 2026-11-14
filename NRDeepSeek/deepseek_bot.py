@@ -24,7 +24,7 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from prompt_inject import (
-    REFUSAL_NUDGE, PromptInjector, refusal_hits, resolve_inject_path, sync_from_template,
+    PromptInjector, refusal_hits, refusal_nudge, resolve_inject_path, sync_from_template,
 )
 
 try:
@@ -197,9 +197,11 @@ KST = timezone(timedelta(hours=9))
 
 # 거절 가드 재생성 횟수. 0 이면 끔. 재생성은 거절 문구가 나왔을 때만 1회 더 호출한다.
 try:
-    REFUSAL_RETRIES = max(0, int(os.environ.get("DEEPSEEK_REFUSAL_RETRIES", "1")))
+    REFUSAL_RETRIES = max(0, int(os.environ.get("DEEPSEEK_REFUSAL_RETRIES", "2")))
 except ValueError:
-    REFUSAL_RETRIES = 1
+    REFUSAL_RETRIES = 2
+# 3차 재시도에서 "최소 납품 단위"만 요구할지
+REFUSAL_DECOMPOSE = os.environ.get("DEEPSEEK_REFUSAL_DECOMPOSE", "").strip().lower() in ("1", "true", "yes", "on")
 
 # dsh-purge 의 prompt-inject.md 자리를 봇 쪽으로 옮긴 것. 본문은 파일에 있고 여기서는 읽기만 한다.
 # 파일이 바뀌면 다음 요청부터 반영되고, 그대로면 같은 문자열이 유지되어 DeepSeek 접두사 캐시가 깨지지 않는다.
@@ -207,6 +209,7 @@ PROMPT_INJECT = PromptInjector(
     resolve_inject_path(BASE_DIR, DATA_DIR),
     DEEPSEEK_BASE_PROMPT,
     label="NRDeepSeek",
+    position=os.environ.get("DEEPSEEK_PROMPT_POSITION", "tail"),
 )
 
 
@@ -1493,12 +1496,13 @@ async def generate_reply(model, messages, *, effort, user_hash, config, tally, s
         if not hits and result.text:
             break
         reason = ", ".join(hits) if hits else "빈 답"
-        print(f"[PURGE] 거절 문구 감지({reason}) → 재생성 {attempt}/{REFUSAL_RETRIES}")
+        print(f"[PURGE] 거절 문구 감지({reason}) → 재생성 {attempt}/{REFUSAL_RETRIES} "
+              f"(stage {'retry' if attempt == 1 else ('frame' if attempt == 2 or not REFUSAL_DECOMPOSE else 'decompose')})")
         sources.clear()
         # 거절 답을 히스토리에 넣지 않는다: 모델이 자기 거절을 보고 "반복 요청해도 같다"로 굳는 걸 막는다.
         retry = await generate_reply_once(
             model, messages, effort=effort, user_hash=user_hash, config=config, tally=tally,
-            sources=sources, extra=REFUSAL_NUDGE,
+            sources=sources, extra=refusal_nudge(attempt, REFUSAL_DECOMPOSE),
         )
         if not retry.text:
             break

@@ -105,5 +105,9 @@ services:
       DEEPSEEK_PROMPT_INJECT: ${DEEPSEEK_PROMPT_INJECT:-/data/prompt-inject.md}
       # 1로 두면 재배포 때 이미지에 든 본문을 /data 로 자동 복사한다(덮어쓰기 전 자동 백업). 기본 꺼짐
       DEEPSEEK_PROMPT_AUTOSYNC: ${DEEPSEEK_PROMPT_AUTOSYNC:-0}
+      # 인젝트 위치: head | tail(기본) | both — 실측(tail 9/9 vs head 8/9, n=3)으로 tail 유지
+      DEEPSEEK_PROMPT_POSITION: ${DEEPSEEK_PROMPT_POSITION:-tail}
+      # 거절 재시도 횟수(1: 같은 요청 재실행, 2: 허구 프레임, 3: 최소 납품 단위)
+      DEEPSEEK_REFUSAL_RETRIES: ${DEEPSEEK_REFUSAL_RETRIES:-2}
     volumes:
       - /mnt/storage/docker/discord/data:/data
