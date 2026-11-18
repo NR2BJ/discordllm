@@ -90,34 +90,51 @@ except Exception as e:
 
 print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 
-FLASH_MODEL = "gemini-3.8-flash"
 FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
+HYDROGEN_MODEL = "gemini-4-hydrogen"
+CARBON_MODEL = "gemini-4-carbon"
 ARGON_MODEL = "gemini-4-argon"
 # 이미지 생성·편집은 Nano Banana 2.1 하나만 쓴다 (서버 설정에 예전 모델이 남아 있어도 get_config가 덮어쓴다)
 IMAGE_MODEL = "gemini-nano-banana-2.1"
-MAX_THINKING_LEVEL = "high"
 
-AVAILABLE_MODELS = {
-    "flash-lite": {
-        "display_name": "Flash-Lite 최고 추론 (Gemini 3.5 Flash-Lite)",
-        "text": FLASH_LITE_MODEL,
-        "image": IMAGE_MODEL,
-        "thinking_level": MAX_THINKING_LEVEL,
-    },
-    "flash": {
-        "display_name": "Flash 최고 추론 (Gemini 3.8 Flash)",
-        "text": FLASH_MODEL,
-        "image": IMAGE_MODEL,
-        "thinking_level": MAX_THINKING_LEVEL,
-    },
-    "argon": {
-        "display_name": "Argon 최고 추론 (Gemini 4 Argon)",
-        "text": ARGON_MODEL,
-        "image": IMAGE_MODEL,
-        "thinking_level": MAX_THINKING_LEVEL,
-    },
+# 모델별로 받는 thinking_level (aistudio.google.com/docs/thinking, 2026-11 기준).
+# Gemini 4는 minimal을 에러로 거부하고, xhigh는 Hydrogen에만 있다. 첫 값이 아니라 아래 DEFAULT가 기본값이다.
+TEXT_MODEL_SPECS = {
+    "hydrogen": {"model": HYDROGEN_MODEL, "label": "Gemini 4 Hydrogen", "levels": ("low", "medium", "high", "xhigh")},
+    "carbon": {"model": CARBON_MODEL, "label": "Gemini 4 Carbon", "levels": ("low", "medium", "high")},
+    "argon": {"model": ARGON_MODEL, "label": "Gemini 4 Argon", "levels": ("low", "medium", "high")},
+    "flash-lite": {"model": FLASH_LITE_MODEL, "label": "Gemini 3.5 Flash-Lite", "levels": ("minimal", "low", "medium", "high")},
 }
-TEXT_MODEL = FLASH_MODEL
+MODEL_THINKING_LEVELS = {spec["model"]: spec["levels"] for spec in TEXT_MODEL_SPECS.values()}
+DEFAULT_THINKING_LEVEL = "high"  # 모든 텍스트 모델이 받는 값
+
+
+def is_bot_guild_interaction(interaction):
+    """봇이 실제로 들어가 있는 서버에서 온 상호작용인지 (사용자 설치로 남의 서버·DM에서 쓴 경우 False)."""
+    return interaction.guild_id is not None and bot.get_guild(interaction.guild_id) is not None
+
+
+def normalize_thinking_level(text_model, thinking_level):
+    """모델이 받지 않는 thinking_level이면 기본값(high)으로 바꾼다."""
+    levels = MODEL_THINKING_LEVELS.get(text_model)
+    if not levels or thinking_level in levels:
+        return thinking_level
+    return DEFAULT_THINKING_LEVEL
+
+
+# /model 선택지: 모델 × 추론 강도 (예: hydrogen-xhigh). 디스코드 선택지 25개 제한 안쪽.
+AVAILABLE_MODELS = {
+    f"{key}-{level}": {
+        "display_name": f"{spec['label']} · 추론 {level}",
+        "text": spec["model"],
+        "image": IMAGE_MODEL,
+        "thinking_level": level,
+    }
+    for key, spec in TEXT_MODEL_SPECS.items()
+    for level in spec["levels"]
+}
+TEXT_MODEL = HYDROGEN_MODEL
+TEXT_THINKING_LEVEL = DEFAULT_THINKING_LEVEL  # 개인·서버 설정이 없을 때 쓰는 기본 (/model은 더 이상 글로벌을 바꾸지 않는다)
 # Deep Research는 모델 선택과 분리된 전용 명령어(/deepo, /deepm)로만 실행
 DEEP_RESEARCH_AGENTS = {
     "deepo": "deep-research-preview-04-2026",
@@ -163,7 +180,7 @@ TEXT_ATTACHMENT_EXTENSIONS = (
     ".log", ".xml", ".yaml", ".yml", ".toml", ".ini", ".sh", ".csv", ".tsv",
 )
 MODEL_HISTORY_LIMITS = {
-    FLASH_MODEL: 20,
+    HYDROGEN_MODEL: 20,
     FLASH_LITE_MODEL: 20,
 }
 
@@ -3349,7 +3366,8 @@ async def call_gemini(history_contents, text_model=None, thinking_level=None):
     if text_model is None:
         text_model = TEXT_MODEL
     if thinking_level is None:
-        thinking_level = MAX_THINKING_LEVEL
+        thinking_level = TEXT_THINKING_LEVEL
+    thinking_level = normalize_thinking_level(text_model, thinking_level)
 
     input_data = gemini_contents_to_interaction_steps(history_contents)
     system_instruction = build_gemini_system_prompt()
@@ -3381,16 +3399,22 @@ class GeminiBot(commands.Bot):
             if configured_model and configured_model not in supported_text_models:
                 guild_config["text_model"] = TEXT_MODEL
                 guild_config["image_model"] = IMAGE_MODEL
-                guild_config["thinking_level"] = MAX_THINKING_LEVEL
+                guild_config["thinking_level"] = DEFAULT_THINKING_LEVEL
                 model_config_changed = True
                 print(
                     f"[CONFIG] guild={guild_id} unsupported text model reset: "
                     f"{configured_model} -> {TEXT_MODEL}"
                 )
-            elif configured_model and guild_config.get("thinking_level") != MAX_THINKING_LEVEL:
-                guild_config["thinking_level"] = MAX_THINKING_LEVEL
-                model_config_changed = True
-                print(f"[CONFIG] guild={guild_id} thinking level fixed: {MAX_THINKING_LEVEL}")
+            elif configured_model:
+                current_level = guild_config.get("thinking_level")
+                fixed_level = normalize_thinking_level(configured_model, current_level or DEFAULT_THINKING_LEVEL)
+                if fixed_level != current_level:
+                    guild_config["thinking_level"] = fixed_level
+                    model_config_changed = True
+                    print(
+                        f"[CONFIG] guild={guild_id} thinking level fixed: "
+                        f"{current_level} -> {fixed_level} ({configured_model})"
+                    )
         if model_config_changed:
             DataManager.save_json(CONFIG_FILE, self.server_configs)
         self.channel_locks = {}
@@ -3448,7 +3472,7 @@ class GeminiBot(commands.Bot):
                 "reset_time": None,
                 "text_model": TEXT_MODEL,
                 "image_model": IMAGE_MODEL,
-                "thinking_level": MAX_THINKING_LEVEL,
+                "thinking_level": TEXT_THINKING_LEVEL,
                 "history_limit": DEFAULT_HISTORY_LIMIT,
                 "history_block": DEFAULT_HISTORY_BLOCK,
                 "image_history_limit": DEFAULT_IMAGE_HISTORY_LIMIT,
@@ -3456,7 +3480,10 @@ class GeminiBot(commands.Bot):
             }
         self.server_configs[gid].setdefault("text_model", TEXT_MODEL)
         self.server_configs[gid]["image_model"] = IMAGE_MODEL
-        self.server_configs[gid]["thinking_level"] = MAX_THINKING_LEVEL
+        cfg = self.server_configs[gid]
+        cfg["thinking_level"] = normalize_thinking_level(
+            cfg["text_model"], cfg.get("thinking_level") or DEFAULT_THINKING_LEVEL
+        )
         self.server_configs[gid].setdefault("history_limit", DEFAULT_HISTORY_LIMIT)
         self.server_configs[gid].setdefault("history_block", DEFAULT_HISTORY_BLOCK)
         self.server_configs[gid].setdefault("image_history_limit", DEFAULT_IMAGE_HISTORY_LIMIT)
@@ -3492,6 +3519,35 @@ class GeminiBot(commands.Bot):
             global_cfg = {}
             self.server_configs["_global"] = global_cfg
         return global_cfg
+
+    def get_user_model(self, user_id):
+        """사용자 설치(/chat·/image·DM /model)용 개인 모델 설정. 없으면 None."""
+        users = self.server_configs.get("_users")
+        if not isinstance(users, dict):
+            return None
+        entry = users.get(str(user_id))
+        if not isinstance(entry, dict) or entry.get("text_model") not in MODEL_THINKING_LEVELS:
+            return None
+        return entry
+
+    def set_user_model(self, user_id, text_model, thinking_level):
+        users = self.server_configs.get("_users")
+        if not isinstance(users, dict):
+            users = {}
+            self.server_configs["_users"] = users
+        users[str(user_id)] = {"text_model": text_model, "thinking_level": thinking_level}
+        self.save_config()
+
+    def resolve_personal_model(self, interaction):
+        """/chat·/image가 쓸 (모델, 추론 강도): 개인 설정 → 봇이 들어간 서버의 설정 → 기본값."""
+        entry = self.get_user_model(interaction.user.id)
+        if entry:
+            text_model = entry["text_model"]
+            return text_model, normalize_thinking_level(text_model, entry.get("thinking_level"))
+        if is_bot_guild_interaction(interaction):
+            cfg = self.get_config(interaction.guild_id)
+            return cfg["text_model"], cfg["thinking_level"]
+        return TEXT_MODEL, TEXT_THINKING_LEVEL
 
     def get_lavalink_session_id(self):
         return self.get_global_config().get("lavalink_session_id")
@@ -4704,15 +4760,16 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
 
         contents = [types.Content(role="user", parts=[types.Part(text=f"{format_current_time_marker()}\n"), *parts])]
 
+        chat_model, chat_thinking = bot.resolve_personal_model(interaction)
         chat_trace = {"sdk_version": GENAI_SDK_VERSION, "calls": []}
         chat_sources = []
         response, token_usage = await run_search_interaction(
             chat_trace,
             chat_sources,
-            model=TEXT_MODEL,
+            model=chat_model,
             input_data=gemini_contents_to_interaction_steps(contents),
             system_instruction=CHAT_SYSTEM_PROMPT,
-            thinking_level=MAX_THINKING_LEVEL,
+            thinking_level=chat_thinking,
         )
 
         status = get_interaction_status(response)
@@ -4729,7 +4786,7 @@ async def chat_command(interaction: discord.Interaction, message: str, image: di
                 await interaction.followup.send(chunk)
 
             usage_detail = chat_trace.get("usage") or {}
-            print(f"  [BOT]({TEXT_MODEL}): {text_reply}")
+            print(f"  [BOT]({chat_model}/{chat_thinking}): {text_reply}")
             print(
                 f"  [TOKEN]: {token_usage} (In: {usage_detail.get('input', 0)}, Cached: {usage_detail.get('cached', 0)}, "
                 f"Search: {chat_trace.get('search')})"
@@ -4795,12 +4852,13 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
             user_message += "\nA reference image is provided for editing."
         user_message += "\n\nReturn the refined image prompt and an optional brief user-facing message."
 
+        image_text_model, image_thinking = bot.resolve_personal_model(interaction)
         response = await create_model_interaction(
-            model=TEXT_MODEL,
+            model=image_text_model,
             input_data=user_message,
             system_instruction=IMAGE_SYSTEM_PROMPT,
             response_schema=IMAGE_PROMPT_SCHEMA,
-            thinking_level=MAX_THINKING_LEVEL,
+            thinking_level=image_thinking,
         )
 
         status = get_interaction_status(response)
@@ -4820,7 +4878,7 @@ async def image_command(interaction: discord.Interaction, prompt: str, reference
             if len(text_reply) > 1900:
                 text_reply = text_reply[:1900] + "..."
             await interaction.followup.send(text_reply)
-            print(f"  [BOT]({TEXT_MODEL}): {text_reply}")
+            print(f"  [BOT]({image_text_model}): {text_reply}")
 
         status_msg = await interaction.followup.send(f"**Generating:** `{generated_prompt}`")
 
@@ -5406,47 +5464,54 @@ async def deepm_command(interaction: discord.Interaction, prompt: str):
     for key, info in AVAILABLE_MODELS.items()
 ])
 async def switch_model(interaction: discord.Interaction, name: str = None):
-    global TEXT_MODEL, IMAGE_MODEL
+    # 봇이 들어간 서버: 그 서버 채널 대화용 설정. 그 밖(DM·사용자 설치로 쓴 남의 서버): 내 개인 설정(/chat·/image).
+    server_scope = is_bot_guild_interaction(interaction)
     if name is None:
-        if interaction.guild:
-            cfg = bot.get_config(interaction.guild_id)
-            server_tm = cfg.get("text_model", TEXT_MODEL)
-            server_im = cfg.get("image_model", IMAGE_MODEL)
-            server_hist = get_history_limit(cfg)
-            server_image_hist = get_image_history_limit(cfg)
-            await interaction.response.send_message(
-                f"이 서버 모델: `{server_tm}` (텍스트, 히스토리 {server_hist}개, 이미지 {server_image_hist}개) / `{server_im}` (이미지)\n"
-                f"글로벌 기본값: `{TEXT_MODEL}` / `{IMAGE_MODEL}`"
-            )
+        personal = bot.get_user_model(interaction.user.id)
+        if personal:
+            personal_line = f"내 개인 설정: `{personal['text_model']}` (추론 `{personal['thinking_level']}`)"
         else:
-            await interaction.response.send_message(
-                f"글로벌 기본 모델: `{TEXT_MODEL}` / `{IMAGE_MODEL}` (이미지)"
+            personal_line = f"내 개인 설정: 없음 → 기본값 `{TEXT_MODEL}` (추론 `{TEXT_THINKING_LEVEL}`)"
+        lines = []
+        if server_scope:
+            cfg = bot.get_config(interaction.guild_id)
+            lines.append(
+                f"이 서버 모델: `{cfg['text_model']}` (추론 `{cfg['thinking_level']}`, "
+                f"히스토리 {get_history_limit(cfg)}개, 이미지 {get_image_history_limit(cfg)}개)"
             )
+        lines.append(personal_line)
+        lines.append(f"이미지 모델: `{IMAGE_MODEL}`")
+        await interaction.response.send_message("\n".join(lines), ephemeral=not server_scope)
         return
     if name not in AVAILABLE_MODELS:
         available = ', '.join(AVAILABLE_MODELS.keys())
         await temp_reply(interaction, f"'{name}' 모델을 찾을 수 없습니다. 사용 가능: {available}")
         return
-    TEXT_MODEL = AVAILABLE_MODELS[name]["text"]
-    IMAGE_MODEL = AVAILABLE_MODELS[name]["image"]
+    text_model = AVAILABLE_MODELS[name]["text"]
     thinking_level = AVAILABLE_MODELS[name]["thinking_level"]
-    if interaction.guild:
-        cfg = bot.get_config(interaction.guild_id)
-        cfg["text_model"] = TEXT_MODEL
-        cfg["image_model"] = IMAGE_MODEL
-        cfg["thinking_level"] = thinking_level
-        bot.save_config()
-    cfg = bot.get_config(interaction.guild_id) if interaction.guild else {}
+    if not server_scope:
+        bot.set_user_model(interaction.user.id, text_model, thinking_level)
+        await interaction.response.send_message(
+            f"내 모델 변경됨: **{name}**\n텍스트: `{text_model}` / 추론 `{thinking_level}`\n"
+            f"이미지: `{IMAGE_MODEL}`\n(/chat·/image에 적용, 나에게만 저장)",
+            ephemeral=True,
+        )
+        return
+    cfg = bot.get_config(interaction.guild_id)
+    cfg["text_model"] = text_model
+    cfg["image_model"] = IMAGE_MODEL
+    cfg["thinking_level"] = thinking_level
+    bot.save_config()
     history_limit = get_history_limit(cfg)
     history_block = get_history_block(cfg)
     media_cap = get_image_history_limit(cfg)
     actor_name = get_server_display_name(interaction.guild, interaction.user)
-    thinking_label = f"`{thinking_level}`"
     await interaction.response.send_message(
-        f"모델 변경됨: **{name}** by {actor_name}\n"
-        f"텍스트: `{TEXT_MODEL}`\n이미지: `{IMAGE_MODEL}`\n"
-        f"사고 수준: {thinking_label}\n"
-        f"히스토리: {history_limit}~{history_limit + history_block - 1}개 (블록 {history_block}) / 미디어 상한 {media_cap}개"
+        f"서버 모델 변경됨: **{name}** by {actor_name}\n"
+        f"텍스트: `{text_model}`\n이미지: `{IMAGE_MODEL}`\n"
+        f"사고 수준: `{thinking_level}`\n"
+        f"히스토리: {history_limit}~{history_limit + history_block - 1}개 (블록 {history_block}) / 미디어 상한 {media_cap}개\n"
+        f"(DM이나 봇이 없는 서버에서 /model을 쓰면 내 개인 설정이 바뀝니다)"
     )
 
 if __name__ == "__main__":
