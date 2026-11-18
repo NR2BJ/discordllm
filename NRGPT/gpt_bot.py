@@ -79,17 +79,18 @@ MODELS = {
         "efforts": EFFORT_LEVELS,
         "price": (1.0, 5.0, 0.05, 1.25),
     },
+    # 6.2 Sol·Astra (2026-11 공식 문서): effort low~max, none은 400으로 거부. temperature·top_p도 받지 않는다.
     "sol": {
-        "id": "gpt-6.1-sol",
-        "name": "GPT-6.1 Sol",
+        "id": "gpt-6.2-sol",
+        "name": "GPT-6.2 Sol",
         "efforts": EFFORT_LEVELS[1:],
         "price": (2.0, 10.0, 0.10, 2.50),
     },
     "astra": {
-        "id": "gpt-6-astra",
-        "name": "GPT-6 Astra",
+        "id": "gpt-6.2-astra",
+        "name": "GPT-6.2 Astra",
         "efforts": EFFORT_LEVELS[1:],
-        "price": (10.0, 50.0, 1.0, 12.50),
+        "price": (8.0, 40.0, 0.40, 10.0),  # 캐시 쓰기 가격은 문서에 없어 입력의 1.25배로 추정
     },
 }
 DEFAULT_MODEL_KEY = "terra"
@@ -106,8 +107,8 @@ REPLY_DEADLINE_SECONDS = 900
 
 # 이미지 생성·수정은 hosted image_generation 도구. 그릴지, 새로 그릴지 고칠지는 대화 모델이 정한다.
 IMAGE_MODELS = {
-    "flare": {"id": "gpt-image-2.5-flare", "name": "GPT Image 2.5 Flare (빠른 일반 생성)"},
-    "sunburst": {"id": "gpt-image-2.5-sunburst", "name": "GPT Image 2.5 Sunburst (정밀 수정)"},
+    "flare": {"id": "gpt-image-2.6-flare", "name": "GPT Image 2.6 Flare (빠른 일반 생성)"},
+    "sunburst": {"id": "gpt-image-2.6-sunburst", "name": "GPT Image 2.6 Sunburst (정밀 수정)"},
 }
 DEFAULT_IMAGE_MODEL_KEY = "flare"
 IMAGE_QUALITIES = ("auto", "low", "medium", "high", "xhigh", "max")

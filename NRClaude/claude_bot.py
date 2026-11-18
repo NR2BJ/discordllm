@@ -62,7 +62,7 @@ WEB_SEARCH_MAX_CALLS = 5  # 한 메시지에서 검색 호출 총 상한
 WEB_SEARCH_MAX_ROUNDS = WEB_SEARCH_MAX_CALLS  # 한 번에 하나씩 검색해도 한도를 다 쓸 수 있게 왕복 수를 맞춘다
 MAX_PAUSE_TURNS = 3  # Claude 기본 검색이 길어져 pause_turn으로 멈췄을 때 이어서 보내는 횟수 상한
 
-# 세 모델 모두 어댑티브 사고만 쓴다. 사고 강도(effort)를 비우면 모델 기본값(Haiku·Opus medium, Sonnet high).
+# 모든 모델이 어댑티브 사고만 쓴다. 사고 강도(effort)를 비우면 모델 기본값(Haiku·Opus medium, Sonnet·Fable high).
 # 가격은 100만 토큰당 달러: (입력, 출력, 캐시 읽기, 캐시 쓰기 5분). 로그에 찍는 예상 비용 계산용이다.
 MODELS = {
     "haiku": {
@@ -83,6 +83,13 @@ MODELS = {
         "name": "Claude Opus 5.5",
         "default_effort": "medium",
         "price": (4.0, 20.0, 0.20, 5.0),
+    },
+    # Fable 5.2: 사고는 항상 켜짐(어댑티브), 기본 effort high. 비싸서 수동 선택용으로만 둔다.
+    "fable": {
+        "id": "claude-fable-5-2",
+        "name": "Claude Fable 5.2",
+        "default_effort": "high",
+        "price": (8.0, 40.0, 0.20, 10.0),
     },
 }
 DEFAULT_MODEL_KEY = "haiku"
