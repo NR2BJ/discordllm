@@ -93,7 +93,9 @@ print(f"[GEMINI] google-genai SDK {GENAI_SDK_VERSION}")
 FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 HYDROGEN_MODEL = "gemini-4-hydrogen"
 CARBON_MODEL = "gemini-4-carbon"
-ARGON_MODEL = "gemini-4-argon"
+NEON_MODEL = "gemini-4-neon"
+# 빠진 모델 → 대신 쓸 모델. 저장된 서버·개인 설정이 이 모델을 가리키면 재시작 때 옮긴다 (추론 강도는 유지, 안 맞으면 high).
+RETIRED_TEXT_MODELS = {"gemini-4-argon": NEON_MODEL}
 # 이미지 생성·편집은 Nano Banana 2.1 하나만 쓴다 (서버 설정에 예전 모델이 남아 있어도 get_config가 덮어쓴다)
 IMAGE_MODEL = "gemini-nano-banana-2.1"
 
@@ -101,8 +103,8 @@ IMAGE_MODEL = "gemini-nano-banana-2.1"
 # Gemini 4는 minimal을 에러로 거부하고, xhigh는 Hydrogen에만 있다. 첫 값이 아니라 아래 DEFAULT가 기본값이다.
 TEXT_MODEL_SPECS = {
     "hydrogen": {"model": HYDROGEN_MODEL, "label": "Gemini 4 Hydrogen", "levels": ("low", "medium", "high", "xhigh")},
+    "neon": {"model": NEON_MODEL, "label": "Gemini 4 Neon", "levels": ("low", "medium", "high", "xhigh")},
     "carbon": {"model": CARBON_MODEL, "label": "Gemini 4 Carbon", "levels": ("low", "medium", "high")},
-    "argon": {"model": ARGON_MODEL, "label": "Gemini 4 Argon", "levels": ("low", "medium", "high")},
     "flash-lite": {"model": FLASH_LITE_MODEL, "label": "Gemini 3.5 Flash-Lite", "levels": ("minimal", "low", "medium", "high")},
 }
 MODEL_THINKING_LEVELS = {spec["model"]: spec["levels"] for spec in TEXT_MODEL_SPECS.values()}
@@ -3396,6 +3398,12 @@ class GeminiBot(commands.Bot):
             if guild_id.startswith("_") or not isinstance(guild_config, dict):
                 continue
             configured_model = guild_config.get("text_model")
+            if configured_model in RETIRED_TEXT_MODELS:
+                replacement = RETIRED_TEXT_MODELS[configured_model]
+                guild_config["text_model"] = replacement
+                model_config_changed = True
+                print(f"[CONFIG] guild={guild_id} retired text model moved: {configured_model} -> {replacement}")
+                configured_model = replacement
             if configured_model and configured_model not in supported_text_models:
                 guild_config["text_model"] = TEXT_MODEL
                 guild_config["image_model"] = IMAGE_MODEL
@@ -3415,6 +3423,18 @@ class GeminiBot(commands.Bot):
                         f"[CONFIG] guild={guild_id} thinking level fixed: "
                         f"{current_level} -> {fixed_level} ({configured_model})"
                     )
+        user_models = self.server_configs.get("_users")
+        if isinstance(user_models, dict):
+            for user_id, entry in user_models.items():
+                if not isinstance(entry, dict) or entry.get("text_model") not in RETIRED_TEXT_MODELS:
+                    continue
+                replacement = RETIRED_TEXT_MODELS[entry["text_model"]]
+                entry["text_model"] = replacement
+                entry["thinking_level"] = normalize_thinking_level(
+                    replacement, entry.get("thinking_level") or DEFAULT_THINKING_LEVEL
+                )
+                model_config_changed = True
+                print(f"[CONFIG] user={user_id} retired text model moved -> {replacement}")
         if model_config_changed:
             DataManager.save_json(CONFIG_FILE, self.server_configs)
         self.channel_locks = {}
