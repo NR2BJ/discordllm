@@ -64,6 +64,7 @@ MAX_PAUSE_TURNS = 3  # Claude 기본 검색이 길어져 pause_turn으로 멈췄
 
 # 모든 모델이 어댑티브 사고만 쓴다. 사고 강도(effort)를 비우면 모델 기본값(Haiku·Opus medium, Sonnet·Fable high).
 # 가격은 100만 토큰당 달러: (입력, 출력, 캐시 읽기, 캐시 쓰기 5분). 로그에 찍는 예상 비용 계산용이다.
+# 캐시 쓰기 1시간은 입력 단가의 2배라 따로 적지 않는다 (UsageTally.add_usage에서 계산).
 MODELS = {
     "haiku": {
         "id": "claude-haiku-5-5",
@@ -76,7 +77,7 @@ MODELS = {
         "id": "claude-sonnet-5-5",
         "name": "Claude Sonnet 5.5",
         "default_effort": "high",
-        "price": (2.0, 10.0, 0.20, 2.50),
+        "price": (2.0, 10.0, 0.10, 2.50),
     },
     "opus": {
         "id": "claude-opus-5-5",
@@ -97,6 +98,15 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MAX_OUTPUT_TOKENS = 16000  # 사고 토큰도 여기에 포함된다
 MAX_OUTPUT_TOKENS_DEEP = 32000  # 사고 강도 xhigh·max
 NATIVE_SEARCH_PRICE = 0.01  # Claude 기본 웹 검색 1회 요금
+# 프롬프트 캐시 수명. 시스템 프롬프트·히스토리 끝 지점에 쓴다 ("1h" 또는 "5m").
+# 디스코드 대화는 5~60분씩 끊기는 일이 잦아, 5분이면 끊길 때마다 히스토리 전체를 1.25배로 다시 쓴다.
+# 1시간은 쓰기 단가가 2배지만 새로 붙은 부분(지난 답장 + 새 메시지)만 쓰고, 끊겨도 0.05배로 읽는다.
+# 요청 끝 자동 지점(도구 왕복용, 몇 초 간격)은 늘 5분이다. 긴 TTL 지점이 앞에 와야 해서 순서도 맞다.
+CACHE_TTL = os.environ.get("CLAUDE_CACHE_TTL", "1h").strip().lower()
+if CACHE_TTL not in ("1h", "5m"):
+    CACHE_TTL = "1h"
+# 캐시 진단(diagnostics): 같은 채널의 직전 응답과 비교해 캐시가 어디서 깨졌는지(시스템·도구·히스토리) 알려 준다
+CACHE_DIAGNOSTICS = os.environ.get("CLAUDE_CACHE_DIAGNOSTICS", "1").strip().lower() not in ("0", "false", "off", "no")
 # 접수 단계: 연결~첫 이벤트(message_start)까지. 보통 몇 초라 넘으면 꼬인 것으로 보고 버린 뒤 다시 보낸다.
 CLAUDE_ACCEPT_TIMEOUT_SECONDS = 60
 CLAUDE_ACCEPT_ATTEMPTS = 2
@@ -149,12 +159,12 @@ _COMMON_RULES = """## General Rules
 - Keep responses concise and Discord-appropriate."""
 
 HISTORY_TIME_RULE = (
-    "- Earlier user messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
+    "- User messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
     "how long ago something was said. Do not copy this label format in your replies."
 )
 
 CURRENT_TIME_RULE = (
-    "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
+    "- The latest message ends with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
     "automatically; the user did not write it. It is the real current date and time; your training data is older, "
     "so do not assume an earlier year."
 )
@@ -214,7 +224,7 @@ def format_sent_time(sent_at):
 
 
 def format_current_time_marker():
-    """현재 메시지 맨 앞에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
+    """현재 메시지 맨 뒤 블록에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
 
     매 분 바뀌는 값이라 시스템 프롬프트(히스토리 앞)에 두면 히스토리 캐시가 깨져서, 매번 새로 바뀌는
     현재 메시지에 붙인다. 이 줄의 뜻은 시스템 프롬프트가 설명한다 (Gemini·LLM 봇과 같은 문구).
@@ -633,7 +643,7 @@ def strip_bot_name_prefix(text):
 
 def clean_response_text(text, speaker_labels):
     """모델이 시각 줄·봇 이름·대화 기록의 `표시명 (시각):`·`표시명:` 라벨을 흉내 내 답장 앞에 붙이면 지운다."""
-    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*", "", text or "")
+    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*|\s*\[System time: [^\]\n]+\]\s*$", "", text or "")
     text = re.sub(r"^[^\n:]{1,60} \(\d{2}/\d{2} \d{2}:\d{2}\):[ \t]*\n?", "", text, count=1)
     bot_name = get_bot_display_name()
     if text.startswith(f"{bot_name}:"):
@@ -649,14 +659,19 @@ def is_bot_notice(content):
     return (content or "").startswith(BOT_NOTICE_PREFIXES)
 
 
-def mark_cache_breakpoint(history):
-    """히스토리 마지막 블록에 캐시 지점을 둔다.
+def long_cache_control():
+    """시스템 프롬프트·히스토리 끝 지점용 (CACHE_TTL). 대화가 끊겼다 이어져도 다시 쓰지 않고 읽게 한다."""
+    return {"type": "ephemeral", "ttl": CACHE_TTL}
 
-    현재 메시지는 맨 앞 시각 줄 때문에 다음 요청에서 같은 모양으로 다시 나오지 않으므로, 다음 요청이 읽을 수
-    있는 캐시는 '히스토리 끝'까지다. 시스템 프롬프트 지점 + 이 지점 + 요청 끝 자동 지점(도구 왕복용) = 3개.
+
+def mark_cache_breakpoint(history):
+    """히스토리 마지막 블록에 캐시 지점을 둔다 (CACHE_TTL).
+
+    현재 메시지 본문 끝 지점(build_current_blocks)이 다음 요청에서 맞지 않을 때(이미지가 다르게 잡히는 등)에도
+    이 지점까지는 읽을 수 있게 남겨 둔다.
     """
     if history:
-        history[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        history[-1]["content"][-1]["cache_control"] = long_cache_control()
 
 # ================= 4. 이미지 =================
 CLAUDE_IMAGE_TYPES = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
@@ -1356,8 +1371,10 @@ def find_urls(text):
     return urls[:MAX_LINKS_PER_MESSAGE]
 
 
-async def read_links(message, user_text):
+async def read_links(message, user_text, notes=None):
     """현재 메시지의 링크 본문을 읽어 user_text 끝에 붙인다. 반환: (user_text, 못 읽은 URL 목록)
+
+    본문은 문서 캐시에도 넣어 Claude에는 render_history_body로 보낸다. 본문이 아닌 안내 문구는 notes에도 담는다.
 
     직접 읽기 → (PDF·실패한 링크) Tavily Extract → 그래도 못 읽은 링크는 web_fetch 도구로 Claude가 직접 읽게 한다.
     """
@@ -1388,10 +1405,13 @@ async def read_links(message, user_text):
             else:
                 print(f"[WEB] 링크 미리 읽기 실패 → web_fetch 허용: {url} ({extract_failed.get(url) or 'Tavily 사용 안 함'})")
                 unread.append(url)
-                user_text += (
-                    f"\n\n(System: 이 링크의 본문을 미리 읽지 못했습니다: {url} — web_fetch 도구로 직접 읽어 보고, "
+                note = (
+                    f"(System: 이 링크의 본문을 미리 읽지 못했습니다: {url} — web_fetch 도구로 직접 읽어 보고, "
                     "그래도 못 읽으면 내용을 추측하지 말 것)"
                 )
+                user_text += f"\n\n{note}"
+                if notes is not None:
+                    notes.append(note)
     return user_text, unread
 
 # ================= 7. Claude 호출 =================
@@ -1419,6 +1439,7 @@ class UsageTally:
         self.input_tokens = 0
         self.cache_read = 0
         self.cache_write = 0
+        self.cache_write_1h = 0  # cache_write 중 1시간 TTL로 쓴 몫 (단가가 입력의 2배)
         self.output_tokens = 0
         self.native_searches = 0
         self.native_fetches = 0
@@ -1435,6 +1456,7 @@ class UsageTally:
         new_input = value(usage, "input_tokens")
         read = value(usage, "cache_read_input_tokens")
         write = value(usage, "cache_creation_input_tokens")
+        write_1h = min(write, value(getattr(usage, "cache_creation", None), "ephemeral_1h_input_tokens"))
         output = value(usage, "output_tokens")
         server_tools = getattr(usage, "server_tool_use", None)
         searches = value(server_tools, "web_search_requests")
@@ -1444,15 +1466,17 @@ class UsageTally:
         self.input_tokens += new_input
         self.cache_read += read
         self.cache_write += write
+        self.cache_write_1h += write_1h
         self.output_tokens += output
         self.native_searches += searches
         self.native_fetches += fetches
         self.cost += (
-            new_input * price_in + output * price_out + read * price_read + write * price_write
+            new_input * price_in + output * price_out + read * price_read
+            + (write - write_1h) * price_write + write_1h * price_in * 2
         ) / 1_000_000 + searches * NATIVE_SEARCH_PRICE
 
     def merge(self, other):
-        for name in ("calls", "input_tokens", "cache_read", "cache_write", "output_tokens",
+        for name in ("calls", "input_tokens", "cache_read", "cache_write", "cache_write_1h", "output_tokens",
                      "native_searches", "native_fetches", "cost"):
             setattr(self, name, getattr(self, name) + getattr(other, name))
 
@@ -1462,7 +1486,8 @@ class UsageTally:
         if self.native_searches or self.native_fetches:
             extra = f", Claude 검색 {self.native_searches}회·읽기 {self.native_fetches}회"
         return (
-            f"In: {self.prompt_tokens}, Cached: {self.cache_read}{cache_rate}, Write: {self.cache_write}, "
+            f"In: {self.prompt_tokens}, Cached: {self.cache_read}{cache_rate}, "
+            f"Write: {self.cache_write} (1h {self.cache_write_1h}), "
             f"Out: {self.output_tokens}, calls={self.calls}{extra}, ~${self.cost:.5f}"
         )
 
@@ -1494,7 +1519,9 @@ async def _stream_claude_once(request):
     last_event = "(연결 전)"
     try:
         async with asyncio.timeout(CLAUDE_ACCEPT_TIMEOUT_SECONDS) as deadline:
-            async with bot.claude.messages.stream(**request) as stream:
+            # diagnostics는 베타 엔드포인트에만 있다 (응답 모양은 같다)
+            messages_api = bot.claude.beta.messages if "diagnostics" in request else bot.claude.messages
+            async with messages_api.stream(**request) as stream:
                 last_event = "(헤더 받음)"
                 async for event in stream:
                     if events == 0:
@@ -1535,7 +1562,35 @@ async def call_claude(**request):
             await asyncio.sleep(2)
 
 
-async def run_claude(model, system_blocks, messages, *, effort, user_hash, backend, fetch_enabled, tally, sources):
+def note_cache_diagnostics(response, previous_id, round_no):
+    """캐시 진단 결과를 로그와 /claude 상태 통계에 남긴다.
+
+    hit: 직전 요청과 앞부분이 같고 캐시도 읽음 / expired: 앞부분은 같은데 캐시가 없음(TTL 만료·최소 길이 미만)
+    / pending: 비교가 아직 안 끝남 / 그 밖: API가 알려 준 원인(system_changed·tools_changed·messages_changed 등)
+    """
+    if previous_id is None:
+        return
+    usage = response.usage
+    read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    prompt = int(getattr(usage, "input_tokens", 0) or 0) + read + int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    diagnostics = getattr(response, "diagnostics", None)
+    reason = getattr(diagnostics, "cache_miss_reason", None) if diagnostics is not None else None
+    missed = None
+    if diagnostics is None:
+        kind = "hit" if read * 2 >= prompt else "expired"
+    elif reason is None:
+        kind = "pending"
+    else:
+        kind = getattr(reason, "type", None) or "unknown"
+        missed = getattr(reason, "cache_missed_input_tokens", None)
+    bot.cache_diag[kind] = bot.cache_diag.get(kind, 0) + 1
+    if kind != "hit":
+        extra = f" missed≈{missed}" if missed is not None else ""
+        print(f"[CACHE] 진단 round={round_no}: {kind}{extra} read={read}/{prompt} prev={previous_id}")
+
+
+async def run_claude(model, system_blocks, messages, *, effort, user_hash, backend, fetch_enabled, tally, sources,
+                     channel_id=None):
     """Claude 호출 + 도구 루프. backend: tavily(Tavily 검색 도구) | native(Claude 기본 검색)
 
     거부(stop_reason refusal)는 내용보다 먼저 확인하고, 거부되면 중간에 나온 글도 버린다.
@@ -1550,6 +1605,8 @@ async def run_claude(model, system_blocks, messages, *, effort, user_hash, backe
     cited_urls = []
     tool_rounds = 0
     pauses = 0
+    # 캐시 진단: 같은 채널의 직전 응답 ID와 비교한다 (채널마다 대화가 따로 쌓이므로)
+    previous_id = bot.cache_prev_ids.get(channel_id) if channel_id is not None else None
     while True:
         request = {
             "model": model["id"],
@@ -1558,9 +1615,11 @@ async def run_claude(model, system_blocks, messages, *, effort, user_hash, backe
             "messages": convo,
             "tools": tools,
             "thinking": {"type": "adaptive"},
-            "cache_control": {"type": "ephemeral"},  # 요청 끝 자동 지점: 도구 왕복 때 앞 왕복을 캐시로 읽는다
+            "cache_control": {"type": "ephemeral"},  # 요청 끝 자동 지점(5분): 도구 왕복 때 앞 왕복을 캐시로 읽는다
             "metadata": {"user_id": user_hash},
         }
+        if CACHE_DIAGNOSTICS:
+            request["diagnostics"] = {"previous_message_id": previous_id}
         if effort:
             request["output_config"] = {"effort": effort}
         if tool_rounds >= WEB_SEARCH_MAX_ROUNDS:
@@ -1576,6 +1635,11 @@ async def run_claude(model, system_blocks, messages, *, effort, user_hash, backe
             f"{time.perf_counter() - round_started:.1f}s"
         )
         tally.add_usage(model, response.usage)
+        if CACHE_DIAGNOSTICS:
+            note_cache_diagnostics(response, previous_id, tool_rounds)
+            previous_id = response.id
+            if channel_id is not None:
+                bot.cache_prev_ids[channel_id] = response.id
         if response.stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
             return ReplyResult(
@@ -1626,21 +1690,21 @@ async def run_claude(model, system_blocks, messages, *, effort, user_hash, backe
         return ReplyResult(text="".join(answer_parts).strip(), stop_reason=response.stop_reason, backend=backend)
 
 
-async def generate_reply(model, messages, *, effort, user_hash, fetch_enabled, tally, sources):
+async def generate_reply(model, messages, *, effort, user_hash, fetch_enabled, tally, sources, channel_id=None):
     """Tavily 검색 도구로 답을 만든다. Tavily를 못 쓰면 Claude 기본 검색으로 처음부터 다시 만든다."""
-    system_blocks = [{"type": "text", "text": CLAUDE_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+    system_blocks = [{"type": "text", "text": CLAUDE_SYSTEM_PROMPT, "cache_control": long_cache_control()}]
     backend = "tavily" if tavily_available() else "native"
     try:
         return await run_claude(
             model, system_blocks, messages, effort=effort, user_hash=user_hash, backend=backend,
-            fetch_enabled=fetch_enabled, tally=tally, sources=sources,
+            fetch_enabled=fetch_enabled, tally=tally, sources=sources, channel_id=channel_id,
         )
     except TavilyOutage as e:
         mark_tavily_down(e)
         sources.clear()
         return await run_claude(
             model, system_blocks, messages, effort=effort, user_hash=user_hash, backend="native",
-            fetch_enabled=fetch_enabled, tally=tally, sources=sources,
+            fetch_enabled=fetch_enabled, tally=tally, sources=sources, channel_id=channel_id,
         )
 
 # ================= 8. 봇 =================
@@ -1668,6 +1732,8 @@ class ClaudeBot(commands.Bot):
         self.images = ImageCache(IMAGE_CACHE_BYTES)
         self.stats = UsageTally()  # 봇 시작 후 누적
         self.counters = {"replies": 0, "blocked": 0, "refused": 0, "guard_errors": 0}
+        self.cache_prev_ids = {}  # 채널별 직전 Claude 응답 ID (캐시 진단 비교 대상)
+        self.cache_diag = {}  # 캐시 진단 결과별 횟수 (hit·expired·messages_changed …)
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -1758,22 +1824,29 @@ async def add_reaction(message, emoji):
         print(f"[WARN] 반응 달기 실패 ({emoji}): {e}")
 
 
-async def read_current_attachments(message, user_text):
+async def read_current_attachments(message, user_text, notes=None):
     """현재 메시지 첨부. 반환: (user_text, 보낼 이미지, 검사할 이미지)
 
     이미지는 전부 검사하고, 요청 크기 한도 안에서만 보낸다. 문서는 본문을 user_text에 붙인다.
+    본문이 아닌 안내 문구(처리 못 한 첨부 등)는 notes에도 담는다 (Claude에는 히스토리 모양 뒤에 따로 붙인다).
     """
+    def add_note(note):
+        nonlocal user_text
+        user_text += f"\n{note}"
+        if notes is not None:
+            notes.append(note)
+
     image_atts = [att for att in message.attachments if is_image_attachment(att)]
     prepared = await asyncio.gather(*(bot.images.get(att) for att in image_atts))
     images, screen_images = [], []
     used = 0
     for att, item in zip(image_atts, prepared):
         if item is None:
-            user_text += f"\n(User attached an image that could not be processed: {att.filename})"
+            add_note(f"(User attached an image that could not be processed: {att.filename})")
             continue
         screen_images.append(item)
         if used + item.size > CURRENT_MEDIA_BYTES_CAP:
-            user_text += f"\n(User attached another image, skipped because the message is too large: {att.filename})"
+            add_note(f"(User attached another image, skipped because the message is too large: {att.filename})")
             continue
         used += item.size
         images.append(item)
@@ -1783,10 +1856,10 @@ async def read_current_attachments(message, user_text):
             continue
         content_type = (att.content_type or "").lower()
         if content_type.startswith("video/"):
-            user_text += f"\n(User attached a video: {att.filename})"
+            add_note(f"(User attached a video: {att.filename})")
             continue
         if content_type.startswith("audio/"):
-            user_text += f"\n(User attached an audio file: {att.filename})"
+            add_note(f"(User attached an audio file: {att.filename})")
             continue
         extracted_text, doc_type = await extract_attachment_text(att)
         if extracted_text:
@@ -1794,7 +1867,7 @@ async def read_current_attachments(message, user_text):
             print(f"[CACHE] {doc_type or 'text'} file 저장: {doc_id} ({att.filename})")
             user_text += f'\n\nAttached file "{att.filename}":\n\n{extracted_text}'
         else:
-            user_text += f"\n(User attached a file that could not be read: {att.filename})"
+            add_note(f"(User attached a file that could not be read: {att.filename})")
     return user_text, images, screen_images
 
 
@@ -1984,6 +2057,22 @@ async def handle_refusal(message, config, result, display_name):
         await add_reaction(message, REACT_HISTORY_RESET)
 
 
+def build_current_blocks(message, label, images, notes):
+    """현재 메시지를 다음 요청의 히스토리와 같은 모양으로 만들고, 시각 줄·안내 문구는 맨 뒤 블록에 따로 둔다.
+
+    앞부분(`표시명 (MM/DD HH:MM):` + 본문(웹페이지·문서 포함) + 이미지)은 다음 요청에서 히스토리로 똑같이
+    다시 나오므로 여기에 캐시 지점을 두면 다음 요청이 이 메시지까지 읽는다 (예전에는 매번 두 번 썼다).
+    시각 줄은 매 분 바뀌고 안내 문구는 히스토리에 없으므로 그 뒤 블록에 둔다.
+    지점 4개: 시스템 프롬프트 · 히스토리 끝 · 이 메시지 본문 끝 · 요청 끝 자동(도구 왕복, 5분).
+    """
+    blocks = [{"type": "text", "text": f"{label} ({format_sent_time(message.created_at)}):\n{render_history_body(message)}"}]
+    blocks.extend(item.block() for item in images)
+    blocks[-1]["cache_control"] = long_cache_control()
+    tail = "\n".join([format_current_time_marker(), *notes])
+    blocks.append({"type": "text", "text": tail})
+    return blocks
+
+
 async def respond(message, config):
     started = time.perf_counter()
     model = get_model(config)
@@ -1992,8 +2081,9 @@ async def respond(message, config):
     display_name = get_server_display_name(message.guild, message.author)
 
     # 1) 현재 메시지: 링크 본문 → 첨부 (Gemini·LLM 봇과 같은 순서)
-    user_text, unread_urls = await read_links(message, message.content or "")
-    user_text, images, screen_images = await read_current_attachments(message, user_text)
+    notes = []
+    user_text, unread_urls = await read_links(message, message.content or "", notes)
+    user_text, images, screen_images = await read_current_attachments(message, user_text, notes)
 
     # 2) 사전 검사. 통과해야 Claude에 보낸다. 검사를 못 하면 보내지 않고 ⚠️만 단다.
     content_hash = guard_hash(message, [att for att in message.attachments if is_image_attachment(att)])
@@ -2015,13 +2105,11 @@ async def respond(message, config):
         return
     guard_ms = (time.perf_counter() - guard_started) * 1000
 
-    # 3) 히스토리 + 현재 메시지 (시각 줄 → `표시명:` → 본문(웹페이지·문서 포함) → 이미지)
+    # 3) 히스토리 + 현재 메시지
     history, speaker_labels = await build_history(message, config, guard_sexual, display_name)
     mark_cache_breakpoint(history)
     label = speaker_labels.get(message.author.id) or display_name
-    current = [{"type": "text", "text": f"{format_current_time_marker()}\n{label}:\n{user_text}"}]
-    current.extend(item.block() for item in images)
-    messages = history + [{"role": "user", "content": current}]
+    messages = history + [{"role": "user", "content": build_current_blocks(message, label, images, notes)}]
 
     # 4) Claude
     tally = UsageTally()
@@ -2037,6 +2125,7 @@ async def respond(message, config):
                 fetch_enabled=bool(unread_urls),
                 tally=tally,
                 sources=sources,
+                channel_id=message.channel.id,
             )
     except TimeoutError:
         print(
@@ -2200,8 +2289,18 @@ def format_status(config):
         f"히스토리: {base}~{base + block - 1}개 (블록 {block}) / 이미지 상한 {get_image_history_limit(config)}개\n"
         f"봇 시작 후: 답장 {counters['replies']} · 차단 {counters['blocked']} · 거부 {counters['refused']} · "
         f"검사 실패 {counters['guard_errors']} · 입력 {stats.prompt_tokens:,}토큰(캐시 {cache_rate}) · "
-        f"출력 {stats.output_tokens:,}토큰 · 약 ${stats.cost:.4f}"
+        f"출력 {stats.output_tokens:,}토큰 · 약 ${stats.cost:.4f}\n"
+        f"캐시: 수명 {CACHE_TTL} · 쓰기 {stats.cache_write:,}토큰(1시간 {stats.cache_write_1h:,}) · "
+        f"진단 {describe_cache_diagnostics()}"
     )
+
+
+def describe_cache_diagnostics():
+    if not CACHE_DIAGNOSTICS:
+        return "꺼짐"
+    if not bot.cache_diag:
+        return "아직 없음"
+    return " · ".join(f"{kind} {count}" for kind, count in sorted(bot.cache_diag.items(), key=lambda item: -item[1]))
 
 
 @bot.tree.command(name="model", description="Claude 모델·사고 강도 전환 (비우면 현재 상태)")

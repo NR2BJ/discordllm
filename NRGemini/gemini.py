@@ -227,12 +227,12 @@ RAW_CITATION_MARKER_RE = re.compile(
 )
 
 HISTORY_TIME_RULE = (
-    "- Earlier user messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
+    "- User messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
     "how long ago something was said. Do not copy this label format in your replies."
 )
 
 CURRENT_TIME_RULE = (
-    "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
+    "- The latest message ends with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
     "automatically; the user did not write it. It is the real current date and time; your training data is older, "
     "so do not assume an earlier year."
 )
@@ -1482,13 +1482,13 @@ def should_call_action_router(
     return False
 
 
-CURRENT_TIME_MARKER_ECHO_RE = re.compile(r"^\s*\[System time: [^\]\n]+\]\s*")
+CURRENT_TIME_MARKER_ECHO_RE = re.compile(r"^\s*\[System time: [^\]\n]+\]\s*|\s*\[System time: [^\]\n]+\]\s*$")
 # 히스토리 라벨 `이름 (MM/DD HH:MM):`을 모델이 답 첫머리에 흉내 내면 지운다
 SENT_LABEL_ECHO_RE = re.compile(r"^[^\n:]{1,60} \(\d{2}/\d{2} \d{2}:\d{2}\):[ \t]*\n?")
 
 
 def format_current_time_marker():
-    """현재 메시지 맨 앞에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
+    """현재 메시지 맨 뒤에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
 
     모델이 학습 시점을 오늘로 믿고 검색어에 옛 날짜를 넣는 문제가 LLM 봇에서 실측돼(worklog 2026-10-01) 두 봇에 넣는다.
     매 분 바뀌는 값이라 시스템 프롬프트(히스토리 앞)에 두면 히스토리 캐시가 깨져서, 매번 새로 바뀌는 현재 메시지에 붙인다.
@@ -1503,7 +1503,7 @@ def format_current_time_marker():
 
 def strip_time_marker_echo(text):
     """모델이 현재 시각 줄이나 히스토리 라벨을 흉내 내 답변 첫머리에 붙이면 지운다."""
-    text = CURRENT_TIME_MARKER_ECHO_RE.sub("", text or "", count=1)
+    text = CURRENT_TIME_MARKER_ECHO_RE.sub("", text or "")
     return SENT_LABEL_ECHO_RE.sub("", text, count=1)
 
 
@@ -4570,20 +4570,30 @@ async def on_message(message):
                         await status_msg.edit(embed=status_embed)
                     return
 
+                # 현재 메시지는 다음 요청의 히스토리와 같은 모양(`표시명 (MM/DD HH:MM):` + 본문·문서 한 덩어리 +
+                # 미디어)으로 보내고, 현재 시각 줄은 맨 뒤에 둔다. 그러면 다음 요청이 이 메시지까지 캐시로 읽는다
+                # (예전에는 맨 앞 시각 줄 때문에 여기서 앞부분이 끊겼다).
+                current_history_text = message.content or ""
+                current_doc_blocks = bot.doc_cache.render_blocks(message.id, full_content=True)
+                if current_doc_blocks:
+                    current_history_text += "\n\n" + "\n\n".join(current_doc_blocks)
+                current_model_parts = [types.Part(text=current_history_text)] if current_history_text.strip() else []
+                current_model_parts.extend(
+                    part for part in current_parts if part.inline_data is not None or part.file_data is not None
+                )
                 conversation_entries = history_entries + [
                     (
-                        types.Content(role="user", parts=current_parts),
+                        types.Content(role="user", parts=current_model_parts or current_parts),
                         message.author.id,
                         current_display_name,
-                        None,
+                        message.created_at,
                     )
                 ]
                 labeled_contents = label_discord_user_contents(conversation_entries)
-                # 현재 메시지 맨 앞에 현재 시각 줄 (시스템 프롬프트에 두면 매 분 바뀌어 히스토리 캐시가 깨진다)
                 current_content = labeled_contents[-1]
                 labeled_contents[-1] = types.Content(
                     role=current_content.role,
-                    parts=[types.Part(text=f"{format_current_time_marker()}\n"), *(current_content.parts or [])],
+                    parts=[*(current_content.parts or []), types.Part(text=f"\n{format_current_time_marker()}")],
                 )
                 full_contents = merge_adjacent_contents(labeled_contents)
 

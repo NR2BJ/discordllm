@@ -1,5 +1,5 @@
 discord.py
-anthropic>=1.13,<2
+anthropic>=1.17,<2
 aiohttp
 beautifulsoup4
 pypdf

@@ -149,12 +149,12 @@ _COMMON_RULES = """## General Rules
 - Keep responses concise and Discord-appropriate."""
 
 HISTORY_TIME_RULE = (
-    "- Earlier user messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
+    "- User messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
     "how long ago something was said. Do not copy this label format in your replies."
 )
 
 CURRENT_TIME_RULE = (
-    "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
+    "- The latest message ends with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
     "automatically; the user did not write it. It is the real current date and time; your training data is older, "
     "so do not assume an earlier year."
 )
@@ -262,7 +262,7 @@ def format_sent_time(sent_at):
 
 
 def format_current_time_marker():
-    """현재 메시지 맨 앞에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
+    """현재 메시지 맨 뒤 블록에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
 
     매 분 바뀌는 값이라 시스템 프롬프트(히스토리 앞)에 두면 히스토리 캐시가 깨져서, 매번 새로 바뀌는
     현재 메시지에 붙인다. 이 줄의 뜻은 시스템 프롬프트가 설명한다 (Gemini·LLM 봇과 같은 문구).
@@ -681,7 +681,7 @@ def strip_bot_name_prefix(text):
 
 def clean_response_text(text, speaker_labels):
     """모델이 시각 줄·봇 이름·대화 기록의 `표시명 (시각):`·`표시명:` 라벨을 흉내 내 답장 앞에 붙이면 지운다."""
-    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*", "", text or "")
+    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*|\s*\[System time: [^\]\n]+\]\s*$", "", text or "")
     text = re.sub(r"^[^\n:]{1,60} \(\d{2}/\d{2} \d{2}:\d{2}\):[ \t]*\n?", "", text, count=1)
     bot_name = get_bot_display_name()
     if text.startswith(f"{bot_name}:"):
@@ -1275,7 +1275,7 @@ def find_urls(text):
     return urls[:MAX_LINKS_PER_MESSAGE]
 
 
-async def read_links(message, user_text, tally):
+async def read_links(message, user_text, tally, notes=None):
     """현재 메시지의 링크 본문을 읽어 user_text 끝에 붙인다.
 
     직접 읽기 → (PDF·자바스크립트 페이지·실패한 링크) DeepSeek Fetch. 그래도 못 읽으면 추측하지 말라고 적는다.
@@ -1294,7 +1294,10 @@ async def read_links(message, user_text, tally):
             user_text += f'\n\nWebpage "{url}":\n\n{trim_document_text(web_content)}'
         else:
             print(f"[WEB] 링크 읽기 실패: {url} ({error})")
-            user_text += f"\n\n(System: 이 링크의 본문을 읽지 못했습니다: {url} — 내용을 추측하지 말 것)"
+            note = f"(System: 이 링크의 본문을 읽지 못했습니다: {url} — 내용을 추측하지 말 것)"
+            user_text += f"\n\n{note}"
+            if notes is not None:
+                notes.append(note)
     return user_text
 
 
@@ -1642,11 +1645,19 @@ async def send_long_message(channel, content):
         await asyncio.sleep(0.5)
 
 
-async def read_current_attachments(message, user_text, vision):
+async def read_current_attachments(message, user_text, vision, notes=None):
     """현재 메시지 첨부. 반환: (user_text, 보낼 이미지)
 
     이미지는 요청 크기 한도 안에서만 보낸다. 문서는 본문을 user_text에 붙인다.
+    본문이 아닌 안내 문구(처리 못 한 첨부 등)는 notes에도 담는다 (히스토리 모양 뒤에 따로 붙인다).
+    NO_VISION_IMAGE_NOTE는 히스토리에도 본문 뒤에 붙으므로 notes에 넣지 않는다 (build_current_blocks가 붙인다).
     """
+    def add_note(note):
+        nonlocal user_text
+        user_text += f"\n{note}"
+        if notes is not None:
+            notes.append(note)
+
     image_atts = [att for att in message.attachments if is_image_attachment(att)]
     images = []
     if vision:
@@ -1654,10 +1665,10 @@ async def read_current_attachments(message, user_text, vision):
         used = 0
         for att, item in zip(image_atts, prepared):
             if item is None:
-                user_text += f"\n(User attached an image that could not be processed: {att.filename})"
+                add_note(f"(User attached an image that could not be processed: {att.filename})")
                 continue
             if used + item.size > CURRENT_MEDIA_BYTES_CAP:
-                user_text += f"\n(User attached another image, skipped because the message is too large: {att.filename})"
+                add_note(f"(User attached another image, skipped because the message is too large: {att.filename})")
                 continue
             used += item.size
             images.append(item)
@@ -1669,10 +1680,10 @@ async def read_current_attachments(message, user_text, vision):
             continue
         content_type = (att.content_type or "").lower()
         if content_type.startswith("video/"):
-            user_text += f"\n(User attached a video: {att.filename})"
+            add_note(f"(User attached a video: {att.filename})")
             continue
         if content_type.startswith("audio/"):
-            user_text += f"\n(User attached an audio file: {att.filename})"
+            add_note(f"(User attached an audio file: {att.filename})")
             continue
         extracted_text, doc_type = await extract_attachment_text(att)
         if extracted_text:
@@ -1680,7 +1691,7 @@ async def read_current_attachments(message, user_text, vision):
             print(f"[CACHE] {doc_type or 'text'} file 저장: {doc_id} ({att.filename})")
             user_text += f'\n\nAttached file "{att.filename}":\n\n{extracted_text}'
         else:
-            user_text += f"\n(User attached a file that could not be read: {att.filename})"
+            add_note(f"(User attached a file that could not be read: {att.filename})")
     return user_text, images
 
 
@@ -1799,6 +1810,21 @@ async def build_history(message, config, current_display_name, vision):
     return history, speaker_labels
 
 
+def build_current_blocks(message, label, images, notes, vision):
+    """현재 메시지를 다음 요청의 히스토리와 같은 모양으로 만들고, 시각 줄·안내 문구는 맨 뒤 블록에 따로 둔다.
+
+    DeepSeek 캐시는 앞부분이 같은 만큼 자동으로 읽는다. 앞부분(`표시명 (MM/DD HH:MM):` + 본문 + 이미지)이
+    다음 요청의 히스토리와 똑같으므로 다음 요청은 이 메시지까지 캐시로 읽는다 (예전에는 맨 앞 시각 줄 때문에 여기서 끊겼다).
+    """
+    body = render_history_body(message)
+    if not vision and any(is_image_attachment(att) for att in message.attachments):
+        body += "\n" + NO_VISION_IMAGE_NOTE
+    blocks = [{"type": "input_text", "text": f"{label} ({format_sent_time(message.created_at)}):\n{body}"}]
+    blocks.extend(item.block() for item in images)
+    blocks.append({"type": "input_text", "text": "\n".join([format_current_time_marker(), *notes])})
+    return blocks
+
+
 async def respond(message, config):
     started = time.perf_counter()
     model = get_model(config)
@@ -1811,15 +1837,14 @@ async def respond(message, config):
     tally = UsageTally()
 
     # 1) 현재 메시지: 링크 본문 → 첨부 (Gemini·LLM 봇과 같은 순서)
-    user_text = await read_links(message, message.content or "", tally)
-    user_text, images = await read_current_attachments(message, user_text, model["vision"])
+    notes = []
+    user_text = await read_links(message, message.content or "", tally, notes)
+    user_text, images = await read_current_attachments(message, user_text, model["vision"], notes)
 
-    # 2) 히스토리 + 현재 메시지 (시각 줄 → `표시명:` → 본문(웹페이지·문서 포함) → 이미지)
+    # 2) 히스토리 + 현재 메시지
     history, speaker_labels = await build_history(message, config, display_name, model["vision"])
     label = speaker_labels.get(message.author.id) or display_name
-    current = [{"type": "input_text", "text": f"{format_current_time_marker()}\n{label}:\n{user_text}"}]
-    current.extend(item.block() for item in images)
-    messages = history + [{"role": "user", "content": current}]
+    messages = history + [{"role": "user", "content": build_current_blocks(message, label, images, notes, model["vision"])}]
 
     # 3) DeepSeek
     sources = []

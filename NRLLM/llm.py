@@ -106,12 +106,12 @@ _COMMON_RULES = """## General Rules
 - Keep responses concise and Discord-appropriate."""
 
 HISTORY_TIME_RULE = (
-    "- Earlier user messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
+    "- User messages are labeled `Name (MM/DD HH:MM):` with the time they were sent (KST). Use it to tell "
     "how long ago something was said. Do not copy this label format in your replies."
 )
 
 CURRENT_TIME_RULE = (
-    "- The latest message begins with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
+    "- The latest message ends with a `[System time: YYYY-MM-DD (Day) HH:MM KST — …]` line. The bot inserts it "
     "automatically; the user did not write it. It is the real current date and time; your training data is older, "
     "so do not assume an earlier year."
 )
@@ -160,7 +160,7 @@ def format_sent_time(sent_at):
 
 
 def format_current_time_marker():
-    """현재 메시지 맨 앞에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
+    """현재 메시지 맨 뒤 블록에 봇이 자동으로 붙이는 현재 시각 줄 (KST).
 
     모델이 학습 시점을 오늘로 믿고 검색어에 옛 날짜를 넣는 문제가 실측됐다 (gemini-3-flash-preview가
     오늘을 2024-05-23으로 믿고 2024년 뉴스를 검색). 매 분 바뀌는 값이라 시스템 프롬프트(히스토리 앞)에 두면
@@ -619,7 +619,7 @@ def clean_assistant_response_text(text):
     if not isinstance(text, str):
         return text
     # 신규 형식: 모델이 마커를 모방해 응답 첫 줄에 붙인 경우 제거
-    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*", "", text)
+    text = re.sub(r"^\s*\[System time: [^\]\n]+\]\s*|\s*\[System time: [^\]\n]+\]\s*$", "", text)
     # 히스토리 라벨 `이름 (MM/DD HH:MM):`을 흉내 낸 경우
     text = re.sub(r"^[^\n:]{1,60} \(\d{2}/\d{2} \d{2}:\d{2}\):[ \t]*\n?", "", text, count=1)
     text = re.sub(r"^\s*\[CURRENT MESSAGE from [^\]\n]+\]\s*", "", text)
@@ -2370,6 +2370,13 @@ async def on_message(message):
                 current_content = []
                 current_image_inputs = []
                 user_text = message.content
+                # 본문이 아닌 안내 문구(못 읽은 링크·처리 못 한 첨부)는 따로 모아 현재 메시지 맨 뒤 블록에 붙인다
+                current_notes = []
+
+                def add_note(note):
+                    nonlocal user_text
+                    user_text += f"\n{note}"
+                    current_notes.append(note)
                 unresolved_urls = []
 
                 urls = re.findall(r"(https?://\S+)", message.content)
@@ -2400,7 +2407,7 @@ async def on_message(message):
                         else:
                             reason = extract_failed.get(url) or failed_by_url.get(url.rstrip("/")) or "본문 없음"
                             print(f"[WEB] 링크 읽기 실패: {url} ({reason})")
-                            user_text += f"\n\n(System: 이 링크의 본문을 읽지 못했습니다: {url} — 내용을 추측하지 말 것)"
+                            add_note(f"(System: 이 링크의 본문을 읽지 못했습니다: {url} — 내용을 추측하지 말 것)")
 
                 has_media = False
                 if message.attachments:
@@ -2422,16 +2429,16 @@ async def on_message(message):
                                     has_media = True
                                 print(f"[ATT] 이미지 base64 인코딩 완료: {att.filename} ({len(b64)} chars)")
                                 if not can_see_image:
-                                    user_text += f"\n(User attached an image: {att.filename})"
+                                    add_note(f"(User attached an image: {att.filename})")
                             else:
-                                user_text += f"\n(User attached an image: {att.filename})"
+                                add_note(f"(User attached an image: {att.filename})")
                         elif ct.startswith("video") and can_see_video and not too_large:
                             b64, mime = await encode_image(att.url)
                             if b64:
                                 current_content.append({"type": "video_url", "video_url": {"url": f"data:{mime};base64,{b64}"}})
                                 has_media = True
                             else:
-                                user_text += f"\n(User attached a video: {att.filename})"
+                                add_note(f"(User attached a video: {att.filename})")
                         elif ct.startswith("audio") and can_see_audio and not too_large:
                             b64, _ = await encode_image(att.url)
                             if b64:
@@ -2439,7 +2446,7 @@ async def on_message(message):
                                 current_content.append({"type": "input_audio", "input_audio": {"data": b64, "format": fmt}})
                                 has_media = True
                             else:
-                                user_text += f"\n(User attached an audio file: {att.filename})"
+                                add_note(f"(User attached an audio file: {att.filename})")
                         else:
                             extracted_text, doc_type = await extract_attachment_text(att)
                             if extracted_text:
@@ -2448,9 +2455,9 @@ async def on_message(message):
                                 user_text += f'\n\nAttached file "{att.filename}":\n\n{extracted_text}'
                             elif too_large:
                                 media_type = attachment_media_type(att)
-                                user_text += f"\n(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024 * 1024)}MB)"
+                                add_note(f"(User attached a {media_type} file: {att.filename}, but it's too large to process: {file_size // (1024 * 1024)}MB)")
                             elif is_image_attachment(att):
-                                user_text += f"\n(User attached an image: {att.filename})"
+                                add_note(f"(User attached an image: {att.filename})")
                 timing_mark(f"attachments current_images={len(current_image_inputs)}")
 
                 # 현재 메시지에 이미지 첨부됐는데 모델이 비전 미지원이면 거부
@@ -2460,9 +2467,15 @@ async def on_message(message):
                     )
                     return
 
-                # Gemini 봇과 같은 순서: 시각 줄 → `표시명:` → 본문(웹페이지·문서 포함) → 미디어
+                # 다음 요청의 히스토리와 같은 모양(`표시명 (MM/DD HH:MM):` + 본문·문서 → 미디어)으로 보내고,
+                # 현재 시각 줄·안내 문구는 맨 뒤 블록에 둔다. 그러면 다음 요청이 이 메시지까지 캐시로 읽는다.
                 current_label = speaker_labels.get(message.author.id) or current_display_name
-                current_content.insert(0, {"type": "text", "text": f"{format_current_time_marker()}\n{current_label}:\n{user_text}"})
+                current_body = message.content or ""
+                current_doc_blocks = bot.doc_cache.render_blocks(message.id, full_content=True)
+                if current_doc_blocks:
+                    current_body += "\n\n" + "\n\n".join(current_doc_blocks)
+                current_content.insert(0, {"type": "text", "text": f"{current_label} ({format_sent_time(message.created_at)}):\n{current_body}"})
+                current_content.append({"type": "text", "text": "\n".join([format_current_time_marker(), *current_notes])})
                 messages.append({"role": "user", "content": current_content})
 
                 search_sources = []  # 이번 답장에 쓰인 검색 결과 → 답장 끝 출처 목록
