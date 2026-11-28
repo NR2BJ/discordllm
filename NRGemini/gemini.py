@@ -945,9 +945,12 @@ def scan_sound_files():
     return sounds
 
 async def temp_reply(interaction, content, delay=5):
-    """메시지 보내고 delay초 후 자동 삭제."""
-    msg = await interaction.response.send_message(content)
-    actual = await interaction.original_response()
+    """메시지 보내고 delay초 후 자동 삭제. 이미 응답(defer)한 interaction이면 followup으로 보낸다."""
+    if interaction.response.is_done():
+        actual = await interaction.followup.send(content, wait=True)
+    else:
+        await interaction.response.send_message(content)
+        actual = await interaction.original_response()
     await asyncio.sleep(delay)
     try:
         await actual.delete()
@@ -5313,6 +5316,8 @@ class ControlPanelView(discord.ui.View):
         if not member or not member.voice:
             await temp_reply(interaction, "음성 채널에 먼저 접속해주세요.")
             return
+        # VC 연결/Lavalink 재생이 3초를 넘기면 interaction이 만료되므로 먼저 응답해 둔다.
+        await interaction.response.defer()
         try:
             success, _ = await play_sound_in_vc(interaction.guild, member, sound_key, bot)
             if success:
@@ -5325,9 +5330,13 @@ class ControlPanelView(discord.ui.View):
                     SB_PLAY_LOG.pop(0)
             self._refresh_keys()
             self._update_components()
-            await interaction.response.edit_message(embed=self._make_embed(), view=self)
+            await interaction.edit_original_response(embed=self._make_embed(), view=self)
         except Exception as e:
-            await temp_reply(interaction, f"[ERROR] {e}")
+            print(f"[SB] 사운드 재생 실패 [{sound_key}]: {e}")
+            try:
+                await temp_reply(interaction, f"[ERROR] {e}")
+            except Exception:
+                pass
 
     async def _log_callback(self, interaction: discord.Interaction):
         self.show_log = not self.show_log
@@ -5353,8 +5362,9 @@ class ControlPanelView(discord.ui.View):
             actor_name = get_server_display_name(interaction.guild, interaction.user)
             log_voice_snapshot("수동 퇴장 요청", interaction.guild, vc, extra=f"user={actor_name}")
             bot.clear_voice_target(interaction.guild.id)
+            await interaction.response.defer()
             await vc.disconnect()
-            await interaction.response.edit_message(embed=self._make_embed(), view=self)
+            await interaction.edit_original_response(embed=self._make_embed(), view=self)
         else:
             await temp_reply(interaction, "현재 음성 채널에 접속되어 있지 않습니다.")
 
