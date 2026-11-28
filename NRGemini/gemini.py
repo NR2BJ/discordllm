@@ -957,6 +957,27 @@ async def temp_reply(interaction, content, delay=5):
     except Exception:
         pass
 
+async def defer_component(interaction, label):
+    """컴포넌트 클릭에 먼저 응답한다. 만료(10062)면 False를 돌려주고, 늦었으면 원인 구분용 로그를 남긴다.
+
+    수신 지연 = 디스코드가 클릭을 만든 시각부터 콜백 진입까지(게이트웨이 전달 지연, 서버 시계 오차 포함).
+    응답 요청 = defer HTTP 요청에 걸린 시간(봇 → 디스코드 네트워크).
+    """
+    received_age = (discord.utils.utcnow() - interaction.created_at).total_seconds()
+    started = time_module.perf_counter()
+    ok = True
+    try:
+        await interaction.response.defer()
+    except discord.NotFound:
+        ok = False
+    request_took = time_module.perf_counter() - started
+    if not ok or received_age > 1.5 or request_took > 1.5:
+        print(
+            f"[INTERACTION] {label} 수신 지연={received_age:.2f}s 응답 요청={request_took:.2f}s "
+            f"{'성공' if ok else '만료(10062)'}"
+        )
+    return ok
+
 async def temp_followup(interaction, content, delay=5):
     """followup 메시지 보내고 delay초 후 자동 삭제."""
     msg = await interaction.followup.send(content)
@@ -5317,7 +5338,8 @@ class ControlPanelView(discord.ui.View):
             await temp_reply(interaction, "음성 채널에 먼저 접속해주세요.")
             return
         # VC 연결/Lavalink 재생이 3초를 넘기면 interaction이 만료되므로 먼저 응답해 둔다.
-        await interaction.response.defer()
+        # 응답이 이미 늦어 만료됐어도 소리는 틀고 패널은 메시지 편집으로 갱신한다.
+        deferred = await defer_component(interaction, f"사운드보드 [{sound_key}]")
         try:
             success, _ = await play_sound_in_vc(interaction.guild, member, sound_key, bot)
             if success:
@@ -5330,13 +5352,21 @@ class ControlPanelView(discord.ui.View):
                     SB_PLAY_LOG.pop(0)
             self._refresh_keys()
             self._update_components()
-            await interaction.edit_original_response(embed=self._make_embed(), view=self)
+            await self._edit_panel_after_defer(interaction, deferred)
         except Exception as e:
             print(f"[SB] 사운드 재생 실패 [{sound_key}]: {e}")
-            try:
-                await temp_reply(interaction, f"[ERROR] {e}")
-            except Exception:
-                pass
+            if deferred:
+                try:
+                    await temp_reply(interaction, f"[ERROR] {e}")
+                except Exception:
+                    pass
+
+    async def _edit_panel_after_defer(self, interaction, deferred):
+        if deferred:
+            await interaction.edit_original_response(embed=self._make_embed(), view=self)
+        elif interaction.message is not None:
+            # interaction이 만료돼도 봇 메시지는 일반 API로 고칠 수 있다. 안 고치면 버린 옛 메뉴가 남아 패널이 죽는다.
+            await interaction.message.edit(embed=self._make_embed(), view=self)
 
     async def _log_callback(self, interaction: discord.Interaction):
         self.show_log = not self.show_log
@@ -5362,9 +5392,9 @@ class ControlPanelView(discord.ui.View):
             actor_name = get_server_display_name(interaction.guild, interaction.user)
             log_voice_snapshot("수동 퇴장 요청", interaction.guild, vc, extra=f"user={actor_name}")
             bot.clear_voice_target(interaction.guild.id)
-            await interaction.response.defer()
+            deferred = await defer_component(interaction, "VC 퇴장")
             await vc.disconnect()
-            await interaction.edit_original_response(embed=self._make_embed(), view=self)
+            await self._edit_panel_after_defer(interaction, deferred)
         else:
             await temp_reply(interaction, "현재 음성 채널에 접속되어 있지 않습니다.")
 
